@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       # 工具链固定 22：pnpm 11.7 要求 Node ≥ 22.13（它 import `node:sqlite`）。
       # 这里原先直接用矩阵版本，于是 node 20 那条腿连 setup-node 的 pnpm 缓存步骤都过不去。
