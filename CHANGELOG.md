@@ -7,6 +7,11 @@
 
 ## [未发布]
 
+### 变更
+
+- 发布产物收窄为 `dist/bundle` + `cordis.patch.yml`。`exports` 只指向自包含单文件，
+  之前 tarball 里的 `dist/src`、`dist/tests`（约 90 个文件、449 KB）全是消费方拿不到的东西。
+
 ## [1.0.0] - 2026-10-03
 
 ### 新增
