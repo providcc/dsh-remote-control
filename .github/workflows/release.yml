@@ -37,9 +37,9 @@ jobs:
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
-      # 同 CI：协议包发布前无法冻结锁文件。
+      # 同 CI：lockfile 已提交（协议包上了 npm 之后生成的），冻结安装。
       - name: Install
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check, format check, build, tests
         run: |

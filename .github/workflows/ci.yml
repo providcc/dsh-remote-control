@@ -31,11 +31,10 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
-      # 本仓暂不带 pnpm-lock.yaml：`dsh-remote-wire` 还没发布到 npm 时，`^1.0.0` 解析不出来。
-      # 引导顺序：① 先发协议包 → ② 在本仓跑一次 `pnpm install` 并把生成的 pnpm-lock.yaml 提交
-      # → ③ 把这里改成 `--frozen-lockfile`。
+      # lockfile 已提交（协议包 `dsh-remote-wire@1.0.0` 上了 npm 之后生成的），所以冻结安装。
+      # 协议升版后要重新 `pnpm install` 并提交新的 pnpm-lock.yaml，否则这里会红。
       - name: Install
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check
         run: pnpm typecheck

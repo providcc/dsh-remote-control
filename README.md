@@ -39,18 +39,14 @@
 
 ### 前置条件
 
-`dsh-remote-wire` 是 npm 依赖，本仓的 `pnpm install` 需要它已经发布。首次引导顺序：
-
-1. 在 `dsh-remote-protocol` 仓打 `v*` 标签走它的 Release，把包发到 npm；
-2. 回到本仓跑一次 `pnpm install`，把生成的 `pnpm-lock.yaml` 提交；
-3. 把 `.github/workflows/ci.yml` 里的 `--no-frozen-lockfile` 改成 `--frozen-lockfile`。
-
-（步骤 2、3 是一次性的。协议升版后重跑即可。）
+`dsh-remote-wire` 是 npm 依赖，本仓以 `^1.0.0` 消费它，`pnpm-lock.yaml` 已提交、CI 用
+`pnpm install --frozen-lockfile`。协议升版时走这三步：改 `packages/plugin/package.json` 里的版本
+→ 跑一次 `pnpm install` → 把更新后的 `pnpm-lock.yaml` 一起提交。
 
 插件不进 `node_modules`，而是打成**自包含单文件**装进 profile：
 
 ```sh
-pnpm install          # 装依赖（含 dsh-remote-wire，需先发布该包）
+pnpm install          # 装依赖（含 npm 上的 dsh-remote-wire，按 lockfile 冻结）
 sh scripts/install-to-profile.sh
 # DSH_PROFILE=~/.dsh/profiles/tui sh scripts/install-to-profile.sh   # 指定其它 profile
 ```
