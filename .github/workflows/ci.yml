@@ -57,11 +57,20 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # 用 find 显式列文件，而不是把 glob 交给 node：`--test` 的位置参数语义在版本之间变过——
+      # node 20 把它当字面路径（`dist/tests/*.test.js` 直接 "Could not find"），node 22 才当 glob。
+      # 每个包的测试数都先断言非零，否则目录一改名就变成"0 个测试全绿"。
       - name: Run tests on node ${{ matrix.node }}
         run: |
           set -e
-          (cd packages/plugin && node --test "dist/tests/*.test.js")
-          (cd packages/presentation && node --test "dist/tests/*.test.js")
+          for pkg in packages/plugin packages/presentation; do
+            cd "$pkg"
+            n="$(find dist/tests -name '*.test.js' | wc -l)"
+            echo "$pkg 测试文件数：$n"
+            [ "$n" -gt 0 ] || { echo "$pkg 的 dist/tests 下没找到 *.test.js"; exit 1; }
+            find dist/tests -name '*.test.js' -print0 | xargs -0 node --test
+            cd ../..
+          done
 
       - name: Verify the bundles are self-contained single files
         run: |
