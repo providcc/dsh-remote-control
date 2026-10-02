@@ -26,9 +26,11 @@ jobs:
 
       - uses: pnpm/action-setup@v4
 
+      # 工具链固定 22：pnpm 11.7 要求 Node ≥ 22.13（它 import `node:sqlite`）。
+      # 这里原先直接用矩阵版本，于是 node 20 那条腿连 setup-node 的 pnpm 缓存步骤都过不去。
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '22'
           cache: pnpm
 
       # lockfile 已提交（协议包 `dsh-remote-wire@1.0.0` 上了 npm 之后生成的），所以冻结安装。
@@ -36,16 +38,30 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # 静态检查跑一次就够，两条腿重复跑没有额外信息。
       - name: Type-check
+        if: matrix.node == '22'
         run: pnpm typecheck
 
       - name: Format check
+        if: matrix.node == '22'
         run: pnpm format:check
 
-      # 各包的 test 脚本会先 build（tsc + esbuild 打包），再对 dist/tests 跑 node --test。
-      # 打包脚本自带产物断言（外壳形状、体积上限、sidebarRight 存在）。
-      - name: Build + tests
-        run: pnpm test
+      # build 里含 esbuild 打包，打包脚本自带产物断言（外壳形状、体积上限、sidebarRight 存在）。
+      - name: Build
+        run: pnpm build
+
+      # engines 写的是 >=20，那就得真在 20 上把测试跑一遍。跑测试只要 `node --test`
+      # 打 dist/tests，不经 pnpm，所以这里可以把 node 切成矩阵版本。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run tests on node ${{ matrix.node }}
+        run: |
+          set -e
+          (cd packages/plugin && node --test "dist/tests/*.test.js")
+          (cd packages/presentation && node --test "dist/tests/*.test.js")
 
       - name: Verify the bundles are self-contained single files
         run: |
