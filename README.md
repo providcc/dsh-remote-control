@@ -2,18 +2,18 @@
 
 [![CI](https://github.com/providcc/dsh-remote-control/actions/workflows/ci.yml/badge.svg)](https://github.com/providcc/dsh-remote-control/actions/workflows/ci.yml)
 [![npm: dsh-remote-control](https://img.shields.io/npm/v/dsh-remote-control.svg)](https://www.npmjs.com/package/dsh-remote-control)
-[![npm: dsh-remote-control-presentation](https://img.shields.io/npm/v/dsh-remote-control-presentation.svg)](https://www.npmjs.com/package/dsh-remote-control-presentation)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 **DSH Remote Control** 的宿主侧——跑在 DeepSeek Harness 里的 cordis 插件。它把本机的 DSH 与
 零知识中继配对，让微信小程序可以**发指令、看流式输出、回答审批**，全程载荷级端到端加密。
 
-本仓是 monorepo，产出两个 npm 包：
+本仓是 monorepo，**只发一个 npm 包** `dsh-remote-control`；另一半 `packages/presentation`
+不单独发包，随 [`scripts/install-to-profile.sh`](./scripts/install-to-profile.sh) 以 bundle 装进 profile：
 
-| 目录                                               | 包名                              | 作用                                                                               |
-| -------------------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
-| [`packages/plugin`](./packages/plugin)             | `dsh-remote-control`              | 主插件：配对、中继连接、会话与命令、审批转发、防休眠                               |
-| [`packages/presentation`](./packages/presentation) | `dsh-remote-control-presentation` | 把当前配对二维码落到磁盘，并让 DSH 右栏**自动弹码**（含一个浏览器面 `client.cjs`） |
+| 目录                                               | 包名                              | 分发方式    | 作用                                                                               |
+| -------------------------------------------------- | --------------------------------- | ----------- | ---------------------------------------------------------------------------------- |
+| [`packages/plugin`](./packages/plugin)             | `dsh-remote-control`              | **npm**     | 主插件：配对、中继连接、会话与命令、审批转发、防休眠                               |
+| [`packages/presentation`](./packages/presentation) | `dsh-remote-control-presentation` | 本仓 bundle | 把当前配对二维码落到磁盘，并让 DSH 右栏**自动弹码**（含一个浏览器面 `client.cjs`） |
 
 其余两半在各自仓库：[`dsh-remote-server`](https://github.com/providcc/dsh-remote-server)（零知识中继）、
 `dsh-remote-mp`（微信小程序客户端）。三者共用

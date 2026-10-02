@@ -1,7 +1,8 @@
 {
   "name": "dsh-remote-control-presentation",
   "version": "1.0.0",
-  "description": "DSH Remote Control presentation half: keeps the current pairing QR rendered on disk and answers a same-origin route so the right sidebar opens it automatically — no manual click, no workspace switch.",
+  "private": true,
+  "description": "DSH Remote Control presentation half: keeps the current pairing QR rendered on disk and answers a same-origin route so the right sidebar opens it automatically — no manual click, no workspace switch. Not published to npm: it ships as a bundle installed from this repo by scripts/install-to-profile.sh.",
   "type": "module",
   "license": "MIT",
   "author": "providcc",
@@ -43,10 +44,6 @@
       "platform": "web",
       "inject": []
     }
-  },
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
   },
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",

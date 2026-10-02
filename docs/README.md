@@ -13,15 +13,15 @@
 它们是**历史记录**，正文与行号锚点都指向重写前的 monorepo，**刻意保留原样**（改写会破坏
 "`docs/SECURITY.md:17-19`"这类引用锚点）。阅读时按下表做一次名字换算即可：
 
-| 文档里写的                              | 现在是什么                                                                                   |
-| --------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `packages/protocol`、`@dsh-rc/protocol` | 独立仓库 **`dsh-remote-protocol`**（npm 包 `dsh-remote-wire`，本插件以 npm 依赖消费）        |
-| `apps/server`、`@dsh-rc/server`         | 独立仓库 **`dsh-remote-server`**（零知识中继）                                               |
-| `packages/plugin`                       | 本仓库 `packages/plugin`（宿主侧插件，npm 包名 `dsh-remote-control`）                        |
-| `packages/presentation`                 | 本仓库 `packages/presentation`（右栏二维码半侧，npm 包名 `dsh-remote-control-presentation`） |
-| `docs/legacy-spec/*`                    | 重写前的考古取证稿，**不随开源发布**（只留在私有开发仓）                                     |
-| `HANDOFF.md`                            | 私有开发仓的交接记录，**不随开源发布**                                                       |
-| `SELF-HOSTING.md`                       | 已随中继仓迁出，见 `dsh-remote-server/docs/SELF-HOSTING.md`                                  |
-| `b026d63`                               | 重写前的基线提交（仅在私有开发仓的历史里可见）                                               |
+| 文档里写的                              | 现在是什么                                                                                    |
+| --------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `packages/protocol`、`@dsh-rc/protocol` | 独立仓库 **`dsh-remote-protocol`**（npm 包 `dsh-remote-wire`，本插件以 npm 依赖消费）         |
+| `apps/server`、`@dsh-rc/server`         | 独立仓库 **`dsh-remote-server`**（零知识中继）                                                |
+| `packages/plugin`                       | 本仓库 `packages/plugin`（宿主侧插件，npm 包名 `dsh-remote-control`）                         |
+| `packages/presentation`                 | 本仓库 `packages/presentation`（右栏二维码半侧，`private`，随本仓 bundle 安装、**不发 npm**） |
+| `docs/legacy-spec/*`                    | 重写前的考古取证稿，**不随开源发布**（只留在私有开发仓）                                      |
+| `HANDOFF.md`                            | 私有开发仓的交接记录，**不随开源发布**                                                        |
+| `SELF-HOSTING.md`                       | 已随中继仓迁出，见 `dsh-remote-server/docs/SELF-HOSTING.md`                                   |
+| `b026d63`                               | 重写前的基线提交（仅在私有开发仓的历史里可见）                                                |
 
 换句话说：文档里的路径是"当时的快照"，对照表是"现在的地址"。除名字换算外，其余结论仍然成立。

@@ -5,8 +5,8 @@
 
 ## 本仓的基本规则
 
-这是一个**宿主侧插件** monorepo，产出两个 npm 包（`packages/plugin`、`packages/presentation`）。
-最重要的几条：
+这是一个**宿主侧插件** monorepo。`packages/plugin` 发 npm（`dsh-remote-control`），
+`packages/presentation` 是 `private`、随本仓 bundle 安装（**不发 npm**）。最重要的几条：
 
 1. **凭据绝不落盘、绝不入日志。** `hostToken` 只从环境变量读；任何打印路径都要过 `redactSecret`。
    提交前自查一遍你的 diff 里没有真实 token / PSK / 配对码。
