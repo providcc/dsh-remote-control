@@ -109,11 +109,12 @@
 
 ### 测试
 
-262 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
+265 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
 `sessionWorkspace`）。删掉 5 个只属于那两条已删路径的测试文件；
 `pill-routes.test.ts`（22 条）、`pill-isolation.test.ts`（8 条，含
 "配对入口只有 pill：两种宿主上 hint 都不许再宣传 pair"与"webServer 晚到时 warn:pill 必须自己消失"）、
-`client-bundle.test.ts`（18 条，在 vm 里真跑打出来的 `client.cjs`，含"`slots` 晚到时那颗 pill 必须补挂"）。
+`client-bundle.test.ts`（22 条，在 vm 里真跑打出来的 `client.cjs`，含"`slots` 晚到时那颗 pill 必须补挂"、
+"点开只给连接信息、不许顺手发码"、"抬头那句不许把中文逐字断行"）。
 伞仓 `e2e/run.mjs` 新增一步：**真中继在线**时点那三条路由——发码、幂等复点同一张、
 出的 PNG 与主机维护的那张码同一个 epoch（单测里发码分支永远是"中继不可达"，那条路此前从没走过）。
 
@@ -142,7 +143,8 @@
 - 发布产物收窄为 `dist/bundle` + `cordis.patch.yml`。`exports` 只指向自包含单文件，
   之前 tarball 里的 `dist/src`、`dist/tests`（约 90 个文件、449 KB）全是消费方拿不到的东西。
 
-[未发布]: https://github.com/providcc/dsh-remote-control/compare/v1.1.0...HEAD
+[未发布]: https://github.com/providcc/dsh-remote-control/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/providcc/dsh-remote-control/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/providcc/dsh-remote-control/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/providcc/dsh-remote-control/releases/tag/v1.0.0
 
@@ -161,5 +163,3 @@
 - 对宿主内核面的软探测：不写 inject 闸门，缺服务时受影响面最小。
 - 自包含单文件产物（esbuild），安装只需拷文件 + 注册 bundle，profile 里不需要 `node_modules`。
 
-[未发布]: https://github.com/providcc/dsh-remote-control/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/providcc/dsh-remote-control/releases/tag/v1.0.0
