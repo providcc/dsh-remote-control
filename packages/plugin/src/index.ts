@@ -15,7 +15,7 @@
  * 3. **`provide()` 无条件执行**：外部（测试、其它插件）拿到的永远是同一个句柄，
  *    runtime 还没起来时 `createPairing()` 返回 null，而不是"这个插件不存在"。
  */
-import { randomBytes } from 'node:crypto'
+import path from 'node:path'
 import { type CmdPayload, type EvPayload, buildPairingUri } from 'dsh-remote-wire'
 import { HostRuntime, type RuntimeTransport } from './core/runtime.js'
 import { KeepAwake } from './core/sleep-policy.js'
@@ -26,6 +26,7 @@ import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
 import { StatusFile } from './shell/status.js'
+import { resolveHostId } from './shell/host-id.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { startPill, type PillHandle } from './pill/start.js'
 import { type LivePairing, type PillStatus } from './pill/routes.js'
@@ -146,6 +147,12 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   // 1.2s 跑完却 60s 才退出、任何 headless/CLI 跑法白等一分钟，都出自这里（见 core/clock.ts）。
   const oneShot = createOneShotTimers(clock)
   const status = new StatusFile(config.statusFile, clock)
+  /**
+   * 这一台主机的身份。配置给了就用配置的，否则读/写 status.json 旁边那个 `host-id` 文件
+   * ——**不能每次加载现造**，那会让中继顶不了旧号、往换过身份的对端推帧（取证 §3.4 与
+   * `shell/host-id.ts`）。`statusFile` 被清空（关掉快照）时不猜目录，退回一次性身份。
+   */
+  const hostId = resolveHostId(config.statusFile ? path.dirname(config.statusFile) : '', config.hostId)
   const problems = validateConfig(config)
   const log = (message: string, fields: Record<string, string | number | boolean | undefined> = {}): void => {
     try {
@@ -223,7 +230,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     startedCarrier = port.carrier
     relay = new RelayClient({
       url: config.serverUrl,
-      hostId: config.hostId || `h_${randomBytes(3).toString('hex')}`,
+      hostId,
       label: config.hostLabel,
       token: config.hostToken,
       clock,
@@ -323,6 +330,9 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       carrier: startedCarrier || (config.mockBridge ? 'mock' : 'probing'),
       serverUrl: config.serverUrl,
       hostLabel: config.hostLabel,
+      // 主机身份。中继日志里认的就是它，所以"手机连不上/丢帧涨"第一件事是看这个值
+      // 在两次重启之间有没有变（变了就是身份没稳住，见 shell/host-id.ts）。
+      hostId,
       relay: relay ? relayState() : 'idle',
       relayProblem: relayProblem(),
       conversations: relay?.conversationCount ?? 0,
