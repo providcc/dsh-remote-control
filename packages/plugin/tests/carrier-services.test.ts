@@ -236,13 +236,13 @@ test('人工交互两面的登记结果必须能从 status.json 读出来（审�
   // 审批是 **waterfall 参与者**，登记动作就是 `on('approval/request', …)`。
   assert.ok(listeners['approval/request'], '没有真正登记 approval/request 参与者')
   assert.equal(described.approvalFace, 'registered', `审批面登记状态读不出真值：${String(described.approvalFace)}`)
-  // **`global: true` 是这条测试的全部意义**：宿主用 `scopeTarget(req.agent, req.agent)` 派发，
-  // cordis 的判据是 `hook.global || !filter || filter(hook.ctx)`，而插件那条 fiber 是 agent
-  // 作用域的兄弟。少了这个选项，登记照样成功、监听器一次都不会被调用（真机 2026-10-03 撞过）。
+  // **这两个选项各治一种"卡没弹"，摘掉任何一个真机都会瞎**：
+  // `global` 管"不被作用域过滤掉"，`prepend` 管"排在桌面那位应答者前面"
+  // （waterfall 里第一个 hook 是外层，外层不 next() 内层永远轮不到）。
   assert.deepEqual(
     listenerOptions['approval/request'],
-    { global: true },
-    'approval/request 没带 {global:true}：会被 cordis 的作用域过滤掉，审批卡永远弹不到手机上',
+    { global: true, prepend: true },
+    'approval/request 没带 {global:true, prepend:true}：前者会被 cordis 过滤掉，后者会排在桌面 UI 后面永远轮不到',
   )
   // 提问默认不接管（`ctx.userQuestions` 是单提供者，接管会剥夺桌面 UI 的提问能力）。
   assert.equal(described.questionsFace, 'not-taken-over', '默认就该是 not-taken-over，否则桌面端问不了问题')

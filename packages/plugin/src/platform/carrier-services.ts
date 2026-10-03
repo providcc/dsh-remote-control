@@ -69,25 +69,32 @@ export interface ServicesBundle {
 }
 
 /**
- * `ctx.on('approval/request', …)` 的第三个参数。`global: true` 是 cordis 留的**唯一**一条
- * 绕过作用域过滤的路（`EventOptions` 的原文注释：'Receive the event regardless of context
- * filter checks'）。
+ * `ctx.on('approval/request', …)` 的第三个参数。两个选项各治一种"卡没弹"，**缺一不可**。
  *
- * 为什么非加不可（取证）：派发方是
- * `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)`
+ * ### `global: true` —— 不被作用域过滤掉
+ *
+ * 派发方是 `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)`
  * （桌面 asar 里 `ApprovalService.decide`），而 cordis 的 `dispatch()` 判据是
  * `hook.global || !filter || filter.call(thisArg, hook.ctx)`；`scopeTarget` 的 filter 只放行
  * "未打作用域标签的上下文"与"派发键的**祖先**作用域"，原文注释写着
  * 'A tag BELOW the dispatch key stays excluded — events flow up the chain, never down'。
- * 插件那条 fiber 与 agent 作用域是兄弟不是祖先，所以不加 `global` 时：
- * **登记成功、`approvalFace` 报 registered、监听器一次都不会被调用**。
+ * 插件那条 fiber 与 agent 作用域是兄弟不是祖先。`global` 是 cordis 留的唯一一条逃生口
+ * （`EventOptions` 原文：'Receive the event regardless of context filter checks'）。
  *
- * 真机上的形状就是这条假象的代价：审批策略是 `ask`，桌面在等人点，手机上什么都没有，
- * 而 status.json 里 `approval/asked` 明明出现过、`problems` 是空的。唯一的破口是
- * `outbound` 里连 `permission_request_no_peer` 都没有——计数在发送之前就 +1，
- * 所以"没有计数"= "根本没走到发送那一步"。
+ * ### `prepend: true` —— 排在桌面那一位**前面**
+ *
+ * waterfall 是"外层不调 `next()`，内层就永远轮不到"，而 `dispatch()` 返回的数组里
+ * **第一个就是外层**（`register()` 用 `unshift` 实现 prepend）。桌面 UI 的应答者登记得比我们早，
+ * 它一拿到请求就去等真人点按钮、且不 `next()`——于是真机上出现过这个形状：
+ * `approvalAsked=1`、`approvalDecided=not-seen`（卡在桌面等人）、`approvalCalls=0`（我们没轮到），
+ * 手机上什么都没有，而 `approvalFace` 一直报 `registered`。
+ *
+ * **代价，说清楚**：排到最外层意味着也排在 Auto 预置的自动审阅之前（那条是 `prepend` 登记的）。
+ * 本机没配 Auto 预置（profile 里只有 read-only / workspace-write / danger-full-access），
+ * 所以这里没有东西被跳过；哪天接上 Auto，这一行要重新审——正确做法大概是"先让自动审阅跑完，
+ * 再由手机答人"，而不是继续抢在最外层。
  */
-const APPROVAL_SUBSCRIBE_OPTIONS = { global: true } as const
+const APPROVAL_SUBSCRIBE_OPTIONS = { global: true, prepend: true } as const
 
 export interface ServicesOptions {
   clock: Clock
