@@ -430,14 +430,27 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
 
   /**
-   * pill 抬头那句"连接状态"与点开那三行（中继 / 状态 / 版本）：取值口径与 `status.json`
-   * 完全一致（同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
+   * pill 抬头那句"连接状态"与点开那三行（中继 / 状态 / 版本）：中继那一行取值口径与
+   * `status.json` 完全一致（同一个 `relayState()`），免得两处说两种话。
    * 这里出去的四个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
+   *
+   * ⚠️ `paired` 读的是 **clientCount（手机台数）而不是 conversationCount（会话数）**，
+   * 这不是随手选的：会话按 D3 长存，手机解配也不删（手机回前台要用同一个 convId 回来），
+   * 于是解配之后 `conversationCount` **恒为 1**，pill 会一直显示"已配对"——
+   * 用户点了手机上的「解除配对」、主机这边毫无变化，正是这个字段顶错了。
+   * 主机侧的 `peer-left` 已经把 clientId 从成员表摘掉（`relay.ts`），所以这里读
+   * `clientCount` 才是"现在真有手机连着吗"。
+   *
+   * 为什么 `clientCount` 在配对瞬间不会是 0（那会误报"未配对"）：配对成功的
+   * 那一刻成员表确实是空的，手机 clientId 要等它**下一帧**才带上来 ——
+   * 所以它只能靠 `onEncrypted` 登记，不能只在 `open()` 记（见 relay.ts）。
+   * 好在 mp 侧 `_onPaired` 里立刻发了一帧 `cmd.list_sessions`，
+   * 那帧到达时成员表就补齐了，pill 最多差一个轮询周期（3 秒）不会一直空着。
    */
   function pillStatus(): PillStatus {
     return {
       relay: relay ? relayState() : 'idle',
-      paired: relay?.conversationCount ?? 0,
+      paired: relay?.clientCount ?? 0,
       serverUrl: config.serverUrl,
       version: PLUGIN_VERSION,
     }
