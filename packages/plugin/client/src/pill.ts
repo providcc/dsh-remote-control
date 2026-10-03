@@ -135,7 +135,12 @@ export function secondsText(ms: number): string {
 const CSS = `
 .drc-pill { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 2px 8px;
   border: 0; border-radius: 999px; background: transparent; color: inherit; font: inherit;
-  font-size: 12px; line-height: 18px; cursor: pointer; }
+  font-size: 12px; line-height: 18px; cursor: pointer;
+  /* 宿主那一排挤不下时会自己截断（「6 轮 …」那种），我们也跟这个形状走：
+     一行写完，写不下就省略号。**没有这两条**的话，flex 项会被压到「中文最小内容宽度
+     = 一个字」，于是「已连 1 台」竖着排成四行（2026-10-03 真屏幕截图）。 */
+  flex: 0 1 auto; white-space: nowrap; }
+.drc-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .drc-pill:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04)); }
 .drc-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--dsw-alias-label-dimmed, #9aa0a6); }
 .drc-dot[data-tone="wait"] { background: var(--dsw-alias-state-warn-primary, #faad14); }

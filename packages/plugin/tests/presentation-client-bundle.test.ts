@@ -468,6 +468,26 @@ test('挂载之后抬头写的是状态路由给的那句', async () => {
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'on', '灯的颜色由 tone 决定')
 })
 
+test('那一排挤不下时只许省略号，不许把中文逐字断行（真屏幕截图抓到的形状）', async () => {
+  // 现场：宿主 dock 已经挤到 `6 轮 …`、`1.6M to…`，而我们那颗 `已连 1 台` 被压成竖排四个字。
+  // flex 项默认可以缩到"中文的最小内容宽度 = 一个字"，所以 nowrap + 省略号必须写死在样式里。
+  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'online', paired: 1, hasCode: false } })
+  const root = harness.mountPill()
+  await flush()
+  const css = harness.fakeDocument().head.children.find((node) => node.tag === 'style')?.textContent ?? ''
+  assert.ok(css.includes('.drc-pill'), `那颗 pill 的样式没注入到 head：${css.slice(0, 120)}`)
+  assert.match(css, /flex: 0 1 auto; white-space: nowrap;/, '按钮不许被压成多行：nowrap 是那条断行的唯一解药')
+  assert.match(
+    css,
+    /\.drc-label \{[^}]*min-width: 0;[^}]*text-overflow: ellipsis;[^}]*\}/,
+    '缩不下时截断的是文字，不是把整颗按钮撑开',
+  )
+  // 截断之后全文仍然取得到（悬浮与读屏都靠这两条）
+  const pill = root.find('drc-pill')!
+  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已连 1 台')
+  assert.equal(pill.getAttribute('aria-label'), '已连 1 台')
+})
+
 test('中继没连上时说的是"远程未连接"，不许假装有得配', async () => {
   const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'offline', paired: 0, hasCode: false } })
   const root = harness.mountPill()

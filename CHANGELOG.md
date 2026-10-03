@@ -73,6 +73,11 @@
   两条退路（回调里只 mount 一次），以及一条能演"晚到"的测试（`presentation-client-bundle.test.ts`
   的 `lateSlots`/`flushInject`）。`apply` 时没探到的那句 warn 改成"已挂回调等晚到"，不再断言
   "这代宿主没这个服务"。
+- **那颗 pill 在挤不动的那一排里不再逐字断行**。宿主 dock 空间不够时会把每一项自己截断
+  （`6 轮 …`、`1.6M to…`），而按钮本身是 flex 项、默认可以缩到"中文的最小内容宽度 = 一个字"，
+  于是 `已连 1 台` 竖着排成四行（2026-10-03 用户截图）。现在 `.drc-pill` 写死
+  `flex: 0 1 auto; white-space: nowrap`，`.drc-label` 给 `min-width: 0` + `text-overflow: ellipsis`，
+  与邻居同一个形状；全文仍然在 `title` 与 `aria-label` 上，悬浮和读屏都不丢。
 - 配对二维码的编码/解码防回归（伞仓 `scripts/validate-qr.mjs`）从"三条产物"降到两条：
   PNG 与裸矩阵。
 
@@ -92,7 +97,7 @@
 
 ### 测试
 
-261 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
+262 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
 `sessionWorkspace`）。删掉 5 个只属于那两条已删路径的测试文件；
 `presentation-pill-routes.test.ts`（22 条）、`presentation-isolation.test.ts`（8 条，含
 "配对入口只有 pill：两种宿主上 hint 都不许再宣传 pair"与"webServer 晚到时 warn:pill 必须自己消失"）、
