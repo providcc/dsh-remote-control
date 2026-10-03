@@ -219,8 +219,10 @@ test('人工交互两面的登记结果必须能从 status.json 读出来（审�
   const f = fixture()
   const services = f.bundle({ live: true })
   const listeners: Record<string, (...args: unknown[]) => void> = {}
-  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+  const listenerOptions: Record<string, unknown> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void, options?: unknown) => {
     listeners[name] = listener
+    listenerOptions[name] = options
     return () => {}
   }
   const kernel = f.kernel(services)
@@ -234,9 +236,96 @@ test('人工交互两面的登记结果必须能从 status.json 读出来（审�
   // 审批是 **waterfall 参与者**，登记动作就是 `on('approval/request', …)`。
   assert.ok(listeners['approval/request'], '没有真正登记 approval/request 参与者')
   assert.equal(described.approvalFace, 'registered', `审批面登记状态读不出真值：${String(described.approvalFace)}`)
+  // **`global: true` 是这条测试的全部意义**：宿主用 `scopeTarget(req.agent, req.agent)` 派发，
+  // cordis 的判据是 `hook.global || !filter || filter(hook.ctx)`，而插件那条 fiber 是 agent
+  // 作用域的兄弟。少了这个选项，登记照样成功、监听器一次都不会被调用（真机 2026-10-03 撞过）。
+  assert.deepEqual(
+    listenerOptions['approval/request'],
+    { global: true },
+    'approval/request 没带 {global:true}：会被 cordis 的作用域过滤掉，审批卡永远弹不到手机上',
+  )
   // 提问默认不接管（`ctx.userQuestions` 是单提供者，接管会剥夺桌面 UI 的提问能力）。
   assert.equal(described.questionsFace, 'not-taken-over', '默认就该是 not-taken-over，否则桌面端问不了问题')
   detach()
+})
+
+/**
+ * `approvalFace='registered'` 只说明"挂上去了"，不说明"收得到"。
+ * 这两条把"收到之后走到哪一步"也钉成字段：真机上再出现审批卡没弹，
+ * 看 `approvalCalls` 是 0 还是 >0 就能一句话分掉两半。
+ */
+test('审批 waterfall 被调用时要留下次数与落点：手机答了就记 answered-by-phone', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  const asked: string[] = []
+  kernel.attachInteractionSink!({
+    approval: async (info: { sessionId: string; action: string }) => {
+      asked.push(`${info.sessionId}/${info.action}`)
+      return 'allowed-once'
+    },
+    question: async () => null,
+  })
+  assert.equal((kernel.describe() as Record<string, unknown>).approvalCalls, 0, '一次都没派发，计数不该动')
+  const outcome = await listeners['approval/request']!(
+    { agent: { session: { id: 'ses_live' } }, toolName: 'write_file', reason: '要往工作区外写' },
+    async () => 'unavailable',
+  )
+  assert.equal(outcome, 'allowed-once', '手机放行之后没把 outcome 交回瀑布')
+  assert.deepEqual(asked, ['ses_live/write_file'], '交给 runtime 的会话与工具名不对：审批卡会问错东西')
+  const described = kernel.describe() as Record<string, unknown>
+  assert.equal(described.approvalCalls, 1, '调用次数没进 status.json：只能靠猜')
+  assert.equal(
+    described.approvalLast,
+    'answered-by-phone(allowed-once)',
+    `落点读不出来：${String(described.approvalLast)}`,
+  )
+})
+
+test('拿不到会话或手机没答上时要交还桌面，并把"交还了"记进 status.json', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let sinkCalls = 0
+  kernel.attachInteractionSink!({
+    approval: async () => {
+      sinkCalls += 1
+      return 'decline'
+    },
+    question: async () => null,
+  })
+  // ① 请求里没有会话 id（宿主换了字段形状）→ 不抢答，交还。
+  const noSession = await listeners['approval/request']!({ toolName: 'write_file' }, async () => 'unavailable')
+  assert.equal(noSession, 'unavailable', '没有会话 id 却自己答了：会把桌面 UI 的审批权抢掉')
+  assert.equal(sinkCalls, 0, '没有会话 id 还去问手机')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalLast,
+    'handed-back(no phone target)',
+    '交还原因没进 status.json：下次又要从"为什么没弹"猜起',
+  )
+  // ② 手机超时（sink 回 decline）→ 同样交还，而不是替用户拒绝。
+  const declined = await listeners['approval/request']!(
+    { agent: { session: { id: 'ses_live' } }, toolName: 'write_file' },
+    async () => 'unavailable',
+  )
+  assert.equal(declined, 'unavailable', '手机没答上时我们替用户拒绝：桌面那条链就该自己决定')
+  assert.equal(sinkCalls, 1, '这一条该问到手机')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalLast,
+    'handed-back(phone declined or timed out)',
+    '超时交还与"没有手机"必须分得开：前者是手机没点，后者是没配过',
+  )
+  assert.equal((kernel.describe() as Record<string, unknown>).approvalCalls, 2)
 })
 
 test('takeOverQuestions=true 时才注册提问提供者；没有那个服务要说得出来', () => {

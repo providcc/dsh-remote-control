@@ -338,7 +338,12 @@ export class RelayClient {
     }
   }
 
-  private onEncrypted(frame: { sessionId: string; clientId?: string; ciphertext?: string; items?: Array<{ ciphertext: string }> }): void {
+  private onEncrypted(frame: {
+    sessionId: string
+    clientId?: string
+    ciphertext?: string
+    items?: Array<{ ciphertext: string }>
+  }): void {
     const conversation = this.conversations.get(frame.sessionId)
     if (!conversation) {
       // 本端已经没有这把钥匙：留着通道只会让手机对着一个听不见的对端说话。

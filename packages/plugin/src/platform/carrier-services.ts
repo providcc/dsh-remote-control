@@ -58,10 +58,36 @@ export interface ServicesBundle {
    * 不该把整条载体判定拖垮，所以它是可选服务。
    */
   sessionController?: LooseObject
-  /** cordis 的事件注册口；对 waterfall 是**参与式**监听。 */
-  on?(name: string, listener: (...args: unknown[]) => void): unknown
+  /**
+   * cordis 的事件注册口；对 waterfall 是**参与式**监听。
+   *
+   * 第三个参数是 `EventOptions`（`{ global?, prepend? }`）。审批那条**必须带 `global: true`**，
+   * 理由见 `APPROVAL_SUBSCRIBE_OPTIONS`。
+   */
+  on?(name: string, listener: (...args: unknown[]) => void, options?: unknown): unknown
   off?(name: string, listener: (...args: unknown[]) => void): unknown
 }
+
+/**
+ * `ctx.on('approval/request', …)` 的第三个参数。`global: true` 是 cordis 留的**唯一**一条
+ * 绕过作用域过滤的路（`EventOptions` 的原文注释：'Receive the event regardless of context
+ * filter checks'）。
+ *
+ * 为什么非加不可（取证）：派发方是
+ * `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)`
+ * （桌面 asar 里 `ApprovalService.decide`），而 cordis 的 `dispatch()` 判据是
+ * `hook.global || !filter || filter.call(thisArg, hook.ctx)`；`scopeTarget` 的 filter 只放行
+ * "未打作用域标签的上下文"与"派发键的**祖先**作用域"，原文注释写着
+ * 'A tag BELOW the dispatch key stays excluded — events flow up the chain, never down'。
+ * 插件那条 fiber 与 agent 作用域是兄弟不是祖先，所以不加 `global` 时：
+ * **登记成功、`approvalFace` 报 registered、监听器一次都不会被调用**。
+ *
+ * 真机上的形状就是这条假象的代价：审批策略是 `ask`，桌面在等人点，手机上什么都没有，
+ * 而 status.json 里 `approval/asked` 明明出现过、`problems` 是空的。唯一的破口是
+ * `outbound` 里连 `permission_request_no_peer` 都没有——计数在发送之前就 +1，
+ * 所以"没有计数"= "根本没走到发送那一步"。
+ */
+const APPROVAL_SUBSCRIBE_OPTIONS = { global: true } as const
 
 export interface ServicesOptions {
   clock: Clock
@@ -111,7 +137,6 @@ const MODEL_LIST_METHODS = new Set(['list', 'listModels', 'available', 'availabl
 /** 命中这些名字之一才算「能切换模型」。 */
 const MODEL_SET_METHODS = new Set(['set', 'select', 'setSelection', 'setDefault', 'update'])
 
-
 /** 折叠后的插件内部形状。 */
 interface ListedSession {
   id: string
@@ -160,6 +185,17 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    */
   let approvalFace = 'not-attached'
   let questionsFace = 'pending'
+  /**
+   * 审批那条 waterfall 的监听器**被调用了几次**，以及最后一次走到了哪一步（进 status.json）。
+   *
+   * 为什么必须有：`approvalFace='registered'` 只证明"我们把自己挂上去了"，
+   * 一点都不能证明"挂的地方收得到"——cordis 的 waterfall 按作用域过滤派发，
+   * 挂错作用域的监听器登记成功、永不触发（见 `APPROVAL_SUBSCRIBE_OPTIONS`）。
+   * 真机上那一次"审批卡没弹"就是靠这两个字段定位的：`approvalCalls=0` 直接排除了
+   * "我们抢答了又丢掉"，把问题钉在派发那一步。
+   */
+  let approvalCalls = 0
+  let approvalLast = 'not-called'
 
   /**
    * 模型面的登记结果，进 status.json。
@@ -680,7 +716,12 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         // **参与**这条 waterfall：必须返回 outcome 或调用 next()，返回 undefined 会冲掉整条链。
         const listener = (...args: unknown[]): Promise<string> => participate(args)
         try {
-          const disposer = (on as (n: string, fn: unknown) => unknown).call(services, name, listener)
+          const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
+            services,
+            name,
+            listener,
+            APPROVAL_SUBSCRIBE_OPTIONS,
+          )
           // 这条登记要进 status.json：真机上审批卡"为什么没弹"分三种原因
           // （策略根本没问 / 没登记上 / 登记了但没配对的手机），没有这个字段就只能猜。
           approvalFace = 'registered'
@@ -751,6 +792,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
 
   /** `approval/request(this, req, next)`：req 是只读审批问题，next 交还给其他应答者。 */
   async function participate(args: unknown[]): Promise<string> {
+    approvalCalls += 1
     const request = args.find(
       (arg) => arg && typeof arg === 'object' && typeof (arg as { toolName?: unknown }).toolName === 'string',
     ) as { agent?: { session?: { id?: string } }; toolName?: string; reason?: string; signal?: AbortSignal } | undefined
@@ -758,6 +800,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const sessionId = String(request?.agent?.session?.id ?? '')
     if (!sink || !sessionId || !servicesPeers()) {
       // 没有手机端在线 → 交还桌面 UI。这一步是"插件不抢答"的关键。
+      approvalLast = 'handed-back(no phone target)'
       return String((await next?.()) ?? 'unavailable')
     }
     const decision = await sink.approval({
@@ -766,7 +809,12 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       ...(request?.reason ? { reason: String(request.reason) } : {}),
       ...(request?.signal ? { signal: request.signal } : {}),
     })
-    if (decision === 'decline') return String((await next?.()) ?? 'unavailable')
+    if (decision === 'decline') {
+      // 手机超时/没答上 → 也交还桌面，不替用户决定。
+      approvalLast = 'handed-back(phone declined or timed out)'
+      return String((await next?.()) ?? 'unavailable')
+    }
+    approvalLast = `answered-by-phone(${decision})`
     return decision
   }
 
@@ -827,7 +875,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         canSwitch: canList && canSet,
         reason: canList && canSet ? undefined : `主机内核只提供读取（命中：${hits.join(',') || '无'}）`,
       }
-    },    describe() {
+    },
+    describe() {
       return {
         carrier: 'services',
         sessions: typeof services.sessions === 'object',
@@ -850,10 +899,12 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         agentModelFields: (() => {
           const first = firstLiveAgent()
           if (!first) return 'no-live-agent'
-          return Object.keys(first)
-            .filter((k) => /model|provider|preset/i.test(k))
-            .slice(0, 8)
-            .join(',') || 'none'
+          return (
+            Object.keys(first)
+              .filter((k) => /model|provider|preset/i.test(k))
+              .slice(0, 8)
+              .join(',') || 'none'
+          )
         })(),
         agents: typeof services.agents === 'object',
         agentDefaultModel: typeof services.agentDefaultModel === 'object',
@@ -870,6 +921,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         unmappedEventTypes: [...unmappedEventTypes].join('|'),
         injectedUserMessages: [...injectedUserMessages].map(([kind, count]) => `${count}×${kind}`).join('|') || 'none',
         approvalFace,
+        approvalCalls,
+        approvalLast,
         questionsFace,
         listenerErrors:
           [...listenerErrors]
