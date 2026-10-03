@@ -207,9 +207,10 @@ export class RelayClient {
   broadcast(payload: EvPayload): number {
     let sent = 0
     for (const id of this.conversations.ids()) {
-      // 没有活客户端的会话**跳过而不计数**：手机不在的时候主机照样每 15 秒产生一轮状态，
-      // 把它记成"发了但没人收到"会让 `_no_peer` 变成常态噪声，
-      // 而这个计数存在的目的正是"这一次真的丢了"（真机 45 秒涨 9 帧就是这么来的）。
+      // 没有活客户端的会话**不上线**：手机不在的时候主机照样每 15 秒产生一轮状态，
+      // 以前每一帧都会被中继计成一次丢帧（真机实测 45 秒涨 9，`droppedFrames` 就一直是
+      // 这一路噪声主导）。跳过之后调用方仍会把这次记成 `*_no_peer`——那是本地计数，
+      // 说的是"主机想发、当时没人听"，与"帧上了线又被丢"是两件事，前者不该污染后者。
       if (!this.conversations.hasClient(id)) continue
       if (this.send(id, payload)) sent += 1
     }
