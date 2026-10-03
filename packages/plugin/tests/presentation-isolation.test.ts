@@ -153,13 +153,24 @@ function boot(options: { webServer?: unknown; registerThrows?: boolean; sidebarE
       if (!definition?.handler) throw new Error('drc 命令没注册或没有 handler')
       return await definition.handler({ commandId: 'isolation-cmd', rawInput })
     },
+    /**
+     * 等到"载具已决定 + 中继真的走完一次连接尝试"，并**返回那一刻的快照**。
+     *
+     * 为什么必须返回快照而不是让断言各自再读一次：中继的保活重连在跑，
+     * `relay` 会在 `offline ⇄ connecting` 之间跳。CI（Node 20 作业）上实测抓到过
+     * "等载具时读到 offline，回头再读变成 connecting"导致的假红。
+     * 对照测试要比的是**同一时刻的两份状态**，所以等待条件与取样必须是同一次动作。
+     */
     async waitForCarrier() {
-      const deadline = Date.now() + 4000
+      const deadline = Date.now() + 8000
       for (;;) {
         const state = service?.state ?? {}
-        // 载具决定之后 relay 客户端才被建出来：'idle' 表示还没走到那一步。
-        if (state.carrier === 'mock' && state.relay !== 'idle') return state
-        if (Date.now() > deadline) throw new Error(`等不到载具决定：${JSON.stringify(state).slice(0, 200)}`)
+        if (state.carrier === 'mock' && state.relay === 'offline') return state
+        if (Date.now() > deadline) {
+          throw new Error(
+            `等不到"载具决定 + 中继走完一次连接尝试"：${JSON.stringify(service?.state ?? {}).slice(0, 220)}`,
+          )
+        }
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
     },
