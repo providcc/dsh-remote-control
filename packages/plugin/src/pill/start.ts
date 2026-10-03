@@ -1,5 +1,5 @@
 /**
- * pill — 状态栏那颗 pill 的宿主侧接线：软探测 `webServer`、挂三条路由、收干净。
+ * pill — 状态栏那颗 pill 的宿主侧接线：软探测 `webServer`、挂四条路由、收干净。
  *
  * 2026-10-03 这一半原来还带着"右栏自动弹码"：按节拍看当前码、渲染 PNG、写进会话工作区、
  * 再经一条只读路由把 `dsh-resource://` 地址交给浏览器面。那套整个删了——配对入口现在只有
@@ -31,11 +31,11 @@ export interface PillHandle {
   stop(): void
   /** 排错入口：为什么没起 / 服务是从哪条路拿到的 / 路由挂上没。 */
   readonly probe: Record<string, string>
-  /** 那三条路由**是否真的挂上了**——没挂上就没有配对入口。 */
+  /** 那四条路由**是否真的挂上了**——没挂上就没有配对入口。 */
   readonly available: boolean
 }
 
-/** 起 pill 的那三条路由。`enabled:false` 时什么都不做。返回句柄；`stop()` 幂等。 */
+/** 起 pill 的那四条路由。`enabled:false` 时什么都不做。返回句柄；`stop()` 幂等。 */
 export function startPill(ctx: LooseContext, deps: PillRouteDeps & { enabled: boolean }): PillHandle {
   const { log } = deps
   const probe: Record<string, string> = {}
@@ -52,6 +52,7 @@ export function startPill(ctx: LooseContext, deps: PillRouteDeps & { enabled: bo
         ensureFresh: () => deps.ensureFresh(),
         current: () => deps.current(),
         status: () => deps.status(),
+        unpair: () => deps.unpair(),
         log,
       })
       probe.routes = 'registered'

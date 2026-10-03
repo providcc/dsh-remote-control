@@ -1,21 +1,22 @@
 /**
- * pill-routes — 状态栏那颗 pill 用的三条同域路由，与它自带的守卫。
+ * pill-routes — 状态栏那颗 pill 用的四条同域路由，与它自带的守卫。
  *
  *   `POST /plugins/dsh-remote-control/pairing/new`  点一下要一张能用的码（幂等）
  *   `GET  /plugins/dsh-remote-control/pairing.png`  弹窗里那张二维码图
- *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句状态 + 点开那几行连接信息
+ *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句状态 + 点开那行中继地址
+ *   `POST /plugins/dsh-remote-control/unpair`       退出配对（作废当前那条通道）
  *
- * 三条都是**按需**的：宿主侧不再有"按节拍渲染并落盘"那一半（右栏自动弹码方案 2026-10-03 删除），
+ * 四条都是**按需**的：宿主侧不再有"按节拍渲染并落盘"那一半（右栏自动弹码方案 2026-10-03 删除），
  * 图在有人要的时候现渲染，状态在 pill 问的时候现读。
  *
  * 安全姿态分两档，写在同一个文件里但**判据分开**：
  *
  * - 只读那两条：`Host` 必须环回（挡 DNS 重绑定的导航/表单请求），`Origin` 缺席放过
  *   （同源 GET 浏览器本来就可能不带，桌面宿主的转发层还会主动删掉它）。
- * - 会改状态的那条：跨站判据是**只有同源脚本发得出的自定义头** `x-drc-pair: 1`。
- *   不能拿 `Origin` 当凭据——2026-10-03 在真宿主上点那颗 pill 直接 403，弹窗上印着
- *   `origin-missing`：桌面宿主转发时会把 `origin` 删掉，"Origin 必须存在"这条前提在这台
- *   宿主上永远不成立。带自定义头则跨站必然先触发 CORS 预检，而这条服务既不响应 OPTIONS
+ * - 会改状态的那**两**条（发码、解配）：跨站判据是**只有同源脚本发得出的自定义头**
+ *   `x-drc-pair: 1`。不能拿 `Origin` 当凭据——2026-10-03 在真宿主上点那颗 pill 直接 403，
+ *   弹窗上印着 `origin-missing`：桌面宿主转发时会把 `origin` 删掉，"Origin 必须存在"这条前提
+ *   在这台宿主上永远不成立。带自定义头则跨站必然先触发 CORS 预检，而这条服务既不响应 OPTIONS
  *   也不发 `Access-Control-*`，浏览器会拦下；HTML 表单更没有设头的口子。
  *   `Origin` 存在时仍要判：环回 http(s) 或宿主自己的自定义 scheme（`dsh-app://app`）算"自己"。
  *
@@ -37,6 +38,7 @@ import { qrPng } from '../platform/qr.js'
 export const PAIR_NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const PAIR_IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
 export const PAIR_STATUS_ROUTE = '/plugins/dsh-remote-control/status'
+export const PAIR_UNPAIR_ROUTE = '/plugins/dsh-remote-control/unpair'
 
 /** 写路由的跨站判据（见文件头）。浏览器面 `client/src/pill.ts` 里是同一个字面量。 */
 export const PAIR_MARKER_HEADER = 'x-drc-pair'
@@ -50,20 +52,20 @@ export interface LivePairing {
 }
 
 /**
- * pill 上那句"连接状态"与点开看到的那几行"连接信息"：四个非凭据字段，别的一律不出。
+ * pill 上那句"连接状态"与点开看到的那一行中继地址：三个非凭据字段，别的一律不出。
  *
- * `hostLabel` 与 `serverUrl` 是**已经印在手机上看到的东西**（配对 URI 里就带着这两条，
- * `status.json` 也有），不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，
- * 也没有那条 URI 的任何片段。
+ * `serverUrl` 是**已经印在手机上看到的东西**（配对 URI 里就带着它，`status.json` 也有），
+ * 不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，也没有那条 URI 的任何片段。
+ *
+ * 本机名（`hostLabel`）2026-10-03 从面板上撤了：它是配置里那个名字，配对时手机上已经看到，
+ * 留在弹窗里只是占一行。抬头那句"已配对/未配对"由 `paired` 一个字段决定就够了。
  */
 export interface PillStatus {
   /** 与 `status.json` 的 `relay` 同一取值集合：`idle` 是"runtime 还没起来"，不是"断了"。 */
   relay: 'online' | 'connecting' | 'offline' | 'idle'
-  /** 当前配对着的手机数量；pill 抬头那句"已配对"与点开那句"已配对 N 台"都读它。 */
+  /** 当前配对着的手机数量。只允许配一台，所以它是 0 或 1；抬头那句与右上角那颗按钮都读它。 */
   paired: number
-  /** 本机在那台手机上显示的名字（`hostLabel`）。 */
-  hostLabel: string
-  /** 中继地址（原样），连接信息那一栏要说清连的是哪台。 */
+  /** 中继地址（原样），弹窗里那一行要说清连的是哪台。 */
   serverUrl: string
 }
 
@@ -75,8 +77,10 @@ export interface PillRouteDeps {
   ensureFresh(): LivePairing | null
   /** 只读地看当前有没有仍然有效的码（图片路由用，绝不顺手发码）。 */
   current(): LivePairing | null
-  /** 连接状态（pill 抬头那句）。 */
+  /** 连接状态（pill 抬头那句 + 弹窗那一行）。 */
   status(): PillStatus
+  /** 退出配对：作废当前所有配对通道，返回作废的条数。幂等，没有可配对的通道时返回 0。 */
+  unpair(): number
   log(message: string, fields?: Record<string, string | number | boolean | undefined>): void
 }
 
@@ -165,7 +169,7 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   response.end(payload)
 }
 
-// ── 三条 handler ────────────────────────────────────────────────────
+// ── handler ─────────────────────────────────────────────────────────
 
 /** `POST /pairing/new`：点一下配对。 */
 export function pairNewHandler(deps: PillRouteDeps): (request: IncomingMessage, response: ServerResponse) => void {
@@ -253,9 +257,40 @@ export function pillStatusHandler(deps: PillRouteDeps) {
       json(response, 200, {
         relay: status.relay,
         paired: status.paired,
-        hostLabel: status.hostLabel,
         serverUrl: status.serverUrl,
       })
+    } catch (error) {
+      json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
+    }
+  }
+}
+
+/**
+ * `POST /unpair`：弹窗右上角那颗"退出配对"。
+ *
+ * 与发码同一条守卫（`x-drc-pair`），因为它是写路由：一条跨站请求若能让主机解配，
+ * 就等于让任意网页把用户自己的远程通道踢掉。
+ *
+ * 回 **200 + `{state:'ok', unpaired:n}`**：`n=0` 也是成功（本来就没配上），不是错误——
+ * 那颗按钮在"已配对"时才出现，但轮询与点击之间状态可能已经变了，把这种正常竞态
+ * 报成 500 只会让面板显示一句看不懂的红字。
+ */
+export function unpairHandler(deps: PillRouteDeps): (request: IncomingMessage, response: ServerResponse) => void {
+  return (request, response) => {
+    if (request.method !== 'POST') {
+      json(response, 405, { error: 'method not allowed' })
+      return
+    }
+    const guard = rejectedBy(request)
+    if (guard) {
+      deps.log('解配请求被守卫拒', { guard })
+      json(response, 403, { error: 'request-not-trusted', guard })
+      return
+    }
+    try {
+      const unpaired = deps.unpair()
+      deps.log('经状态栏退出配对', { unpaired })
+      json(response, 200, { state: 'ok', unpaired })
     } catch (error) {
       json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
     }
@@ -274,9 +309,9 @@ export interface WebServerLike {
 }
 
 /**
- * 挂上这三条路由；返回一个注销函数（三条一起摘，一条抛了也不许把其余留在宿主上）。
+ * 挂上这四条路由；返回一个注销函数（四条一起摘，一条抛了也不许把其余留在宿主上）。
  *
- * ⚠️ 半途失败也必须干净：`webServer.register` 会因为"路由名已被占用"抛错，而三条是**依次**挂的。
+ * ⚠️ 半途失败也必须干净：`webServer.register` 会因为"路由名已被占用"抛错，而四条是**依次**挂的。
  * 不加这层回滚的话，第二条挂不上时第一条就永久留在宿主上、`stop()` 再也拿不到它的注销函数——
  * 表现是"重载一次之后那条路由再也挂不上"（右栏方案当年踩过同一形状，见 install 脚本的退役逻辑）。
  */
@@ -286,6 +321,7 @@ export function registerPillRoutes(webServer: WebServerLike, deps: PillRouteDeps
     { kind: 'exact' as const, path: PAIR_NEW_ROUTE, handler: pairNewHandler(deps) },
     { kind: 'exact' as const, path: PAIR_IMAGE_ROUTE, handler: pairImageHandler(deps) },
     { kind: 'exact' as const, path: PAIR_STATUS_ROUTE, handler: pillStatusHandler(deps) },
+    { kind: 'exact' as const, path: PAIR_UNPAIR_ROUTE, handler: unpairHandler(deps) },
   ]
   try {
     for (const definition of definitions) off.push(webServer.register(definition))

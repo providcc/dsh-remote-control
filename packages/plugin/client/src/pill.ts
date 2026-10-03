@@ -2,9 +2,16 @@
  * pill — 状态栏那颗写"未配对 / 已配对"的 pill（浏览器那一半）。
  *
  * 它做三件事：往宿主的 `conversation.composer.dock` 槽位注册一颗 pill，按节拍问
- * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时弹面板——面板顶部那几行
- * 就是那四个字段读出来的"连接信息"，要配对得再按一次"生成配对码"（`POST /pairing/new`，
- * 再把 `GET /pairing.png` 画在同一个面板里）。
+ * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时弹面板。
+ *
+ * **面板的形状**（2026-10-03 重设计，以"精炼"为准）：抬头一行是状态 + 右上角那**一颗**动作按钮，
+ * 下面只在拿得到时补一行中继地址。那颗按钮跟着当前视图走：出图时是 `刷新`
+ * （同一条幂等发码路由 `POST /pairing/new`，`GET /pairing.png` 画进面板），其余情形
+ * **未配对**时是 `生成配对码`、**已配对**时是 `退出配对`（`POST /unpair`）。原来那三行
+ * "本机 / 状态 / 已配对"、`再配一台`、`换一张` 与"倒计时走完自动补一张"都在这一轮删掉了：
+ * 抬头那句已经是状态，台数只可能是 0 或 1，而一张码过期后该重发还是让用户自己按。
+ *
+ * 颜色就是状态：灰（未启动 / 未配对）、黄（连接中）、绿（已配对）、**红（已断开连接）**。
  *
  * 三条形状上的决定都有据可查，不是随手挑的：
  *
@@ -24,10 +31,11 @@
  * 纪律与主文件同一条：**任何一步抛出都只留一行日志，绝不把异常抛进 loader**。
  */
 
-/** pill 用到的三条路由（宿主侧定义在 `src/pill/routes.ts`，字符串必须一致）。 */
+/** pill 用到的四条路由（宿主侧定义在 `src/pill/routes.ts`，字符串必须一致）。 */
 export const STATUS_ROUTE = '/plugins/dsh-remote-control/status'
 export const NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
+export const UNPAIR_ROUTE = '/plugins/dsh-remote-control/unpair'
 
 /** 槽位与条目 id：抄 `conversation.composer.dock` 那个已验证的用法。 */
 export const SLOT_NAME = 'conversation.composer.dock'
@@ -60,7 +68,6 @@ export type CreateElement = (type: unknown, props: Record<string, unknown>) => u
 interface StatusAnswer {
   relay?: unknown
   paired?: unknown
-  hostLabel?: unknown
   serverUrl?: unknown
 }
 
@@ -120,25 +127,21 @@ export type PanelView =
  *
  * 抬头那句只说**结论**，不说数量也不说进度：`已连 N 台` 在那一排被压窄时会竖着断行（真屏幕
  * 踩过，见 CSS），而"配对中"这种中间态写在抬头上没人看得懂——码是不是还在、还剩几秒，
- * 点进去那几行连接信息里都有。所以未配上的两种情形（没有效码 / 有码还没人扫）合成一句
- * `未配对`，灯跟着走灰色：灰色才是"还没配上"的颜色。
+ * 点进去的弹窗里都有（面板抬头读的就是这一句，同一份来源）。所以未配上的两种情形
+ * （没有效码 / 有码还没人扫）合成一句 `未配对`，灯跟着走灰色：灰色才是"还没配上"的颜色。
+ *
+ * 四种 tone 就是四种颜色：`off` 灰（未启动 / 未配对）、`wait` 黄（连接中）、`on` 绿（已配对）、
+ * `error` 红（已断开连接）。2026-10-03 用户按真屏幕要的：断链必须红，不能和"没配上"同一个灰。
  */
-export function pillLabel(status: StatusAnswer | undefined): { text: string; tone: 'off' | 'wait' | 'on' } {
+export function pillLabel(status: StatusAnswer | undefined): { text: string; tone: 'off' | 'wait' | 'on' | 'error' } {
   const relay = status?.relay
   if (relay === 'idle') return { text: '远程未启动', tone: 'off' }
-  if (relay === 'offline') return { text: '远程未连接', tone: 'off' }
+  // 断链是**故障**不是"还没配"，所以它单独一档、单独一个红：灰色会被读成"还没轮到配"。
+  if (relay === 'offline') return { text: '已断开连接', tone: 'error' }
   if (relay === 'connecting') return { text: '连接中', tone: 'wait' }
   if (relay !== 'online') return { text: '远程控制', tone: 'off' }
   const paired = typeof status?.paired === 'number' ? status.paired : 0
   return paired > 0 ? { text: '已配对', tone: 'on' } : { text: '未配对', tone: 'off' }
-}
-
-/** 中继状态说成人话，用在"连接信息"那一栏（抬头那句是另一套更短的说法）。 */
-const RELAY_TEXT: Record<string, string> = {
-  online: '已连接',
-  connecting: '连接中',
-  offline: '未连接',
-  idle: '未启动',
 }
 
 /**
@@ -154,17 +157,15 @@ export function relayAddress(url: unknown): string {
   return authority.slice(0, 40)
 }
 
-/** 面板顶部那几行"连接信息"——四个非凭据字段，绝不含 6 位码 / PSK / 配对 URI。 */
-export function infoRows(status: StatusAnswer | undefined): Array<[string, string]> {
-  const rows: Array<[string, string]> = []
-  const label = typeof status?.hostLabel === 'string' ? status.hostLabel.trim() : ''
-  if (label !== '') rows.push(['本机', label])
-  const server = relayAddress(status?.serverUrl)
-  if (server !== '') rows.push(['中继', server])
-  const relay = typeof status?.relay === 'string' ? status.relay : ''
-  rows.push(['状态', RELAY_TEXT[relay] ?? '未知'])
-  rows.push(['已配对', `${typeof status?.paired === 'number' ? status.paired : 0} 台`])
-  return rows
+/**
+ * 面板正文那一行：只剩中继地址——排错时唯一要认的就是"连的哪一台"。
+ *
+ * 2026-10-03 重设计前这里是四行（本机 / 中继 / 状态 / 已配对）。那三行删掉的理由各自成立：
+ * 本机名配对时手机上已经看到、台数只可能是 0 或 1、而"连没连上"抬头那句已经说了。
+ * 地址拿不到（第一次轮询还没回来）时返回空串，调用方据此不占那一行。
+ */
+export function relayRow(status: StatusAnswer | undefined): string {
+  return relayAddress(status?.serverUrl)
 }
 
 /** 秒数说成人话：62 秒说"1 分 2 秒"——用户扫一张码不该数秒。 */
@@ -187,24 +188,35 @@ const CSS = `
 .drc-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--dsw-alias-label-dimmed, #9aa0a6); }
 .drc-dot[data-tone="wait"] { background: var(--dsw-alias-state-warn-primary, #faad14); }
 .drc-dot[data-tone="on"] { background: var(--dsw-alias-state-success-primary, #52c41a); }
+.drc-dot[data-tone="error"] { background: var(--dsw-alias-state-error-primary, #ff4d4f); }
 .drc-panel { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 30; width: 240px;
-  padding: 12px 14px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1)); border-radius: 12px;
+  padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1)); border-radius: 12px;
   background: var(--dsw-specific-tip, var(--dsw-alias-bg-layer-1, #ffffff));
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.06);
   color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; }
-/* 连接信息那一栏：键左值右，值被截断时省略号——和那颗 pill 同一套"挤不下就截文字不撑容器"。 */
-.drc-info { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px;
-  padding-bottom: 6px; border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.08)); }
-.drc-row { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+/* 抬头一行：左侧状态，右侧动作。两颗按钮都收在这个右上角（2026-10-03 重设计的要求）。 */
+.drc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.drc-head-label { font-weight: 600; }
+.drc-head-label[data-tone="off"] { color: var(--dsw-alias-label-secondary, #6b7280); }
+.drc-head-label[data-tone="wait"] { color: var(--dsw-alias-state-warn-primary, #faad14); }
+.drc-head-label[data-tone="on"] { color: var(--dsw-alias-state-success-primary, #52c41a); }
+.drc-head-label[data-tone="error"] { color: var(--dsw-alias-state-error-primary, #ff4d4f); }
+.drc-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.drc-btn { padding: 2px 10px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1));
+  border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer;
+  white-space: nowrap; }
+.drc-btn:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04)); }
+/* 正文那一行中继地址：键左值右（space-between），值被截断时省略号——和那颗 pill 同一套
+   "挤不下就截文字不撑容器"。 */
+.drc-info { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  white-space: nowrap; margin-top: 8px; padding-top: 6px;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.08)); }
 .drc-key { flex: 0 0 auto; color: var(--dsw-alias-label-tertiary); }
-.drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: right; }
-.drc-qr { display: block; width: 200px; height: 200px; margin: 0 auto; image-rendering: pixelated; }
+.drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.drc-qr { display: block; width: 200px; height: 200px; margin: 8px auto 0; image-rendering: pixelated; }
 .drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
 .drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
 .drc-note[data-kind="failed"] { color: var(--dsw-alias-state-error-primary, #ff4d4f); }
-.drc-actions { display: flex; gap: 6px; justify-content: center; margin-top: 8px; }
-.drc-btn { padding: 2px 10px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1));
-  border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
 `
 
 /** 认得出 slots 服务吗：`inject`（认领槽位）与 `register`（往里放组件）两个函数都得在。 */
@@ -273,7 +285,19 @@ function warn(message: string, error?: unknown): void {
 
 function ensureStyle(doc: Document): void {
   try {
-    if (doc.querySelector(`style[data-plugin-css="${STYLE_ID}"]`)) return
+    const existing = doc.querySelector(`style[data-plugin-css="${STYLE_ID}"]`)
+    if (existing) {
+      /**
+       * 已经插过就**按内容对齐**，不能只看"有没有插过"就返回。
+       *
+       * 宿主换新版这一半时文档未必重载（HMR 只替换模块、`<head>` 里的 `<style>` 原样留着），
+       * 于是新代码按新结构建 DOM、旧样式却还在生效——真屏幕上表现为整块面板错位
+       * （2026-10-03 用户截图：抬头那颗按钮掉到第二行居中，那是上一版 `.drc-actions` 的
+       * `justify-content: center` 在管事）。这一条就是那次事故的修法。
+       */
+      if (existing.textContent !== CSS) existing.textContent = CSS
+      return
+    }
     const element = doc.createElement('style')
     element.setAttribute('data-plugin-css', STYLE_ID)
     element.textContent = CSS
@@ -349,33 +373,56 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     return node
   }
 
-  /** 面板顶部那几行连接信息；没探到状态（第一次轮询还没回来）时不占地方。 */
-  const infoBlock = (): HTMLElement | undefined => {
+  /** 二维码那一行的说明：没过期报剩余时间，过期了就明说要自己再按一次（不再自动补一张）。 */
+  const qrNote = (): string =>
+    expiresInMs > 0 ? `扫码配对 · ${secondsText(expiresInMs)}后过期` : '配对码已过期，点右上角「刷新」重新生成'
+
+  /**
+   * 抬头一行：左边状态、右边动作。**面板唯一那颗动作按钮就收在这里**（面板的右上角）。
+   *
+   * 它跟着当前视图走：正在出图时是 `刷新`（同一条幂等发码路由，码还在就还是它、过期了才换新的），
+   * 其余情形按配没配上给 `生成配对码` / `退出配对`。原来二维码那一版仍印着 `生成配对码`，
+   * 同一件事两个说法，2026-10-03 用户按真屏幕改掉了。
+   *
+   * 状态那句话跟那颗 pill 读同一份 `pillLabel(lastStatus)`，所以面板开着时轮询一回来
+   * （比如手机上刚扫完码）这句话就跟着变。
+   */
+  const header = (): HTMLElement => {
+    const head = doc.createElement('div')
+    head.className = 'drc-head'
+    const state = pillLabel(lastStatus)
+    const stateText = text('span', 'drc-head-label', state.text)
+    stateText.setAttribute('data-tone', state.tone)
+    head.appendChild(stateText)
+    const actions = doc.createElement('div')
+    actions.className = 'drc-actions'
+    const action =
+      view.kind === 'qr' || view.kind === 'loading'
+        ? { label: '刷新', run: requestPairing }
+        : pairedNow() > 0
+          ? { label: '退出配对', run: requestUnpair }
+          : { label: '生成配对码', run: requestPairing }
+    actions.appendChild(buttonOf(action.label, () => void action.run()))
+    head.appendChild(actions)
+    return head
+  }
+
+  /** 正文那一行中继地址；没探到状态（第一次轮询还没回来）或地址为空时不占地方。 */
+  const relayBlock = (): HTMLElement | undefined => {
     if (!lastStatus) return undefined
-    const box = doc.createElement('div')
-    box.className = 'drc-info'
-    for (const [key, value] of infoRows(lastStatus)) {
-      const row = doc.createElement('div')
-      row.className = 'drc-row'
-      row.appendChild(text('span', 'drc-key', key))
-      row.appendChild(text('span', 'drc-value', value))
-      box.appendChild(row)
-    }
-    return box
+    const address = relayRow(lastStatus)
+    if (address === '') return undefined
+    const row = doc.createElement('div')
+    row.className = 'drc-info'
+    row.appendChild(text('span', 'drc-key', '中继'))
+    row.appendChild(text('span', 'drc-value', address))
+    return row
   }
 
   const paint = (): void => {
     if (!panel) return
     panel.replaceChildren()
-    const info = infoBlock()
-    if (info) panel.appendChild(info)
-    if (view.kind === 'info') {
-      const actions = doc.createElement('div')
-      actions.className = 'drc-actions'
-      actions.appendChild(buttonOf(pairedNow() > 0 ? '再配一台' : '生成配对码', () => void requestPairing()))
-      panel.appendChild(actions)
-      return
-    }
+    panel.appendChild(header())
     if (view.kind === 'loading') {
       panel.appendChild(text('p', 'drc-note', '正在生成配对码…'))
       return
@@ -386,29 +433,24 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       image.setAttribute('alt', '配对二维码')
       image.src = view.imageSrc
       panel.appendChild(image)
+      // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路）。
       panel.appendChild(text('p', 'drc-code', view.token))
-      // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路），但那句话不用说满：
-      // 面板顶部已经有连接信息，这行只负责"什么时候作废"。
-      panel.appendChild(text('p', 'drc-note', `扫码配对 · ${secondsText(expiresInMs)}后过期`))
-      const actions = doc.createElement('div')
-      actions.className = 'drc-actions'
-      actions.appendChild(buttonOf('换一张', () => void requestPairing()))
-      panel.appendChild(actions)
+      panel.appendChild(text('p', 'drc-note', qrNote()))
       return
     }
-    const note =
-      view.kind === 'unavailable'
-        ? text('p', 'drc-note', view.reason)
-        : (() => {
-            const node = text('p', 'drc-note', `配对请求没成功：${view.detail}`)
-            node.setAttribute('data-kind', 'failed')
-            return node
-          })()
-    panel.appendChild(note)
-    const actions = doc.createElement('div')
-    actions.className = 'drc-actions'
-    actions.appendChild(buttonOf('再试一次', () => void requestPairing()))
-    panel.appendChild(actions)
+    if (view.kind === 'unavailable' || view.kind === 'failed') {
+      const note =
+        view.kind === 'unavailable'
+          ? text('p', 'drc-note', view.reason)
+          : (() => {
+              const node = text('p', 'drc-note', `配对请求没成功：${view.detail}`)
+              node.setAttribute('data-kind', 'failed')
+              return node
+            })()
+      panel.appendChild(note)
+    }
+    const relay = relayBlock()
+    if (relay) panel.appendChild(relay)
   }
 
   const closePanel = (): void => {
@@ -452,13 +494,44 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       if (countTimer === undefined) {
         countTimer = setInterval(() => {
           expiresInMs -= 1000
-          // 到点自动再要一张：此刻宿主那边的 current() 已判过期，幂等入口会真的发新的。
-          if (expiresInMs <= 0) void requestPairing()
-          else paint()
+          // 到点**换一张的能力没有了**（2026-10-03 拍板）：不自动补、也没有「换一张」按钮。
+          // 停表并就地把它说成"已过期"，重发与否由人再按一次那颗按钮决定。
+          if (expiresInMs <= 0) {
+            clearInterval(countTimer)
+            countTimer = undefined
+          }
+          paint()
         }, 1000)
       }
     }
     paint()
+  }
+
+  /**
+   * 退出配对：面板右上角那颗按钮（只在已配对时出现）。
+   *
+   * 乐观地把 `paired` 清零再重画，这样那句话与那颗按钮**当场**就翻过去，不用等下一次轮询
+   * （轮询是 2 秒节拍，等它会让"按下没反应"成为错觉）。随后立刻补一次真轮询对账，
+   * 万一宿主那边没作废掉（比如守卫拒了），下一次轮询会把真相带回来。
+   */
+  async function requestUnpair(): Promise<void> {
+    if (disposed || !panel) return
+    try {
+      // 与发码同一条守卫：这是写路由，桌面宿主会删 `origin`，所以判据是那个自定义头。
+      await deps.fetchImpl(UNPAIR_ROUTE, {
+        method: 'POST',
+        headers: { 'x-drc-pair': '1' },
+        credentials: 'same-origin',
+      })
+    } catch (error) {
+      warn('退出配对请求失败（面板会靠下一次轮询对账）', error)
+    }
+    if (disposed || !panel) return
+    if (lastStatus) lastStatus = { ...lastStatus, paired: 0 }
+    view = { kind: 'info' }
+    write()
+    paint()
+    void pollStatus()
   }
 
   const openPanel = (): void => {
@@ -466,12 +539,12 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     panel = doc.createElement('div')
     panel.className = 'drc-panel'
     panel.setAttribute('role', 'dialog')
-    panel.setAttribute('aria-label', 'dsh-remote-control 连接信息')
+    panel.setAttribute('aria-label', 'dsh-remote-control 配对')
     panel.tabIndex = -1
     root.appendChild(panel)
     button.setAttribute('aria-expanded', 'true')
     /**
-     * 点开**只给连接信息**，发码要人再按一下那颗按钮。
+     * 点开**只给状态与那颗按钮**，发码要人再按一下右上角那颗。
      *
      * 原来这里是"点 pill = 发码"，因为那颗 pill 唯一的用途就是配对。现在抬头那句已经是
      * 状态（`未配对` / `已配对`），点它的第一预期变成"看一眼连得怎么样"，于是发码不再是
@@ -526,6 +599,20 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       const body = (await response.json?.()) as StatusAnswer | undefined
       if (!body || typeof body !== 'object') return
       lastStatus = body
+      /**
+       * 手机上刚扫完码：面板若还停在二维码上，当场翻回状态视图。
+       *
+       * 那一张码配上之后就没用了，继续占着面板会让人以为"还没成功、再扫一次"，而且抬头那句
+       * 已经翻成 `已配对`、右上角那颗也该换成 `退出配对` 了（2026-10-03 用户按真屏幕要的）。
+       */
+      if (view.kind === 'qr' && pairedNow() > 0) {
+        view = { kind: 'info' }
+        if (countTimer !== undefined) {
+          clearInterval(countTimer)
+          countTimer = undefined
+        }
+        if (panel) paint()
+      }
       write()
     } catch (error) {
       // 路由没挂上时是持续的 404/失败：这是一条降级说明，不是故障。

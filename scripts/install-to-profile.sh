@@ -6,19 +6,19 @@
 #
 # 装的是**一个 bundle，两半产物**（2026-10-03 起；之前是两包两个 bundle）：
 #
-#   dsh-remote-control/index.js    宿主侧：配对、中继、会话、命令，**外加**给状态栏那颗
-#                                  pill 挂三条同域路由（发码 / 图片 / 状态）。
+#   dsh-remote-control/index.js    宿主侧：配对、中继、会话，**外加**给状态栏那颗
+#                                  pill 挂四条同域路由（发码 / 图片 / 状态 / 退出配对）。
 #   dsh-remote-control/client.cjs  浏览器面：向装载器拿 react、往 `conversation.composer.dock`
-#                                  注册那颗 pill——点一下发码、二维码弹在按钮上方。
+#                                  注册那颗 pill——点开是状态，发码要按面板右上角那颗按钮。
 #
 # 为什么原来拆两包、现在折一个：拆包是为了"某一代宿主没有 `webServer` 时只有那一行不激活，
 # 配对/中继一行都不受影响"。折成一个包之后这个隔离由代码提供——`src/pill/start.ts`
 # 只软探测 `webServer`，拿不到就整半不起；`tests/pill-isolation.test.ts` 用**逐字段对照**
 # 锁住这件事（同一个假上下文跑两遍，差别只许出现在 `state().pill` 与那条 `warn:pill` 上）。
 #
-# ⚠️ 2026-10-03 起**配对入口只有那颗 pill**：右栏自动弹码、终端文本码、以及 `/drc pair`
-# 都删了。所以"路由没挂上"= 这台主机配不了对，它会在 `status.json` 的 `problems` 里
-# 留一条 `warn:pill`——别再去找那个已经不存在的手动入口。
+# ⚠️ 2026-10-03 起**配对入口只有那颗 pill**：右栏自动弹码、终端文本码都删了，`/drc` 命令
+# 更是**整条删掉**（一个命令都不再注册）。所以"路由没挂上"= 这台主机配不了对，它会在
+# `status.json` 的 `problems` 里留一条 `warn:pill`——别再去找那个已经不存在的手动入口。
 #
 # 为什么长这样（每条都是踩过坑换来的）：
 # 1. **只拷产物**：两半都由 esbuild 打成自包含单文件（dist/bundle/*），
@@ -154,9 +154,9 @@ echo "   下一步：**重启 Harness**（新代码不会被热加载；浏览�
 echo "     cat ~/.dsh/dsh-remote-control/status.json"
 echo "   关键四字段：carrier（services=真内核 / mock=内存替身 / none=配置或载体问题）、"
 echo "               relay（online/connecting/offline）、relayProblem、"
-echo "               pill（配对入口那三条路由的软探测结果：routes=registered / webServer=none / disabled）"
+echo "               pill（配对入口那四条路由的软探测结果：routes=registered / webServer=none / disabled）"
 echo "   配对：点状态栏那颗 dsh-remote-control（输入框那一排）。**命令行没有配对入口了**——"
-echo "     /drc 只剩 status 与 unpair，右栏自动弹码与终端文本码都已删除。"
+echo "     /drc 命令整条删掉（一个命令都不再注册），右栏自动弹码与终端文本码也都已删除。"
 echo "     那颗 pill 没出现时：先看 status.json 的 problems 里有没有 warn:pill（宿主侧没挂上路由，"
 echo "     原因在 pill 那块探针里），再看 DevTools 控制台里 [dsh-remote-control pill] 开头的"
 echo "     console.warn（那是浏览器面拿不到 react 或探不到 slots）。"

@@ -1,15 +1,16 @@
 /**
  * pill-isolation.test — "界面上那一半不许连累配对链路"这条隔离的对照测试。
  *
- * 2026-10-03 这一半原来是右栏自动弹码 + 一条只读路由；现在它是状态栏那颗 pill 的三条路由。
- * 隔离的形状没变：**它需要宿主的 `webServer` 服务，而主插件刻意不写任何 `inject:` 闸门**，
- * 所以"这代宿主没这个服务"时只有这一旁路不起，配对、中继、命令一行都不受影响。
- * 原来这条隔离是靠"拆成两个 cordis 条目"这个结构提供的，现在由 `src/pill/start.ts`
- * 的软探测提供——所以必须有对照测试钉住，否则"结构"没了，隔离也就没了。
+ * 2026-10-03 这一半原来是右栏自动弹码 + 一条只读路由；现在它是状态栏那颗 pill 的四条路由
+ * （发码 / 图 / 状态 / 退出配对）。隔离的形状没变：**它需要宿主的 `webServer` 服务，
+ * 而主插件刻意不写任何 `inject:` 闸门**，所以"这代宿主没这个服务"时只有这一旁路不起，
+ * 配对、中继、状态快照一行都不受影响。原来这条隔离是靠"拆成两个 cordis 条目"这个结构
+ * 提供的，现在由 `src/pill/start.ts` 的软探测提供——所以必须有对照测试钉住，
+ * 否则"结构"没了，隔离也就没了。
  *
  * 判据的形式是**对照**而不是"没报错就行"：同一个假上下文跑两遍 `apply()`，唯一的差别是
- * 有没有 `webServer`，然后要求主链路上每一项可观察状态**逐字段相等**、`/drc unpair` 的返回
- * **逐字节相等**。为什么必须做到这个强度：本插件真实发生过的最坏故障是 fiber 被标 FAILED →
+ * 有没有 `webServer`，然后要求主链路上每一项可观察状态**逐字段相等**、字段集合逐个相同。
+ * 为什么必须做到这个强度：本插件真实发生过的最坏故障是 fiber 被标 FAILED →
  * 宿主把它那几个 `ctx.inject` 子 fiber 一起 dispose → carrier=none、配对链路整条没
  * （取证见 `src/index.ts` apply() 里那条纪律）。"没抛异常"抓不到这种形状，而对照能。
  *
@@ -17,9 +18,9 @@
  * （路由名被别的插件占了）；④ 有，但 `pill.enabled:false` 显式关掉。③ 与 ④ 最阴，
  * 因为它们是"我们这一半失败/被关"在宿主的对象上。
  *
- * 另外钉一条与删除直接相关的：**配对入口不可用时必须有 `warn:pill`**。`/drc pair` 与终端
- * 文本码都在 2026-10-03 删了，如果"路由没挂上"这件事没有一条可查的记录，表现就是
- * "这台主机配不了对，而没有任何地方说为什么"。
+ * 另外两条与 2026-10-03 那轮删除直接相关：**配对入口不可用时必须有 `warn:pill`**
+ * （`/drc` 命令与终端文本码都删了，路由没挂上就没有任何配对入口，不留痕就是静默失败）；
+ * 以及**不再注册任何命令**（`/drc` 整条已删，命令注册这条路不该再被碰）。
  *
  * 中继一律指 `ws://127.0.0.1:1`（必然拒绝），这样"连不上"是确定的而不是竞态；
  * `carrierGraceMs` 压到 50ms，否则载具要等默认 5s 宽限期才决定，测试会变成等时间。
@@ -30,7 +31,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../src/index.js'
-import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/pill/routes.js'
+import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE } from '../src/pill/routes.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
@@ -57,21 +58,6 @@ interface RegisterCall {
   handler?: (request: unknown, response: unknown) => unknown
 }
 
-/** `/drc` 注册出来的对外形状，只取"用户看得见的那几项"。 */
-interface CommandShape {
-  name: string
-  description?: string
-  input?: { hint?: string }
-}
-
-/** hint 是 `status | unpair` 这种串：按竖线切开再判，`unpair` 里含着 `pair` 这个子串。 */
-function hintWords(hint: string | undefined): string[] {
-  return String(hint ?? '')
-    .split('|')
-    .map((word) => word.trim())
-    .filter(Boolean)
-}
-
 /**
  * 假 ctx 的 `get`。cordis 那侧的签名是泛型的（`get<T>(name, optional?) => T | undefined`），
  * 写成 `(name: string) => 具体对象 | undefined` 会在 `apply(ctx)` 的边界上红——
@@ -83,9 +69,11 @@ function fakeGet(byName: Record<string, unknown>): <T>(name: string, optional?: 
 
 interface Booted {
   state(): Record<string, unknown>
-  commandRegistered: boolean
-  /** 注册出来的 `/drc` 对外形状（说明文字与提示行）。 */
-  commandShape(): CommandShape | undefined
+  /**
+   * 注册出去的**命令**个数。`/drc` 整条已删（2026-10-03），所以这个数必须恒为 0——
+   * 留着它不是"还能注册"，而是钉住"这条路上不该再有东西"。
+   */
+  commandCount: number
   providedKeys: string[]
   registerCalls: RegisterCall[]
   unregistered: () => number
@@ -96,8 +84,6 @@ interface Booted {
    * 里一次性 push 的启动快照。
    */
   flushInject(): void
-  /** 真注册出来的 `/drc` handler；跑它才算验到"命令这一路没被连累"。 */
-  runDrc(rawInput: string): Promise<unknown>
   waitForCarrier(): Promise<Record<string, unknown>>
   dispose(): void
 }
@@ -117,16 +103,10 @@ function boot(
     lateWeb?: boolean
   } = {},
 ): Booted {
-  interface Definition {
-    name: string
-    description?: string
-    input?: { hint?: string }
-    handler?: (invocation: { commandId: string; rawInput: string; agent?: unknown }) => unknown
-  }
-  const registered: Record<string, Definition> = {}
   const disposers: Array<() => void> = []
   const provided: Record<string, unknown> = {}
   const registerCalls: RegisterCall[] = []
+  let commandCount = 0
   let unregistered = 0
   let disposed = false
   const statusDir = mkdtempSync(path.join(tmpdir(), 'drc-isolation-'))
@@ -157,7 +137,7 @@ function boot(
   const pendingInject: Array<() => void> = []
 
   const context = {
-    // 假的/非 cordis 上下文：命令直接挂 ctx.commands（真 cordis 上这一读会抛，走 get/inject）。
+    // 假的/非 cordis 上下文：命令这一路留着只为**计数**——`/drc` 已删，这里必须恒为 0。
     get: fakeGet(services),
     inject: (names: string[], callback: (scoped: never) => void) => {
       // 只欠 `webServer` 那一条：别的注入保持原样（从不触发），否则这条 fixture 会变竞态测试。
@@ -172,7 +152,9 @@ function boot(
       provided[name] = value
     },
     commands: {
-      register: (definition: Definition) => void (registered[definition.name] = definition),
+      register: () => {
+        commandCount += 1
+      },
     },
     on: () => () => undefined,
     off: () => undefined,
@@ -185,7 +167,7 @@ function boot(
     serverUrl: 'ws://127.0.0.1:1',
     hostToken: FAKE_TOKEN,
     hostId: 'isolation_host',
-    // 连接信息那一栏要把本机名原样带出来，所以这里给一个可断言的值（默认值是 `dsh-host`）。
+    // 本机名还在**状态快照**里（配置回显那一路），只是 pill 弹窗里已经撤了（现在只剩一行中继地址）。
     hostLabel: 'linbin-desk',
     statusFile: path.join(statusDir, 'status.json'),
     mockBridge: true,
@@ -200,22 +182,18 @@ function boot(
         state?: Record<string, unknown>
       }
     | undefined
-  const definition = registered.drc
 
   return {
     state: () => service?.state ?? { relay: 'not-provided' },
-    commandRegistered: definition !== undefined,
-    commandShape: () => definition,
+    get commandCount() {
+      return commandCount
+    },
     providedKeys: Object.keys(provided),
     registerCalls,
     unregistered: () => unregistered,
     flushInject(): void {
       if (web) services.webServer = web
       for (const fire of pendingInject.splice(0)) fire()
-    },
-    async runDrc(rawInput: string) {
-      if (!definition?.handler) throw new Error('drc 命令没注册或没有 handler')
-      return await definition.handler({ commandId: 'isolation-cmd', rawInput })
     },
     /**
      * 等到"载具已决定 + 中继真的走完一次连接尝试"，并**返回那一刻的快照**。
@@ -261,11 +239,11 @@ function pillProblem(state: Record<string, unknown>): string | undefined {
   return problems.find((entry) => entry === 'warn:pill')
 }
 
-test('缺 webServer：provide 与 drc 注册都在，路由一次都没去挂，但配对入口不可用要说话', async () => {
+test('缺 webServer：provide 照常、一个命令都没注册，路由一次都没去挂，但配对入口不可用要说话', async () => {
   const without = boot({})
   try {
     const state = await without.waitForCarrier()
-    assert.equal(without.commandRegistered, true, '缺 webServer 时 drc 命令必须照样注册')
+    assert.equal(without.commandCount, 0, '/drc 整条已删，命令注册这条路不该再被碰')
     assert.deepEqual(without.providedKeys, ['dshRemoteControl'], 'provide 必须照常发生')
     assert.equal(without.registerCalls.length, 0, '没有 webServer 就不该有人去挂路由')
     // 这条是"配不了对"的排查入口：probe 必须说清是没探到，而不是沉默。
@@ -287,7 +265,7 @@ test('缺 webServer：provide 与 drc 注册都在，路由一次都没去挂，
 test('webServer 晚到（注入回调在 apply 返回之后才触发）：挂上之后 warn:pill 必须自己消失', async () => {
   // 真机的形状：`webServer` 是 `ctx.inject` 的回调给的，可能在 apply 返回之后才到。
   // 那条 warn 曾经是在 apply 里一次性 push 进 `problems` 的，于是启动快照会永远带着
-  // "配对入口不可用"，哪怕三条路由后来挂上了——2026-10-03 重装重启后 status.json 里
+  // "配对入口不可用"，哪怕四条路由后来挂上了——2026-10-03 重装重启后 status.json 里
   // `routes:"registered"` 与 `problems:["warn:pill"]` 并存，就是这么来的。
   const late = boot({ webServer: true, lateWeb: true })
   try {
@@ -298,21 +276,21 @@ test('webServer 晚到（注入回调在 apply 返回之后才触发）：挂上
     late.flushInject()
     const state = await late.waitForCarrier()
     assert.equal((state.pill as Record<string, string>).webServer, 'via inject')
-    assert.equal((state.pill as Record<string, string>).routes, 'registered', '三条路由补挂上了')
-    assert.equal(late.registerCalls.length, 3, '三条一起挂')
+    assert.equal((state.pill as Record<string, string>).routes, 'registered', '四条路由补挂上了')
+    assert.equal(late.registerCalls.length, 4, '四条一起挂')
     assert.equal(
       pillProblem(state),
       undefined,
       `routes 已 registered 却还报 warn:pill = 启动快照的假警报：${JSON.stringify(state.problems)}`,
     )
     late.dispose()
-    assert.equal(late.unregistered(), 3, '晚到挂上的路由，停机时同样要注销干净')
+    assert.equal(late.unregistered(), 4, '晚到挂上的路由，停机时同样要注销干净')
   } finally {
     late.dispose()
   }
 })
 
-test('对照：主链路字段逐个相等、`/drc unpair` 逐字节相等，差别只允许出现在 pill 与那条 warn 上', async () => {
+test('对照：主链路字段逐个相等、字段集合逐个相同，差别只允许出现在 pill 与那条 warn 上', async () => {
   const without = boot({})
   const withWeb = boot({ webServer: true })
   try {
@@ -342,20 +320,18 @@ test('对照：主链路字段逐个相等、`/drc unpair` 逐字节相等，差
       '两边快照的字段集合必须一致：少一个字段就是主链路被连带了',
     )
 
-    // 命令这一路才是用户真正走得通的那条：返回必须逐字节相同。
-    const textA = await without.runDrc('unpair')
-    const textB = await withWeb.runDrc('unpair')
-    assert.deepEqual(textB, textA, '/drc unpair 的返回因为 webServer 有无而不同，说明界面那一半连累了命令分支')
-    assert.equal((textA as { kind?: string }).kind, 'success', `宿主契约只认 success/error：${JSON.stringify(textA)}`)
+    // 命令这一路已经没有了（`/drc` 2026-10-03 整条删）：两边都不许冒出任何命令。
+    assert.equal(without.commandCount, 0, '没有 webServer 时也不许注册命令')
+    assert.equal(withWeb.commandCount, 0, '有 webServer 时同样不许注册命令')
 
     // 唯一允许的两处差别，都要精确断言而不是"允许不同"。
     assert.equal((a.pill as Record<string, string>).webServer, 'none')
     assert.equal((b.pill as Record<string, string>).webServer, 'via get')
-    assert.equal((b.pill as Record<string, string>).routes, 'registered', '三条路由一起挂上')
+    assert.equal((b.pill as Record<string, string>).routes, 'registered', '四条路由一起挂上')
     assert.deepEqual(
       withWeb.registerCalls.map((call) => call.path),
-      [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE],
-      '三条路由一起挂：发码 + 弹窗的图 + 抬头状态',
+      [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE],
+      '四条路由一起挂：发码 + 弹窗的图 + 抬头状态 + 退出配对',
     )
     // problems 的差别必须是**恰好那一条** warn:pill，多一条少一条都算红。
     assert.ok(pillProblem(a), '没 webServer 那侧必须有 warn:pill')
@@ -370,14 +346,14 @@ test('对照：主链路字段逐个相等、`/drc unpair` 逐字节相等，差
     // 而表现是"重载一次之后那颗 pill 再也不出现"。这里在断言之后 dispose，两个 finally
     // 里的 dispose 是同一次（helper 内部有 once 守卫）。
     withWeb.dispose()
-    assert.equal(withWeb.unregistered(), 3, '三条路由都要注销')
+    assert.equal(withWeb.unregistered(), 4, '四条路由都要注销')
   } finally {
     without.dispose()
     withWeb.dispose()
   }
 })
 
-test('配对入口只有 pill：两种宿主上 hint 与说明都不许再宣传 pair', async () => {
+test('配对入口只有 pill：两种宿主上都不注册任何命令，凭据也就无从经命令行外泄', async () => {
   const without = boot({})
   const withWeb = boot({ webServer: true })
   try {
@@ -387,50 +363,40 @@ test('配对入口只有 pill：两种宿主上 hint 与说明都不许再宣传
       ['没 webServer', without],
       ['有 webServer', withWeb],
     ] as const) {
-      const hint = booted.commandShape()?.input?.hint
-      assert.ok(
-        !hintWords(hint).includes('pair'),
-        `${label} 这一侧的 hint 里不许再有 pair（命令行兜底已删）：${String(hint)}`,
-      )
-      assert.match(String(booted.commandShape()?.description), /状态栏/, '说明文字要把人指到那颗 pill 上')
+      assert.equal(booted.commandCount, 0, `${label} 这一侧不该注册任何命令（/drc 已整条删掉）`)
     }
-    // 反证：`pair` 落到默认分支 = 状态快照，而不是"发一张码"。
-    const raw = (await withWeb.runDrc('pair')) as { kind?: string; text?: string }
-    assert.equal(raw.kind, 'success')
-    assert.doesNotMatch(String(raw.text), /dshr:|psk/, '命令行不许再把配对凭据印出来')
   } finally {
     without.dispose()
     withWeb.dispose()
   }
 })
 
-test('register() 抛错（路由名被占）：只废掉界面那一半，注册与中继不受影响，且报 warn:pill', async () => {
+test('register() 抛错（路由名被占）：只废掉界面那一半，命令与中继不受影响，且报 warn:pill', async () => {
   const hostile = boot({ registerThrows: true })
   const control = boot({})
   try {
     const state = await hostile.waitForCarrier()
     const baseline = await control.waitForCarrier()
-    assert.equal(hostile.commandRegistered, true, '我们这一半失败，drc 命令必须还在')
+    assert.equal(hostile.commandCount, 0, '我们这一半失败，也不许冒出命令')
     assert.equal(state.relay, baseline.relay, '中继状态不许因为路由失败而变')
     assert.equal(state.carrier, baseline.carrier, '载具状态不许因为路由失败而变')
     assert.ok(
       String((state.pill as Record<string, string>).routes ?? '').startsWith('register threw'),
       '路由注册抛错必须在 probe 里留痕，不然排查时会以为是"没有码"：' + JSON.stringify(state.pill),
     )
-    assert.equal(hostile.registerCalls.length, 1, '第一条注册就抛了，后两条不该再试')
+    assert.equal(hostile.registerCalls.length, 1, '第一条注册就抛了，后三条不该再试')
     assert.ok(pillProblem(state), '挂不上 = 没有配对入口，这条 warn 必须在')
-    assert.deepEqual(await hostile.runDrc('unpair'), await control.runDrc('unpair'), '/drc unpair 必须不受影响')
   } finally {
     hostile.dispose()
     control.dispose()
   }
 })
 
-test('三条里只挂上两条：available 仍是 false——pill 点不开就是没有配对入口', async () => {
+test('四条里只挂上两条：available 仍是 false——pill 点不开就是没有配对入口', async () => {
   const partial = boot({ registerThrowsFrom: 2 })
   try {
     const state = await partial.waitForCarrier()
-    assert.equal(partial.registerCalls.length, 3, '三条都试过')
+    assert.equal(partial.registerCalls.length, 3, '第三条就抛了，所以只试到三条')
     assert.equal((state.pill as Record<string, string>).routes, 'register threw: 这条路径宿主不给挂')
     assert.ok(pillProblem(state), '只要有一条没挂上，pill 就点不开，必须报')
     partial.dispose()
@@ -446,7 +412,7 @@ test('pill.enabled=false：显式关掉唯一配对入口，路由一条都不�
     const state = await off.waitForCarrier()
     assert.equal(off.registerCalls.length, 0, '关掉了就不该去挂路由')
     assert.equal((state.pill as Record<string, string>).pill, 'disabled')
-    assert.equal(off.commandRegistered, true, '关掉界面入口不影响命令注册')
+    assert.equal(off.commandCount, 0, '关掉界面入口也不该冒出命令（本来就没有了）')
     assert.equal(state.relay, 'offline')
     // 这一条是"代价要能被查见"的锁：默认值是开，所以只有用户自己关才会走到这里，
     // 而关掉之后这台主机就没有任何配对入口了——不说话的静默失败是最难查的那种。
@@ -461,11 +427,17 @@ test('pill.enabled=false：显式关掉唯一配对入口，路由一条都不�
   }
 })
 
-test('pill 那三条挂上去的就是带守卫的那三条（接线，不是又拼一遍 deps）', async () => {
+test('pill 那四条挂上去的就是带守卫的那四条（接线，不是又拼一遍 deps）', async () => {
   const withWeb = boot({ webServer: true })
   try {
     const state = await withWeb.waitForCarrier()
     assert.equal(state.relay, 'offline', '这条 fixture 的中继是故意不可达的')
+    // 四条都在、顺序与 registerPillRoutes 一致。
+    assert.deepEqual(
+      withWeb.registerCalls.map((call) => call.path),
+      [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE],
+      '四条路由一起挂：发码 + 弹窗的图 + 抬头状态 + 退出配对',
+    )
 
     const handlerFor = (p: string) => {
       const found = withWeb.registerCalls.find((call) => call.path === p)
@@ -520,19 +492,25 @@ test('pill 那三条挂上去的就是带守卫的那三条（接线，不是又
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: '127.0.0.1:5173' })).status, 204)
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: 'evil.example.com' })).status, 403)
 
-    // 抬头那句状态 + 点开那几行连接信息：只读（Origin 缺席放过），字段集合就那四个。
+    // 退出配对：真机形状（环回 Host + 自定义头，没有 Origin）→ 200；GET → 405；少了头 → 403。
+    const unpaired = await run(PAIR_UNPAIR_ROUTE, 'POST', { host: '127.0.0.1:5173', 'x-drc-pair': '1' })
+    assert.equal(unpaired.status, 200, unpaired.body)
+    assert.deepEqual(JSON.parse(unpaired.body), { state: 'ok', unpaired: 0 }, '这台没配上，unpaired=0 也是成功')
+    assert.equal((await run(PAIR_UNPAIR_ROUTE, 'GET', { host: '127.0.0.1:5173', 'x-drc-pair': '1' })).status, 405)
+    assert.equal((await run(PAIR_UNPAIR_ROUTE, 'POST', { host: '127.0.0.1:5173' })).status, 403)
+
+    // 抬头那句状态 + 点开那一行中继地址：只读（Origin 缺席放过），字段集合就那三个。
     // `relay` 允许 offline / connecting 两种——保活重连在跑，这里钉死一种就是计时器测试。
     const status = await run(PAIR_STATUS_ROUTE, 'GET', { host: '127.0.0.1:5173' })
     assert.equal(status.status, 200, status.body)
     const shown = JSON.parse(status.body) as Record<string, unknown>
     assert.deepEqual(
       Object.keys(shown).sort(),
-      ['hostLabel', 'paired', 'relay', 'serverUrl'],
-      '状态路由多出字段就是要重新审一遍（这四个全是非凭据）',
+      ['paired', 'relay', 'serverUrl'],
+      '状态路由多出字段就是要重新审一遍（这三个全是非凭据；本机名 2026-10-03 撤了）',
     )
     assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
     assert.equal(shown.paired, 0)
-    assert.equal(shown.hostLabel, 'linbin-desk', '连接信息里那句本机名要来自配置，不是写死的')
     assert.equal(shown.serverUrl, 'ws://127.0.0.1:1', '中继地址就是插件连的那个，浏览器面不许自己猜')
 
     // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。

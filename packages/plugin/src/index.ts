@@ -1,9 +1,10 @@
 /**
  * index — cordis bundle 入口（host 侧）。
  *
- * 职责边界（取证 docs/legacy-spec/host-plugin-cordis.md §1）：这个文件只做四件事
- * —— 读配置并校验、探测内核载体、把内核端口/中继客户端/运行时/防休眠接起来、
- * 注册 `/drc` 命令并持续写状态快照。业务逻辑都在 `core/`，平台知识都在 `platform/`。
+ * 职责边界（取证 docs/legacy-spec/host-plugin-cordis.md §1）：这个文件只做三件事
+ * —— 读配置并校验、探测内核载体、把内核端口/中继客户端/运行时/防休眠接起来并持续写状态快照。
+ * 配对入口只有状态栏那颗 pill（`pill/start.ts` 那四条路由）。业务逻辑都在 `core/`，
+ * 平台知识都在 `platform/`。
  *
  * 三条不可违反的纪律：
  *
@@ -50,14 +51,6 @@ interface LooseContext {
    * 让 apply 整体失败 → fiber FAILED → 六个 inject 子 fiber 全被 dispose → carrier=none）。
    */
   effect?(execute: () => (() => unknown) | void): unknown
-  commands?: {
-    register?(definition: {
-      name: string
-      description: string
-      input?: { hint?: string }
-      handler?: (invocation: { commandId: string; rawInput: string; agent?: unknown }) => Promise<unknown> | unknown
-    }): unknown
-  }
 }
 
 export interface RuntimeHandle {
@@ -77,20 +70,16 @@ const SERVICE_NAMES = [
   'sessionController',
 ]
 
-/** 同时保持的配对通道硬上界：超出就从最不活跃的开始剪（空闲 TTL 之外的第二道闸）。 */
+/**
+ * 同时保持的配对通道硬上界：超出就从最不活跃的开始剪（空闲 TTL 之外的第二道闸）。
+ *
+ * 配对策略是**只允许一台**（`onPeerJoined` 里新设备一来就作废旧的），所以正常情况下
+ * 这里永远只有 0 或 1 条；留着这个上界是为了在"作废链路本身出问题"时不至于无界增长。
+ */
 const MAX_CONVERSATIONS = 64
 
 /** 取证：同一个进程里宿主调用了几次 `apply`（bundle 被重复挂载时能看到）。 */
 const APPLY_COUNT = { n: 0 }
-
-/**
- * 宿主命令的返回契约（`@deepseek-ai/dsh-commands` 的 `normalizeResult`）。
- *
- * 只有两种 kind；别的值会在注册边界上 `throw TypeError("...unknown result kind...")`，
- * 整条命令失败。**把它写成类型**是为了让"写错 kind"在编译期就红，而不是等用户在
- * 真机上看到一句宿主内部错误。
- */
-export type CommandResult = { kind: 'success'; text?: string } | { kind: 'error'; text: string }
 
 /** 默认时钟：真实定时器。测试注入假时钟（见 core/clock.ts）。 */
 export const systemClock: Clock = DEFAULT_SYSTEM_CLOCK
@@ -199,7 +188,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   let relay: RelayClient | undefined
   let startedCarrier = ''
   /**
-   * 状态栏那颗 pill 的三条路由（配对的唯一入口）。`undefined` = 还没起 / 起不动。
+   * 状态栏那颗 pill 的四条路由（配对的唯一入口）。`undefined` = 还没起 / 起不动。
    * 它**不在主链路上**：没有 `webServer` 时它就是 undefined，配对、中继、命令一行都不受影响
    * ——这正是原来"拆成两个包"所提供的隔离，现在由 `startPill` 的软探测提供。
    */
@@ -245,6 +234,18 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         pairingWindow.applyServerTtl(token, ttlMs)
       },
       onPeerJoined: (conversationId, pairingToken) => {
+        /**
+         * **只允许一台**（2026-10-03 拍板）。中继在通知我们之前已经把这条新通道开好了
+         * （`relay.ts` 的 peer-joined 先 `conversations.open` 再回调），所以这里要作废的是
+         * **除它以外**的所有通道——新设备一进来，旧设备当场被踢下去。
+         *
+         * 走 `voidConversation` 而不是只删本地：只删本地的话，中继仍会把旧手机的密文转过来，
+         * 而那台手机面对的是一个听不见的对端（R1 那个静默黑洞）。`session-leave` 发出去，
+         * 旧手机端才会显示"主机已断开，请重新配对"。
+         */
+        for (const id of relay?.conversationIds() ?? []) {
+          if (id !== conversationId) relay?.voidConversation(id)
+        }
         runtime?.start()
         void runtime?.pushSessions('peer-joined')
         // 一次性码用掉了就当场换一张新的（而不是等半程刷新）：第二部手机要的是一张新码，
@@ -325,7 +326,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // 出站计数：手机上"没收到 X"的第一现场对比点（插件没发 vs 发了但路上丢了）。
       outbound: runtime?.stats ?? null,
       probe,
-      // 配对入口（那颗 pill 的三条路由）为什么没起，是"配不了对"唯一的排查入口：
+      // 配对入口（那颗 pill 的四条路由）为什么没起，是"配不了对"唯一的排查入口：
       // 这里直接把软探测的结果带出来。
       pill: pillRoutes?.probe ?? { webServer: 'not-started' },
       // token 永远不出现真值；这条有测试锁住。
@@ -413,17 +414,30 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
 
   /**
-   * pill 抬头那句"连接状态"与点开那几行"连接信息"：取值口径与 `status.json` 完全一致
+   * pill 抬头那句"连接状态"与点开那一行中继地址：取值口径与 `status.json` 完全一致
    * （同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
-   * 这里出去的四个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
+   * 这里出去的三个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
    */
   function pillStatus(): PillStatus {
     return {
       relay: relay ? relayState() : 'idle',
       paired: relay?.conversationCount ?? 0,
-      hostLabel: config.hostLabel,
       serverUrl: config.serverUrl,
     }
+  }
+
+  /**
+   * 退出配对（弹窗右上角那颗按钮走的就是这里）：作废当前所有配对通道，返回条数。
+   *
+   * 幂等——本来没配上时返回 0，面板把 0 当成功（轮询与点击之间状态可能已经变了，
+   * 把这种正常竞态报成失败只会让面板显示一句看不懂的红字）。
+   * 与每条通道走 `voidConversation`，中继那边才会收到 `session-leave`、
+   * 手机端才会显示"主机已断开，请重新配对"。
+   */
+  function unpairAll(): number {
+    const ids = relay?.conversationIds() ?? []
+    for (const id of ids) relay?.voidConversation(id)
+    return ids.length
   }
 
   /**
@@ -783,11 +797,10 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     log('no kernel carrier available', { hint: '需要 sessions 服务，或把 mockBridge 打开做开发' })
   }
 
-  // ── 配对入口：状态栏那颗 pill 的三条路由 ────────────────────────────
+  // ── 配对入口：状态栏那颗 pill 的四条路由 ────────────────────────────
   //
-  // 放在 `/drc` 命令**之前**：命令的说明文字与"配对入口还在不在"那条判断都要先知道结果，
-  // 而软探测与路由注册在 `startPill` 里同步完成。
-  // 主链路仍然先成立：这一半起不来时，上面接好的那些一行都不许被回滚。
+  // **配对唯一入口就是这四条路由**（`/drc` 命令 2026-10-03 整个删掉了）。
+  // 主链路先成立：这一半起不来时，上面接好的那些一行都不许被回滚。
   //
   // 整段再包一层 try 不是冗余：`startPill` 内部已经层层兜住，但"层层兜住"是设计不是证明。
   // 它一旦抛出，宿主会把我们这条 fiber 标 FAILED 并 dispose 掉那几个 inject 子 fiber——
@@ -795,10 +808,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   try {
     pillRoutes = startPill(ctx, {
       enabled: config.pill.enabled,
-      // 三条路由要的三件事：幂等发码、只读看当前码、读连接状态。
+      // 四条路由要的四件事：幂等发码、只读看当前码、读连接状态、退出配对。
       ensureFresh: () => ensureFreshPairing(),
       current: () => currentPairing(),
       status: () => pillStatus(),
+      unpair: () => unpairAll(),
       log,
     })
   } catch (error) {
@@ -807,76 +821,10 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       message: String((error as Error)?.message ?? error).slice(0, 200),
     })
   }
-  // **配对入口没了必须说得出为什么**：`/drc pair` 与终端文本码都在 2026-10-03 删掉了，
+  // **配对入口没了必须说得出为什么**：`/drc` 命令与终端文本码都在 2026-10-03 删掉了，
   // "这台主机配不了对"如果没有一条可查的记录，表现就是静默失败。那条 `warn:pill` 由
   // `state()` 每次快照现判（理由见那里），原因本身落在同一个快照的 `pill` 探针里——
   // 通常就在软探测那一步（宿主没 `webServer`，或者路由名被占）。
-
-  // ── /drc 命令 ──────────────────────────────────────────────────────
-  // 拿 commands 的方式和拿内核服务完全一样：`ctx.commands` 这种"直接点属性"的读法在
-  // 真 cordis 上下文上是**抛错**的（属性名不在本 fiber 的 inject 集合里，见 reflect.ts
-  // 的 get trap），所以先试 `ctx.get('commands', true)`，再用 `ctx.inject` 等晚到。
-  //
-  // **返回值只能是 `{kind:'success', text?}` 或 `{kind:'error', text}`。**
-  // 宿主在注册边界上做校验（`@deepseek-ai/dsh-commands` 的 `normalizeResult`），
-  // 别的 `kind` 一律 `throw TypeError("...unknown result kind...")`——用户看到的是
-  // 一条命令整个失败，而不是"格式不标准"。旧实现把这条契约写在注释里，重写时漏掉了，
-  // 于是 `/drc pair` 报 `unknown result kind "text"`。
-  // 现在**两道锁**：类型上 `CommandResult` 让写错 kind 编译就红（`pnpm -r typecheck`），
-  // 运行时有 `tests/command-result.test.ts` 走一遍 apply() 注册出来的真 handler。
-  //
-  // **命令列表里没有 `pair`**（2026-10-03 拍板）：配对唯一入口是状态栏那颗 pill
-  // （`src/pill/routes.ts` 的 `POST /pairing/new` + `GET /pairing.png`）。
-  // 命令行发码那条路删掉不是嫌它多余，是因为它**发第二张**：`/drc pair` 走的是
-  // `createPairing()`，会在 pill 那张之外再挂一个仍然有效的 PSK，而手机扫的是屏幕上那张——
-  // 正是当初"多码事故"的形状。入口不可用时的排查走 `problems` 里那条 `warn:pill`。
-  const commandDefinition = {
-    name: 'drc',
-    description: 'DSH 远程控制：配对请点状态栏的 dsh-remote-control；/drc status 看连接与问题，/drc unpair 解配',
-    input: { hint: 'status | unpair' },
-    handler: async (invocation: { commandId: string; rawInput: string; agent?: unknown }): Promise<CommandResult> => {
-      const argument = String(invocation.rawInput ?? '')
-        .trim()
-        .toLowerCase()
-      if (argument.startsWith('unpair')) {
-        for (const id of relay?.conversationIds() ?? []) relay?.voidConversation(id)
-        return { kind: 'success', text: '已解除所有配对；手机端会显示"主机已断开，请重新配对"。' }
-      }
-      return { kind: 'success', text: JSON.stringify(state(), null, 2) }
-    },
-  }
-  let commandsTaken = false
-  const takeCommands = (source: unknown): void => {
-    if (commandsTaken || !source || typeof source !== 'object') return
-    const holder = source as { register?: (definition: unknown) => unknown }
-    if (typeof holder.register !== 'function') return
-    holder.register(commandDefinition)
-    commandsTaken = true
-    probe.commands = 'registered'
-  }
-  try {
-    // 假的/非 cordis 上下文（单元测试）直接把 commands 挂在 ctx 上；真 cordis 上这一读
-    // 会抛，所以整段包 try——它不是主路径，只是兼容测试与更老一代的宿主形状。
-    takeCommands(ctx.commands)
-  } catch {
-    /* cordis 上下文上没有注入过的属性名读不得：走下面两条路 */
-  }
-  try {
-    takeCommands(ctx.get?.('commands', true))
-  } catch {
-    /* 这一代宿主没这个服务 */
-  }
-  try {
-    const child = ctx.inject?.(['commands'], ((...cbArgs: unknown[]) => {
-      for (const candidate of [cbArgs[0], ...cbArgs, ctx]) {
-        takeCommands(pickFrom(candidate, 'commands'))
-        if (commandsTaken) break
-      }
-    }) as never)
-    if (child !== undefined) injectChildren.push(['commands', child])
-  } catch {
-    /* 没有 commands 服务的代际：静默跳过，配对仍可由 pairOnStartSec 自动发布 */
-  }
 
   return {
     config,
@@ -885,7 +833,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     stop(): void {
       // 复查定时器要先撤：停机之后它们再去写 status.json，写的是已经过期的取证。
       oneShot.cancelAll()
-      // pill 那三条路由也要一起收：它是不在主链路上的旁路，所以单独一句。
+      // pill 那四条路由也要一起收：它是不在主链路上的旁路，所以单独一句。
       pillRoutes?.stop()
       status.stop()
       runtime?.stop()

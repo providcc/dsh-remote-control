@@ -1,11 +1,11 @@
 /**
- * pill-routes.test — 状态栏那颗 pill 那三条路由的判据。
+ * pill-routes.test — 状态栏那颗 pill 那四条路由的判据。
  *
- * 三条路由分两档安全姿态（动机写在 `src/pill/routes.ts` 文件头）：
- * `POST /pairing/new` 会改状态（向中继申请一张新码），跨站判据是只有同源脚本发得出的
- * 自定义头 `x-drc-pair: 1`——**不是** `Origin`：桌面宿主的转发层会把它删掉，这一条是
- * 2026-10-03 在真屏幕上点出来才发现的。`GET /pairing.png` 与 `GET /status` 只读，
- * Origin 缺席放过，但 Host 仍必须环回。
+ * 四条路由分两档安全姿态（动机写在 `src/pill/routes.ts` 文件头）：
+ * `POST /pairing/new` 与 `POST /unpair` 会改状态（发一张码 / 作废当前通道），跨站判据是
+ * 只有同源脚本发得出的自定义头 `x-drc-pair: 1`——**不是** `Origin`：桌面宿主的转发层会把它
+ * 删掉，这一条是 2026-10-03 在真屏幕上点出来才发现的。`GET /pairing.png` 与 `GET /status`
+ * 只读，Origin 缺席放过，但 Host 仍必须环回。
  *
  * 最重要的一条不是"能发码"，而是**响应里绝不能出现凭据**：`psk` 与完整 `qr` URI
  * 一旦经这条路由出去，就等于把"PSK 从不上网"这条红线（D1）从浏览器面捅了个洞。
@@ -19,10 +19,12 @@ import {
   PAIR_IMAGE_ROUTE,
   PAIR_NEW_ROUTE,
   PAIR_STATUS_ROUTE,
+  PAIR_UNPAIR_ROUTE,
   pairImageHandler,
   pairNewHandler,
   pillStatusHandler,
   registerPillRoutes,
+  unpairHandler,
   type LivePairing,
   type PillRouteDeps,
 } from '../src/pill/routes.js'
@@ -76,8 +78,10 @@ function request(method: string, headers: Record<string, string> = {}): Incoming
  */
 const LOOPBACK = { host: '127.0.0.1:19387', 'x-drc-pair': '1' }
 
-function deps(over: Partial<PillRouteDeps> = {}): PillRouteDeps & { calls: { ensure: number; current: number } } {
-  const calls = { ensure: 0, current: 0 }
+function deps(
+  over: Partial<PillRouteDeps> = {},
+): PillRouteDeps & { calls: { ensure: number; current: number; unpair: number } } {
+  const calls = { ensure: 0, current: 0, unpair: 0 }
   const live: LivePairing = { qr: FAKE_QR, token: FAKE_TOKEN, expiresAt: Date.now() + 60_000 }
   return {
     calls,
@@ -92,9 +96,12 @@ function deps(over: Partial<PillRouteDeps> = {}): PillRouteDeps & { calls: { ens
     status: () => ({
       relay: 'online',
       paired: 1,
-      hostLabel: 'desk-01',
       serverUrl: 'wss://relay.example.com:443/relay',
     }),
+    unpair: () => {
+      calls.unpair += 1
+      return 1
+    },
     log: () => {},
     ...over,
   }
@@ -265,7 +272,7 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
 
-test('状态路由只出四个非凭据字段：relay / paired / hostLabel / serverUrl', async () => {
+test('状态路由只出三个非凭据字段：relay / paired / serverUrl', async () => {
   const d = deps()
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -274,26 +281,26 @@ test('状态路由只出四个非凭据字段：relay / paired / hostLabel / ser
   assert.deepEqual(JSON.parse(got.body), {
     relay: 'online',
     paired: 1,
-    hostLabel: 'desk-01',
     serverUrl: 'wss://relay.example.com:443/relay',
   })
   const raw = got.body
   for (const secret of [FAKE_PSK, FAKE_QR, FAKE_TOKEN, 'dshr:']) {
     assert.ok(!raw.includes(secret), `状态回答里出现了 ${secret}：${raw}`)
   }
+  assert.ok(!raw.includes('hostLabel'), `本机名 2026-10-03 从面板上撤了，回答里也不该再有：${raw}`)
   assert.equal(d.calls.ensure, 0, '看状态绝不顺手发码')
+  assert.equal(d.calls.unpair, 0, '看状态更不该解配')
 })
 
 test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的是"没启动"而不是"断了"）', async () => {
   const d = deps({
-    status: () => ({ relay: 'idle', paired: 0, hostLabel: 'desk-01', serverUrl: 'wss://relay.example.com:443/relay' }),
+    status: () => ({ relay: 'idle', paired: 0, serverUrl: 'wss://relay.example.com:443/relay' }),
   })
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
   assert.deepEqual(JSON.parse(reply().body), {
     relay: 'idle',
     paired: 0,
-    hostLabel: 'desk-01',
     serverUrl: 'wss://relay.example.com:443/relay',
   })
 })
@@ -326,9 +333,72 @@ test('status() 自己抛错 → 500 且不外抛到宿主', async () => {
   assert.equal(reply().status, 500)
 })
 
+// ── POST /unpair（退出配对）──────────────────────────────────────────
+
+test('退出配对：POST 回 {state:"ok", unpaired:n}，真去作废通道', async () => {
+  const d = deps()
+  const { res, reply } = response()
+  await unpairHandler(d)(request('POST', LOOPBACK), res)
+  const got = reply()
+  assert.equal(got.status, 200)
+  assert.deepEqual(JSON.parse(got.body), { state: 'ok', unpaired: 1 })
+  assert.equal(d.calls.unpair, 1, '必须真的走到 unpair 那一步')
+  assert.equal(d.calls.ensure, 0, '解配不许顺手发码')
+})
+
+test('本来就没配上（unpair 回 0）也是 200：这是正常竞态，不是错误', async () => {
+  const d = deps({ unpair: () => 0 })
+  const { res, reply } = response()
+  await unpairHandler(d)(request('POST', LOOPBACK), res)
+  assert.equal(reply().status, 200)
+  assert.deepEqual(JSON.parse(reply().body), { state: 'ok', unpaired: 0 })
+})
+
+test('退出配对是写路由：GET → 405，缺自定义头 → 403，跨站 Origin → 403，非环回 Host → 403', async () => {
+  const byMethod = deps()
+  const a = response()
+  await unpairHandler(byMethod)(request('GET', LOOPBACK), a.res)
+  assert.equal(a.reply().status, 405)
+  assert.equal(byMethod.calls.unpair, 0, '被拒的请求绝不能已经先解了配')
+
+  const cases: Array<[Record<string, string>, string]> = [
+    [{ host: '127.0.0.1:19387' }, 'pair-marker-missing'],
+    [{ host: '127.0.0.1:19387', 'x-drc-pair': 'yes' }, 'pair-marker-missing'],
+    [{ ...LOOPBACK, origin: 'https://evil.example.com' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'null' }, 'origin-not-trusted'],
+    [{ host: 'evil.example.com', 'x-drc-pair': '1' }, 'host-not-loopback'],
+  ]
+  for (const [headers, guard] of cases) {
+    const d = deps()
+    const { res, reply } = response()
+    await unpairHandler(d)(request('POST', headers), res)
+    assert.equal(reply().status, 403, `${JSON.stringify(headers)} 应当被拒`)
+    assert.equal(JSON.parse(reply().body).guard, guard, `拒的原因要指对：${reply().body}`)
+    assert.equal(d.calls.unpair, 0, '被拦下的请求不许改状态')
+  }
+})
+
+test('宿主自己的自定义 scheme（`dsh-app://app`）→ 200：与发码那条同一个口径', async () => {
+  const d = deps()
+  const { res, reply } = response()
+  await unpairHandler(d)(request('POST', { ...LOOPBACK, origin: 'dsh-app://app' }), res)
+  assert.equal(reply().status, 200, reply().body)
+})
+
+test('unpair() 自己抛错 → 500 且不外抛到宿主', async () => {
+  const d = deps({
+    unpair: () => {
+      throw new Error('relay 被拆了')
+    },
+  })
+  const { res, reply } = response()
+  await unpairHandler(d)(request('POST', LOOPBACK), res)
+  assert.equal(reply().status, 500)
+})
+
 // ── 注册与注销 ───────────────────────────────────────────────────────
 
-test('注册挂上三条、注销把三条都摘掉', () => {
+test('注册挂上四条、注销把四条都摘掉', () => {
   const registered: string[] = []
   let off = 0
   const web = {
@@ -340,9 +410,9 @@ test('注册挂上三条、注销把三条都摘掉', () => {
     },
   }
   const unregister = registerPillRoutes(web as never, deps())
-  assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE])
+  assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE])
   unregister()
-  assert.equal(off, 3)
+  assert.equal(off, 4)
 })
 
 test('第二条挂不上时，第一条必须被回滚掉：半途失败不许在宿主上留下摘不走的路由', () => {
@@ -372,7 +442,7 @@ test('一条注销抛错不许让其余留在宿主上', () => {
   }
   const unregister = registerPillRoutes(web as never, deps())
   assert.doesNotThrow(() => unregister())
-  assert.equal(off, 3, '后两条必须仍然被调用')
+  assert.equal(off, 4, '后三条必须仍然被调用')
 })
 
 test('反证：环回主机名这份表只有一份，写路由与只读那条必须同一个口径', async () => {

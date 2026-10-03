@@ -8,7 +8,8 @@
  *
  *   1. 外壳注册成功、id 与包名一致、导出的是 `{name, inject, apply}`；
  *   2. 状态栏那颗 pill：向装载器拿 react、软探测 `slots`、往 `conversation.composer.dock`
- *      注册、点开给连接信息、再按一次才发码并把图与 6 位码画进面板；
+ *      注册；点开是"状态 + 右上角那颗按钮"，再按一次才发码（已配对时那颗按钮是退出配对），
+ *      发码后把图与 6 位码画进同一个面板；
  *   3. **任何一条依赖拿不到时只降级成"没有 pill"**：apply 绝不外抛（那会整页起不来），
  *      并且留下一行 warn 说明缺的是哪一样；
  *   4. 发码请求必须带宿主那道守卫要的自定义头（两半的分叉在这里对上）。
@@ -31,6 +32,7 @@ import {
   PAIR_MARKER_VALUE,
   PAIR_NEW_ROUTE,
   PAIR_STATUS_ROUTE,
+  PAIR_UNPAIR_ROUTE,
 } from '../src/pill/routes.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -63,6 +65,12 @@ interface LoadOptions {
   newAnswer?: Record<string, unknown>
   /** `POST /pairing/new` 直接抛（网络断了 / 路由没挂上）。 */
   newThrows?: boolean
+  /** `POST /unpair` 的回答。 */
+  unpairAnswer?: Record<string, unknown>
+  /** `POST /unpair` 直接抛。 */
+  unpairThrows?: boolean
+  /** 预置一份**上一版**的样式表：模拟"宿主热更了这一半、文档没重载"。 */
+  staleStyle?: boolean
 }
 
 interface Harness {
@@ -186,6 +194,8 @@ class FakeElement {
 class FakeDocument {
   head = new FakeElement('head', this)
   private documentListeners = new Map<string, Array<(event: unknown) => void>>()
+  /** `staleStyle` 用：预置的旧 `<style>`，让 `querySelector` 认得出"插过了"。 */
+  seededStyle?: FakeElement
 
   constructor(readonly visibilityState: string) {}
 
@@ -193,8 +203,9 @@ class FakeDocument {
     return new FakeElement(tag, this)
   }
 
-  /** 样式探针：永远返回"没注入过"，于是那颗 pill 会往 head 里补一句 style。 */
-  querySelector(): null {
+  /** 样式探针：默认返回"没注入过"；`seededStyle` 时返回那份**上一版**的样式表。 */
+  querySelector(selector: string): FakeElement | null {
+    if (this.seededStyle && selector.includes('data-plugin-css')) return this.seededStyle
     return null
   }
 
@@ -229,7 +240,7 @@ async function flush(): Promise<void> {
 /**
  * 走"点开 → 再按发码那颗"这两步。
  *
- * 第二步是**这条用例存在的原因**：点开那颗 pill 只给连接信息，发码必须人再按一次，
+ * 第二步是**这条用例存在的原因**：点开那颗 pill 只给状态，发码必须人再按一次，
  * 所以任何"看 QR / 看 6 位码 / 看倒计时"的断言都得先按这一下。少按一下就等于在断言
  * "面板停在信息上"，那条就会假绿。
  */
@@ -251,7 +262,6 @@ const FAKE_REACT = {
 const DEFAULT_STATUS = {
   relay: 'online',
   paired: 0,
-  hostLabel: 'desk-01',
   serverUrl: 'wss://relay.example.com:443/relay',
 }
 
@@ -262,6 +272,13 @@ function load(options: LoadOptions = {}): Harness {
   const timers: Array<() => void> = []
   const slotRegisters: Array<{ definition: Record<string, unknown>; component?: () => unknown }> = []
   const doc = new FakeDocument(options.hidden ? 'hidden' : 'visible')
+  if (options.staleStyle) {
+    const seeded = doc.createElement('style')
+    seeded.setAttribute('data-plugin-css', 'dsh-remote-control/pill.css')
+    seeded.textContent = '.drc-pill { color: red } /* 上一版的样式 */'
+    doc.head.appendChild(seeded)
+    doc.seededStyle = seeded
+  }
   let spec: { id?: string; factory?: (require: unknown) => ClientModule } | undefined
 
   const sandbox: Record<string, unknown> = {
@@ -301,6 +318,17 @@ function load(options: LoadOptions = {}): Harness {
           status: 200,
           json: async () => options.status ?? DEFAULT_STATUS,
         }
+      }
+      if (url.startsWith(PAIR_UNPAIR_ROUTE)) {
+        assert.equal(method, 'POST', '退出配对只接受 POST')
+        // 写路由同一条 CSRF 判据：那颗按钮与发码那颗在同一个弹窗里，头名不许分叉。
+        assert.equal(
+          init?.headers?.[PAIR_MARKER_HEADER],
+          PAIR_MARKER_VALUE,
+          `退出配对必须带 ${PAIR_MARKER_HEADER}: ${PAIR_MARKER_VALUE}，实际 init=${JSON.stringify(init)}`,
+        )
+        if (options.unpairThrows) throw new Error('退出配对那条断了')
+        return { ok: true, status: 200, json: async () => options.unpairAnswer ?? { state: 'ok', unpaired: 1 } }
       }
       assert.equal(method, 'GET', `${url} 不该收到 ${method}`)
       return { ok: true, status: 200, json: async () => ({}) }
@@ -481,14 +509,14 @@ test('注册进 conversation.composer.dock：槽位名、id、order 都要对', 
 })
 
 test('挂载之后抬头写的是状态路由给的那句', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 2 } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
   const root = harness.mountPill()
   await flush()
   const pill = root.find('drc-pill')
   assert.ok(pill, `那颗按钮必须建出来：${root.allText()}`)
   // 抬头那句写在按钮里那个 `drc-label` 上，取它而不是按钮：假 DOM 的 textContent 不聚合后代。
   // 配上了几句台数**不写进抬头**：那排宽度是宿主给的，中文会被逐字断行（见下一条用例），
-  // 而"几台"这件事点进去那栏连接信息里看得见。
+  // 而"几台"这件事点进去那颗按钮上看得见（只允许一台，所以它只可能是 0 或 1）。
   assert.equal(root.find('drc-label')!.textContent, '已配对')
   assert.equal(pill!.getAttribute('aria-label'), '已配对')
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'on', '灯的颜色由 tone 决定')
@@ -526,12 +554,12 @@ test('那一排挤不下时只许省略号，不许把中文逐字断行（真�
   assert.equal(pill.getAttribute('aria-label'), '已配对')
 })
 
-test('中继没连上时说的是"远程未连接"，不许假装有得配', async () => {
+test('中继断链时说的是"已断开连接"，而且是红的——不能和"还没配上"同一个灰', async () => {
   const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, relay: 'offline' } })
   const root = harness.mountPill()
   await flush()
-  assert.equal(root.find('drc-label')!.textContent, '远程未连接')
-  assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'off')
+  assert.equal(root.find('drc-label')!.textContent, '已断开连接')
+  assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'error', '断链是故障不是"还没轮到配"，灰灯会被读成后者')
 })
 
 test('runtime 还没起来时说"远程未启动"：idle 与 offline 是两件事', async () => {
@@ -552,7 +580,7 @@ test('页面不可见时不轮状态（Electron 里窗口在后台是常态）',
   )
 })
 
-test('点开只给连接信息，不许顺手发码：发码是面板里那一次显式的按下', async () => {
+test('点开只给状态 + 右上角那颗按钮，不许顺手发码；面板上不再有本机/状态/已配对那三行', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
@@ -565,25 +593,65 @@ test('点开只给连接信息，不许顺手发码：发码是面板里那一�
     0,
     '点开就发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
   )
-  const rows = root.find('drc-info')!
-  assert.ok(rows, `面板顶部要有那几行连接信息：${root.allText()}`)
-  const flat = rows.allText()
-  assert.match(flat, /desk-01/, '本机名')
-  assert.match(flat, /relay\.example\.com:443/, '中继地址只留 host:port——scheme 和 path 会挤掉别的行')
-  assert.ok(!flat.includes('wss://'), `连接信息里不许出现完整 URI：${flat}`)
-  assert.match(flat, /已连接/, '状态')
-  assert.match(flat, /0 台/, '配了几台')
+  // 抬头那句状态与那颗 pill 同一个来源：面板开着时也读它。
+  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
+  const row = root.find('drc-info')!
+  assert.ok(row, `面板正文要留那一行中继地址：${root.allText()}`)
+  assert.equal(row.find('drc-key')!.textContent, '中继')
+  assert.match(
+    row.find('drc-value')!.textContent,
+    /relay\.example\.com:443/,
+    '地址只留 host:port——scheme 和 path 会挤掉别的行',
+  )
+  assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
+  const flat = root.allText()
+  for (const gone of ['本机', '状态', '已配对', '再配一台', '换一张']) {
+    assert.ok(!flat.includes(gone), `这一轮删掉的说法不该再出现：「${gone}」在 ${flat}`)
+  }
   assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
 })
 
-test('已经配上时那颗按钮改叫"再配一台"，抬头那句是"已配对"', async () => {
+test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpair（带同一个守卫头）', async () => {
+  // 先未配对地建出来，再把状态切成已配对并触发一次轮询，验证按钮会随状态改文案。
   const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
   const root = harness.mountPill()
   await flush()
   root.find('drc-pill')!.emit('click')
   await flush()
-  assert.equal(root.find('drc-btn')!.textContent, '再配一台')
-  assert.match(root.find('drc-info')!.allText(), /1 台/)
+  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  const button = root.find('drc-btn')!
+  assert.equal(button.textContent, '退出配对')
+  assert.equal(
+    harness.requests.filter((url) => url.startsWith(PAIR_UNPAIR_ROUTE)).length,
+    0,
+    '点开面板本身不该解配——必须真的按下那颗按钮',
+  )
+
+  button.emit('click')
+  await flush()
+  assert.ok(
+    harness.requests.some((url) => url.startsWith(PAIR_UNPAIR_ROUTE)),
+    `按下退出配对必须打那条写路由：${harness.requests.join(' | ')}`,
+  )
+  // 乐观翻面：不用等下一次 2 秒轮询，抬头与那颗按钮当场就变。
+  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
+  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+})
+
+test('退出配对那条断了：面板不白屏、抬头仍按乐观结果翻面，并且留下一行 warn', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 }, unpairThrows: true })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  root.find('drc-btn')!.emit('click')
+  await flush()
+  assert.equal(harness.errors.length, 0, '这是降级不是故障')
+  assert.ok(root.find('drc-panel'), '面板要留着')
+  assert.ok(
+    harness.warnings.some((line) => line.includes('退出配对')),
+    `降级要留下能查的一句：${harness.warnings.join(' | ')}`,
+  )
 })
 
 test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板；epoch 进图片 URL', async () => {
@@ -596,6 +664,8 @@ test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板
   assert.equal(root.find('drc-qr')!.src, `${PAIR_IMAGE_ROUTE}?e=e1`, '图片地址要带上这一版码的 epoch')
   assert.equal(root.find('drc-code')!.textContent, '482913', '6 位码必须与 QR 同时在屏上——手输是唯一退路')
   assert.equal(root.find('drc-note')!.textContent, '扫码配对 · 1 分 0 秒后过期')
+  // 出图这一版右上角那颗是**刷新**，不再是"生成配对码"——同一件事两个说法会让用户以为要重新配一次。
+  assert.equal(root.find('drc-btn')!.textContent, '刷新', '二维码页那颗按钮的文案')
   assert.equal(root.find('drc-pill')!.getAttribute('aria-expanded'), 'true')
 })
 
@@ -655,7 +725,7 @@ test('点外面才关：落在面板里的 pointerdown 不许收起，落在外�
   assert.equal(root.find('drc-panel'), undefined, 'Escape 要关')
 })
 
-test('码的寿命走完会自动再要一张（幂等入口此刻才会真的发新的）', async () => {
+test('码过期后**不再自动补一张**，就地说明白要人自己去按（自动补码已删，重发靠右上角那颗「刷新」）', async () => {
   const harness = load({
     react: FAKE_REACT,
     slots: true,
@@ -664,14 +734,49 @@ test('码的寿命走完会自动再要一张（幂等入口此刻才会真的�
   const root = harness.mountPill()
   await openPairing(root)
   assert.equal(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length, 1)
-  // 节拍次序：0 = pill 状态轮询，1 = 面板倒计时。
+  // 节拍次序：0 = pill 状态轮询，1 = 面板倒计时。倒计时走光后自清，所以那一刻仍是 2 个。
   assert.equal(harness.timerCount(), 2, '该有两个节拍')
   await harness.fireAndFlush(1)
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
-    2,
-    '倒计时走光必须再去要一张，否则屏幕上留下一张废码',
+    1,
+    '倒计时走光**不许**再去要一张：自动补码 2026-10-03 删了，重发靠人按右上角那颗「刷新」',
   )
+  assert.match(root.find('drc-note')!.textContent, /已过期/)
+  assert.equal(root.find('drc-btn')!.textContent, '刷新', '要重发还是右上角那颗（出图时它叫刷新）')
+})
+
+test('手机上刚扫完码：面板从二维码当场翻回状态视图，右上角那颗同时变成"退出配对"', async () => {
+  // 一张码配上之后就没用了。面板若还停在图上，用户会以为"还没成功、再扫一次"。
+  const status: Record<string, unknown> = { ...DEFAULT_STATUS, paired: 0 }
+  const harness = load({ react: FAKE_REACT, slots: true, status })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.ok(root.find('drc-qr'), '先确认图在屏上')
+  assert.equal(root.find('drc-btn')!.textContent, '刷新')
+
+  status.paired = 1
+  await harness.fireAndFlush(0)
+  assert.equal(root.find('drc-qr'), undefined, '配上之后那张图不该还占着面板')
+  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-btn')!.textContent, '退出配对')
+  assert.ok(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length === 1, '翻面只是重画，不许顺手再要一张')
+})
+
+test('样式表按内容对齐：宿主热更这一半、文档没重载时，旧 CSS 必须被换掉', async () => {
+  // 现场（2026-10-03 用户截图）：新 JS 按新结构建 DOM，`<head>` 里却还是上一版的 `<style>`——
+  // 旧 `.drc-actions{justify-content:center}` 让右上角那颗按钮掉到第二行居中，整块面板错位。
+  const harness = load({ react: FAKE_REACT, slots: true, staleStyle: true })
+  harness.mountPill()
+  await flush()
+  const doc = harness.fakeDocument()
+  const styles = doc.head.children.filter((node) => node.tag === 'style')
+  assert.equal(styles.length, 1, `不该再插第二份样式表：${styles.length}`)
+  assert.ok(
+    styles[0]!.textContent.includes('.drc-head'),
+    '旧样式表必须被换成这一版的：只看"插过没有"会让上一版的布局一直生效',
+  )
+  assert.ok(!styles[0]!.textContent.includes('上一版的样式'), '旧内容不许留着')
 })
 
 test('卸载（宿主把 pill 摘掉）之后节拍停、文档监听摘干净', async () => {
@@ -694,10 +799,10 @@ test('卸载（宿主把 pill 摘掉）之后节拍停、文档监听摘干净',
 
 test('反证：产物里的路由常量与宿主侧定义逐字一致（分叉的表现是"点了没反应而日志全绿"）', () => {
   const bundle = readFileSync(CLIENT, 'utf8')
-  for (const constant of [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_MARKER_HEADER]) {
+  for (const constant of [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE, PAIR_MARKER_HEADER]) {
     assert.ok(bundle.includes(constant), `client.cjs 里缺 ${constant}`)
   }
   // 出现一条宿主侧没有的 /plugins 路径就是两边分叉了。
   const found = [...new Set([...bundle.matchAll(/\/plugins\/[a-z0-9./-]+/g)].map((match) => match[0]))].sort()
-  assert.deepEqual(found, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE].sort())
+  assert.deepEqual(found, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE].sort())
 })
