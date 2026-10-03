@@ -6,9 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        提需求前先看一眼 [README](https://github.com/providcc/dsh-remote-control#readme) 与
-        [docs/DESIGN.md](https://github.com/providcc/dsh-remote-control/blob/main/docs/DESIGN.md)，
-        了解既有边界（尤其是"插件对内核面软探测、不写 inject 闸门"这条）。
+        提需求前先看一眼 [README](https://github.com/providcc/dsh-remote-control#readme) 的配置与安全两节，
+        了解既有边界（尤其是"插件对内核面软探测、不写 inject 闸门"与"配置键名继承旧名"这两条）。
 
   - type: textarea
     id: problem

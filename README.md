@@ -105,8 +105,10 @@ pnpm format:check     # prettier --check
 
 ## 安全
 
-威胁模型与信任边界见 [`docs/SECURITY.md`](./docs/SECURITY.md)；报告漏洞的流程见仓库根的
-[`SECURITY.md`](./SECURITY.md)。**请不要为安全报告开公开 issue。**
+报告漏洞的流程见仓库根的 [`SECURITY.md`](./SECURITY.md)。**请不要为安全报告开公开 issue。**
+
+可验证的安全边界就写在上面「加密模型」一节里：载荷密钥只经配对二维码交给手机、
+从不上网，`hostToken` 只从环境变量读。重写期的设计推导不随本仓发布。
 
 ## 许可
 
