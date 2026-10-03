@@ -6,10 +6,13 @@ name: Release
 # 本仓只发**一个** npm 包：`dsh-remote-control`（2026-10-03 起 `packages/presentation` 已折进插件包并删除）。
 # 包的产物有两半：宿主侧 `index.js` 与浏览器面 `client.cjs`，都随 `scripts/install-to-profile.sh` 装进 profile。
 #
-# 前置条件（仓库公开、账号就绪后一次性配好）：
-#   · repository secret `NPM_TOKEN` —— npm 的 Automation token，需有发包权限；
-#   · 用 npm 的 **Trusted Publishing** 时可以不配 token，但仍需要 `id-token: write`（已给）。
-# provenance 由插件包 package.json 的 `publishConfig.provenance: true` 打开。
+# 前置条件（2026-10-03 起只有一条）：npm 侧要有指向本仓 `release.yml` 的
+# **Trusted Publishing**（OIDC）配置：
+#   npm trust github dsh-remote-control --repo providcc/dsh-remote-control --file release.yml --allow-publish
+# 之后发布不再用 `NPM_TOKEN` secret（Publish 步骤刻意不设 `NODE_AUTH_TOKEN`——留着 token
+# 会让 pnpm 在 OIDC 失败时静默回落成 token 发布，包发出去了但没有 attestation）。
+# `id-token: write` 是本工作流唯一的凭据权限（已给）；provenance 由插件包 package.json 的
+# `publishConfig.provenance: true` 打开，最后由 "Verify provenance landed" 一步独立体检。
 
 on:
   push:
@@ -62,11 +65,37 @@ jobs:
           echo "版本一致：$version"
 
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         # -r 会跳过 `private: true` 的包，所以这里实际只发 dsh-remote-control 一个；
         # 无 scope 的包要显式 --access public。
+        #
+        # 刻意**不设 NODE_AUTH_TOKEN**：pnpm 在有 token 时会先试 OIDC、换票失败就静默回落到
+        # token 发布——表现是"版本发出去了、工作流也是绿的、attestation 一个没有"，
+        # 日志里只留一行 `Skipped OIDC: ERR_PNPM_AUTH_TOKEN_EXCHANGE … 404`（v1.1.0 就是这样）。
+        # 没有 token 之后 OIDC 是唯一路径，Trusted Publishing 没配好就直接红，红得看得见。
         run: pnpm -r publish --access public --no-git-checks
+
+      # 发完必须**独立验一次 provenance**：工作流绿不等于带 attestation（见上面那条回落）。
+      # 注册表侧的 attestation 落地有秒级延迟，所以重试到 60s，超时就红。
+      - name: Verify provenance landed
+        env:
+          # 通过 env 传事件字段，避免把可被影响的值直接插进脚本。
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          version="${TAG_NAME#v}"
+          url="https://registry.npmjs.org/-/npm/v1/attestations/dsh-remote-control@${version}"
+          for i in $(seq 1 20); do
+            body="$(curl -s "$url" || true)"
+            if printf '%s' "$body" | grep -q '"attestations"'; then
+              echo "provenance 已挂上：dsh-remote-control@${version}"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "发布后 60s 仍查不到 dsh-remote-control@${version} 的 attestation。" >&2
+          echo "多半是这个包还没配 Trusted Publishing（或配的 workflow 文件名不是 release.yml）。" >&2
+          echo "配法：npm trust github dsh-remote-control --repo providcc/dsh-remote-control --file release.yml --allow-publish" >&2
+          exit 1
 
       - name: Create GitHub Release
         env:
