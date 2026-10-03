@@ -104,7 +104,11 @@ echo "   已写入 $target"
 echo "     $BUNDLE_ID @ $version（含浏览器面 client.cjs）"
 
 echo "→ 注册 bundle 到 profile 的 bundles 列表（幂等），并清掉旧的 file: 依赖与退役条目…"
-node --input-type=module -e "
+# 用 heredoc 而不是 `-e "…"`：这段 JS 里出现的任何**英文双引号**都会把双引号字符串提前截断，
+# 而后面的行会变成 node 的位置参数被忽略——表现是"脚本静默跑完、只写了备份、什么都没改"，
+# 退出码还是 0。这个坑真实踩过（折并那次退役就是这么没生效的）。
+# 定界符不加引号，$PROFILE / $BUNDLE_ID / $OLD_PRESENTATION_ID 才会在传进去之前展开。
+node --input-type=module <<NODEJS
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 const file = '$PROFILE/package.json'
 const id = '$BUNDLE_ID'
@@ -146,7 +150,7 @@ for (const field of ['dependencies', 'devDependencies', 'optionalDependencies'])
 }
 writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n')
 console.log('   bundles:', list.join(', '))
-"
+NODEJS
 
 echo
 echo "✅ 已安装 $BUNDLE_ID（两半产物）→ $PROFILE/node_modules/"
