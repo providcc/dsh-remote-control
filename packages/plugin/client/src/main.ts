@@ -1,9 +1,13 @@
 /**
  * client — 浏览器那一半（会被打成 `dist/bundle/client.cjs`，由 `window.__ModuleLoader__` 装载）。
  *
- * 它只做一件事：**每 2 秒问一次宿主那条只读路由"现在有没有可看的配对码"，有就把它推进右栏**。
- * 宿主那一半没有"推右栏"的能力（扩展点不存在），浏览器这一半有 `ctx.sidebarRight`
- * 却不知道什么时候该推（配对码是宿主发的）——两边各有一半，靠这条同域路由接上。
+ * 它做两件事：
+ *
+ * 1. **每 2 秒问一次宿主那条只读路由"现在有没有可看的配对码"，有就把它推进右栏**。
+ *    宿主那一半没有"推右栏"的能力（扩展点不存在），浏览器这一半有 `ctx.sidebarRight`
+ *    却不知道什么时候该推（配对码是宿主发的）——两边各有一半，靠这条同域路由接上。
+ * 2. **状态栏那颗 pill**（`./pill.ts`）：显示连接状态，点一下发码并把二维码弹出来。
+ *    它是 2026-10-03 加的，`apply()` 里那一步单独包 try——它坏了不许连累第 1 条。
  *
  * 为什么不是"打开一个图片文件"：地址是**会话作用域**的 `dsh-resource://file/session/...`，
  * 由右栏的文档预览页型（唯一认领 `dsh-resource://file/**` 的页型）就地渲染。
@@ -16,9 +20,13 @@
  *    都能让应用起不来。所以每一段都包 try。
  * 2. **`inject` 必须声明 `sidebarRight`**。宿主 ctx 是 Proxy，读一个没声明的服务是**抛错**
  *    而不是返回 undefined，`?.` 挡不住（真机取证：`cannot get property "sidebarRight" without inject`）。
+ *    pill 用的 `slots` **故意不写进来**：写进来就等于给右栏那半加了注入闸门，
+ *    所以它走软探测（见 `pill.ts` 文件头第 1 条）。
  * 3. **只在成功打开之后才记 epoch**。打开失败（没有会话面板、页型拒绝）时不留痕，
  *    下一次轮询还会再试——否则会出现"记下了但屏幕上什么都没有、且再也不重试"的死局。
  */
+
+import { findCreateElement, mountPill } from './pill.js'
 
 /** 右栏服务最小面：`require()` 拿到"当前挂着的会话"，`openResource()` 把地址推进那一列。 */
 interface SidebarRightLike {
@@ -28,6 +36,8 @@ interface SidebarRightLike {
 
 interface ClientContext {
   sidebarRight: SidebarRightLike
+  get?<T>(name: string, optional?: true): T | undefined
+  inject?(names: string[], callback: (scoped: unknown) => void): unknown
   effect?(execute: () => (() => unknown) | void): unknown
 }
 
@@ -152,6 +162,14 @@ export function apply(ctx: ClientContext): void {
     }
     timer = setInterval(() => void poll(ctx), POLL_MS)
     void poll(ctx)
+    // pill 单独一个 try：它挂在右栏那半**之后**，注册失败（没 react / 没 slots / 槽位 API
+    // 换了）只该少掉那颗 pill，不该停掉已经在跑的轮询。反过来说也更硬：这一半里任何一处
+    // 抛出 reaching apply 都是"整页 web boot 失败"。
+    try {
+      mountPill(ctx, findCreateElement())
+    } catch (error) {
+      report('pill failed to mount（右栏自动弹码不受影响）', error)
+    }
     try {
       ctx.effect?.(() => stop)
     } catch (error) {

@@ -121,6 +121,23 @@ if (!clientText.includes('sidebarRight')) {
   console.error('[bundle-plugin] client.cjs 里看不到 sidebarRight，八成是打包入口写错了')
   process.exit(1)
 }
+// 状态栏那颗 pill 要向装载器拿 react。它**必须**是运行期那一句（模块名走变量），
+// 不能是构建期解析出来的 `require("react")`：后者会被提到 factory 顶层，宿主给不出这个
+// 模块时抛出发生在 factory 第一行——表现是"web boot: N entry/entries did not activate"，
+// 连已经在生产跑的右栏自动弹码一起没。运行期那一句最坏只少一颗 pill。
+if (/require\(["']react["']\)/.test(clientText)) {
+  console.error('[bundle-plugin] client.cjs 里出现了静态 require("react")：那会让装载失败变成整页起不来')
+  process.exit(1)
+}
+// 反向也钉一条：react 被**内联**进来同样致命（宿主那份与我们这份是两套 fiber，钩子互相
+// 不认识，一点 dock 就白屏）。内联的产物体积会跳一个数量级，所以这里用体积上限当探针。
+if (clientBytes > 128 * 1024) {
+  console.error(
+    `[bundle-plugin] client.cjs ${(clientBytes / 1024).toFixed(0)} KB，超过 128 KB 上限：` +
+      '浏览器那一半只该有轮询 + pill 那点代码，超了八成是把 react 打进来了',
+  )
+  process.exit(1)
+}
 
 console.log(
   `[bundle-plugin] ${path.relative(ROOT, OUT_FILE)} ${(bytes / 1024).toFixed(0)} KB（内联了 ${bundled.length} 个非本包模块）、client.cjs ${(clientBytes / 1024).toFixed(0)} KB`,

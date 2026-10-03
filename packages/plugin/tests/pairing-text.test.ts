@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pairingPairText, PAIR_UNAVAILABLE_TEXT } from '../src/shell/pairing-text.js'
+import { pairingPairText, PAIR_UNAVAILABLE_TEXT, PAIR_VIA_PILL_TEXT } from '../src/shell/pairing-text.js'
 
 const QR = 'dshr:/p?v=1&s=wss%3A%2F%2Frelay.example.invalid&n=demo-host&psk=ZmFrZS1wc2srZmFrZQ%2BZmFrZQ%3D%3D&t=424242'
 const TERMINAL = '█▀▀▀▀▀█ ...\n▀ ▀ ▀ ▀▀'
@@ -72,4 +72,13 @@ test('开了 qrImage 时才报图片路径（报了就等于承诺写了文件�
 test('中继没连上时给出可行动的下一步，而不是"失败"', () => {
   assert.match(PAIR_UNAVAILABLE_TEXT, /status\.json/, '排错入口必须被点名：GUI 宿主里没别的地方可看')
   assert.match(PAIR_UNAVAILABLE_TEXT, /relayProblem/, '要指到具体字段，否则"没连上"三个字什么也解决不了')
+})
+
+test('指路给 pill 那句必须自带退路，不许把人堵死', () => {
+  // 路由挂上了、那颗 pill 却没出现（宿主给不出 react / 没有 slots 服务）是真实 possible 的形状：
+  // 此时只说"去点状态栏"等于没有第二条路，而 `pair` 已经从 hint 里拿掉了，用户找不到出口。
+  assert.match(PAIR_VIA_PILL_TEXT, /\/drc pair force/, '退路必须写在这句话里，不能只存在于代码里')
+  assert.match(PAIR_VIA_PILL_TEXT, /状态栏/, '要先说清去哪儿点')
+  // 这句里不许出现完整配对 URI：它经过宿主命令面板渲染，也不该顺手把凭据印出来。
+  assert.doesNotMatch(PAIR_VIA_PILL_TEXT, /dshr:|psk/)
 })

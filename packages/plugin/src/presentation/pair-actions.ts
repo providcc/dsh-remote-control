@@ -1,13 +1,18 @@
 /**
- * pair-actions — 状态栏那颗 pill 用到的两条路由：
+ * pair-actions — 状态栏那颗 pill 用到的三条路由：
  *
  *   `POST /plugins/dsh-remote-control/pairing/new`  点一下要一张能用的码（幂等）
  *   `GET  /plugins/dsh-remote-control/pairing.png`  弹窗里那张二维码图
+ *   `GET  /plugins/dsh-remote-control/status`       pill 上那句"连接状态"
  *
  * 为什么单独一个文件、不并进 `route.ts`：**两条路的安全姿态不一样**。
  * `route.ts` 是只读的，Origin 缺席可以放过（同源 GET 常常不带它，而读一张马上过期的码
  * 本身不构成权限）；这里有一条**会改状态**的路由，所以 Origin **必须存在且是环回**，
  * 缺席也拒。两种判据写在同一个文件里，迟早有人"顺手复用"成较松的那一个。
+ *
+ * 为什么状态也要一条路由：pill 要在**没点开**的时候就说清"中继在不在"，而浏览器拿不到
+ * `status.json`（那是宿主磁盘上的文件）。这里只出三个非凭据字段，`status.json` 里那些
+ * 带身份/带凭据形状的东西一个字都不出去。
  *
  * 为什么弹窗的图要我们自己出（而不是复用右栏那套 `dsh-resource://file/...`）：
  * 右栏能渲染那张图是因为宿主的文档预览页型认领了 `dsh-resource://file/**`；
@@ -30,12 +35,23 @@ import { hostIsLoopback, json, originMustBeLoopback, type WebServerLike } from '
 
 export const PAIR_NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const PAIR_IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
+export const PAIR_STATUS_ROUTE = '/plugins/dsh-remote-control/status'
 
 /** 一版仍然有效的码（`expiresAt` 是毫秒时刻）。 */
 export interface LivePairing {
   qr: string
   token: string
   expiresAt: number
+}
+
+/** pill 上要显示的那句"连接状态"——三个非凭据字段，别的一律不出。 */
+export interface PillStatus {
+  /** 与 `status.json` 的 `relay` 同一个取值集合：`idle` 是"runtime 还没起来"，不是"断了"。 */
+  relay: 'online' | 'connecting' | 'offline' | 'idle'
+  /** 当前配对着的手机数量。 */
+  paired: number
+  /** 现在有没有一张仍然有效的码（决定 pill 显示"点一下配对"还是"已连接"）。 */
+  hasCode: boolean
 }
 
 export interface PairActionDeps {
@@ -48,6 +64,8 @@ export interface PairActionDeps {
   current(): LivePairing | null
   /** 把码渲染成 PNG 字节。 */
   renderPng(qr: string): Promise<Buffer>
+  /** 连接状态（pill 抬头那句）。 */
+  status(): PillStatus
   log(message: string, fields?: Record<string, string | number | boolean | undefined>): void
 }
 
@@ -120,7 +138,31 @@ export function pairImageHandler(deps: PairActionDeps) {
   }
 }
 
-/** 挂上这两条路由；返回一个注销函数（与 `registerPairingRoute` 同一套生命周期）。 */
+/** `GET /status`：pill 抬头那句连接状态（只读，守卫与只读路由同一档）。 */
+export function pillStatusHandler(deps: PairActionDeps): (request: IncomingMessage, response: ServerResponse) => void {
+  return (request, response) => {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      json(response, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!hostIsLoopback(request.headers.host)) {
+      json(response, 403, { error: 'request-not-trusted' })
+      return
+    }
+    try {
+      const status = deps.status()
+      json(response, 200, {
+        relay: status.relay,
+        paired: status.paired,
+        hasCode: status.hasCode,
+      })
+    } catch (error) {
+      json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
+    }
+  }
+}
+
+/** 挂上这三条路由；返回一个注销函数（与 `registerPairingRoute` 同一套生命周期）。 */
 export function registerPairActionRoutes(webServer: WebServerLike, deps: PairActionDeps): () => void {
   const unregisterNew = webServer.register({
     kind: 'exact',
@@ -132,9 +174,14 @@ export function registerPairActionRoutes(webServer: WebServerLike, deps: PairAct
     path: PAIR_IMAGE_ROUTE,
     handler: pairImageHandler(deps),
   })
+  const unregisterStatus = webServer.register({
+    kind: 'exact',
+    path: PAIR_STATUS_ROUTE,
+    handler: pillStatusHandler(deps),
+  })
   return () => {
-    // 两条都要试着注销：一条抛了也不能把另一条留在宿主上。
-    for (const off of [unregisterNew, unregisterImage]) {
+    // 三条都要试着注销：一条抛了也不能把其余的留在宿主上。
+    for (const off of [unregisterNew, unregisterImage, unregisterStatus]) {
       try {
         off()
       } catch {

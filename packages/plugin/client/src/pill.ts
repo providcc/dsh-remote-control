@@ -1,0 +1,527 @@
+/**
+ * pill — 状态栏那颗"点一下配对"的 pill（浏览器那一半）。
+ *
+ * 它做三件事：往宿主的 `conversation.composer.dock` 槽位注册一颗 pill，按节拍问
+ * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时 `POST /pairing/new`
+ * 要一张码、再把 `GET /pairing.png` 显示在弹出的面板里。
+ *
+ * 三条形状上的决定都有据可查，不是随手挑的：
+ *
+ * 1. **`slots` 走软探测，绝不写进模块的 `inject`**。声明成注入闸门意味着"这代宿主没有
+ *    slots 服务"时**整个 client 条目不激活**——那会连累已经在生产跑的右栏自动弹码
+ *    （同一个 bundle）。`@chaoset/provider-usage` 用 `ctx.get('modelDirectories')` 读
+ *    可选服务，就是这条姿势。
+ * 2. **react 只用来 `createElement`，而且是运行期向 loader 要**（`__drcRequire`，见
+ *    `scripts/bundle-plugin.mjs` 的外壳）。静态 import 的解析失败发生在 factory 顶层，
+ *    那是"整页 web boot 失败"的形状（真机踩过：`web boot: N entry/entries did not activate`）；
+ *    运行期拿不到就只是没有 pill。**不用 hooks**：组件只返回一个带 `ref` 的空 `<span>`，
+ *    UI 全由下面那段 DOM 管——`ref` 回调身份稳定，宿主重渲染 dock 不会把我们这块拆掉重建。
+ * 3. **图走同域 HTTP，不走 `dsh-resource://`**。右栏能吃那个自定义 scheme 是因为宿主的
+ *    文档预览页型认领了它；pill 里一个 `<img>` 能不能吃没有证据，而 `/plugins/**` 是
+ *    必然可行的那条路。
+ *
+ * 纪律与主文件同一条：**任何一步抛出都只留一行日志，绝不把异常抛进 loader，也不许连累
+ * 右栏那半条轮询**。
+ */
+
+/** pill 用到的三条路由（宿主侧定义在 `src/presentation/pair-actions.ts`，字符串必须一致）。 */
+export const STATUS_ROUTE = '/plugins/dsh-remote-control/status'
+export const NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
+export const IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
+
+/** 槽位与条目 id：抄 `conversation.composer.dock` 那个已验证的用法。 */
+export const SLOT_NAME = 'conversation.composer.dock'
+const PILL_ID = 'dsh-remote-control'
+/** 排在宿主自带的 stats(0) 与 provider-usage(10) 之后——加进去的东西不该挤掉原有的。 */
+const PILL_ORDER = 20
+
+const STYLE_ID = 'dsh-remote-control/pill.css'
+const POLL_MS = 2000
+
+interface SlotRegistry {
+  inject(slotName: string, callback: () => void): unknown
+  register(definition: Record<string, unknown>, component: unknown): unknown
+}
+
+interface Gettable {
+  get?<T>(name: string, optional?: true): T | undefined
+}
+
+interface PillHost extends Gettable {
+  inject?(names: string[], callback: (scoped: unknown) => void): unknown
+  effect?(execute: () => (() => unknown) | void): unknown
+}
+
+/** 只用到 createElement——不需要 hooks，见文件头第 2 条。 */
+export type CreateElement = (type: unknown, props: Record<string, unknown>) => unknown
+
+interface StatusAnswer {
+  relay?: unknown
+  paired?: unknown
+  hasCode?: unknown
+}
+
+interface NewAnswer {
+  state?: unknown
+  token?: unknown
+  expiresInMs?: unknown
+  epoch?: unknown
+  reason?: unknown
+  error?: unknown
+}
+
+/**
+ * 面板该显示什么：`POST /pairing/new` 的几种回答收成一个可判别的形状。
+ *
+ * 单独成函数是因为这里有一条**不许靠 HTTP 状态码判成败**的判据：中继不在时那条路由回的是
+ * 200 + `state:"unavailable"`，按 `response.ok` 分支会把它当成功，然后弹一张没有图的白框。
+ */
+export function panelViewFor(answer: NewAnswer | undefined, httpStatus: number): PanelView {
+  if (!answer || typeof answer !== 'object') return { kind: 'failed', detail: `HTTP ${httpStatus}` }
+  if (answer.state === 'ready') {
+    const token = typeof answer.token === 'string' ? answer.token : ''
+    const epoch = typeof answer.epoch === 'string' ? answer.epoch : ''
+    const expiresInMs = typeof answer.expiresInMs === 'number' ? answer.expiresInMs : 0
+    if (token === '' || expiresInMs <= 0) return { kind: 'failed', detail: '发码回答里的码不完整' }
+    // epoch 进 URL：一张码会被就地换掉，缓存任何一版都是让弹窗停在废码上。
+    return { kind: 'qr', token, expiresInMs, imageSrc: `${IMAGE_ROUTE}?e=${encodeURIComponent(epoch)}` }
+  }
+  if (answer.state === 'unavailable') {
+    return {
+      kind: 'unavailable',
+      reason: answer.reason === 'relay-offline' ? '中继还没连上，暂时无法配对。' : '现在发不出配对码。',
+    }
+  }
+  return { kind: 'failed', detail: typeof answer.error === 'string' ? answer.error : `HTTP ${httpStatus}` }
+}
+
+export type PanelView =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'qr'; token: string; expiresInMs: number; imageSrc: string }
+  | { kind: 'unavailable'; reason: string }
+  | { kind: 'failed'; detail: string }
+
+/** 状态 → pill 上那一句。顺序就是优先级：先说连不上，再说要不要配对。 */
+export function pillLabel(status: StatusAnswer | undefined): { text: string; tone: 'off' | 'wait' | 'on' } {
+  const relay = status?.relay
+  if (relay === 'idle') return { text: '远程未启动', tone: 'off' }
+  if (relay === 'offline') return { text: '远程未连接', tone: 'off' }
+  if (relay === 'connecting') return { text: '连接中', tone: 'wait' }
+  if (relay !== 'online') return { text: '远程控制', tone: 'off' }
+  const paired = typeof status?.paired === 'number' ? status.paired : 0
+  if (paired > 0) return { text: `已连 ${paired} 台`, tone: 'on' }
+  return status?.hasCode === true ? { text: '配对中', tone: 'on' } : { text: '点一下配对', tone: 'on' }
+}
+
+/** 秒数说成人话：62 秒说"1 分 2 秒"——用户扫一张码不该数秒。 */
+export function secondsText(ms: number): string {
+  const whole = Math.max(0, Math.round(ms / 1000))
+  if (whole < 60) return `${whole} 秒`
+  return `${Math.floor(whole / 60)} 分 ${whole % 60} 秒`
+}
+
+const CSS = `
+.drc-pill { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 2px 8px;
+  border: 0; border-radius: 999px; background: transparent; color: inherit; font: inherit;
+  font-size: 12px; line-height: 18px; cursor: pointer; }
+.drc-pill:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04)); }
+.drc-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--dsw-alias-label-dimmed, #9aa0a6); }
+.drc-dot[data-tone="wait"] { background: var(--dsw-alias-state-warn-primary, #faad14); }
+.drc-dot[data-tone="on"] { background: var(--dsw-alias-state-success-primary, #52c41a); }
+.drc-panel { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 30; width: 240px;
+  padding: 12px 14px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1)); border-radius: 12px;
+  background: var(--dsw-specific-tip, var(--dsw-alias-bg-layer-1, #ffffff));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.06);
+  color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; }
+.drc-qr { display: block; width: 200px; height: 200px; margin: 0 auto; image-rendering: pixelated; }
+.drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
+.drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
+.drc-note[data-kind="failed"] { color: var(--dsw-alias-state-error-primary, #ff4d4f); }
+.drc-actions { display: flex; gap: 6px; justify-content: center; margin-top: 8px; }
+.drc-btn { padding: 2px 10px; border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.1));
+  border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
+`
+
+/**
+ * 软探测 `slots`：先 `ctx.get`，拿不到再走 `ctx.inject`（回调参数是**作用域化上下文**，
+ * 要在它上面再 get 一次才拿得到服务）。两条路各自包 try——宿主 ctx 读没声明的属性是
+ * **抛错**，不是返回 undefined。
+ */
+function findSlots(ctx: PillHost): SlotRegistry | undefined {
+  let found: SlotRegistry | undefined
+  const accept = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return false
+    const record = value as Record<string, unknown>
+    if (typeof record.inject !== 'function' || typeof record.register !== 'function') return false
+    found = value as SlotRegistry
+    return true
+  }
+  try {
+    if (accept(ctx.get?.('slots', true))) return found
+  } catch {
+    /* 这一代宿主没这个服务名 */
+  }
+  try {
+    ctx.inject?.(['slots'], ((...args: unknown[]) => {
+      for (const candidate of [...args, ctx]) {
+        if (accept(candidate)) return
+        const asGettable = candidate as Gettable | null | undefined
+        if (asGettable && typeof asGettable.get === 'function') {
+          try {
+            if (accept(asGettable.get('slots', true))) return
+          } catch {
+            /* 这个候选没有该服务 */
+          }
+        }
+      }
+    }) as never)
+  } catch {
+    /* 没有 inject 口 */
+  }
+  return found
+}
+
+/**
+ * 装载这份 bundle 的 `__ModuleLoader__` 传进 factory 的那个 require（见
+ * `scripts/bundle-plugin.mjs` 的外壳）。这里**不用 `import`**，理由写在下面。
+ */
+declare const require: ((id: string) => unknown) | undefined
+
+/**
+ * 向装载器要 react 的 `createElement`；拿不到就是没有 pill，而不是整页起不来。
+ *
+ * 模块名走**变量**而不是字面量，这条不是风格问题：字面量 `require('react')` 会被打包器在
+ * 构建期解析成 factory 顶层那一句，一旦宿主给不出这个模块，抛出发生在 factory 第一行——
+ * 那是"web boot: N entry/entries did not activate"，连已经在生产跑的右栏弹码一起没。
+ * 走变量则留在运行期，被这里的 try 接住。（`scripts/bundle-plugin.mjs` 里有一条断言
+ * 盯着产物中不得出现 `require("react")` 那种静态形式。）
+ */
+export function findCreateElement(): CreateElement | undefined {
+  try {
+    if (typeof require !== 'function') return undefined
+    const moduleId = 'react'
+    const react = require(moduleId) as
+      { createElement?: CreateElement; default?: { createElement?: CreateElement } } | undefined
+    const create = react?.createElement ?? react?.default?.createElement
+    return typeof create === 'function' ? create : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function warn(message: string, error?: unknown): void {
+  try {
+    const detail = error instanceof Error ? error.message : error === undefined ? '' : String(error)
+    console.warn(`[dsh-remote-control pill] ${message} ${detail}`)
+  } catch {
+    /* 控制台也可能不可用 */
+  }
+}
+
+function ensureStyle(doc: Document): void {
+  try {
+    if (doc.querySelector(`style[data-plugin-css="${STYLE_ID}"]`)) return
+    const element = doc.createElement('style')
+    element.setAttribute('data-plugin-css', STYLE_ID)
+    element.textContent = CSS
+    doc.head.appendChild(element)
+  } catch (error) {
+    warn('样式注入失败（pill 仍可用，只是没配色）', error)
+  }
+}
+
+export interface PillDeps {
+  fetchImpl(input: string, init?: Record<string, unknown>): Promise<unknown>
+  /** 降级留痕的出口；单测用它钉住"这条路坏了但页面还能用"。 */
+  warn?(message: string): void
+}
+
+/**
+ * 在 `root` 里建出那颗 pill，返回卸载函数。
+ *
+ * DOM 是命令式的（React 只负责给个挂载点），所以这里能把"面板开着时倒计时走完要自动换码"
+ * 这种时序写成可测的分支。`fetchImpl` 是注入口：真实故障形状（200+unavailable 当成功、
+ * 过期后不再重试）只有喂假回答才复现得出来。
+ */
+export function buildPill(root: Element, deps: PillDeps): () => void {
+  const doc = root.ownerDocument
+  ensureStyle(doc)
+
+  const button = doc.createElement('button')
+  button.type = 'button'
+  button.className = 'drc-pill'
+  button.setAttribute('aria-haspopup', 'dialog')
+  button.setAttribute('aria-expanded', 'false')
+  const dot = doc.createElement('span')
+  dot.className = 'drc-dot'
+  dot.setAttribute('aria-hidden', 'true')
+  const label = doc.createElement('span')
+  label.className = 'drc-label'
+  button.appendChild(dot)
+  button.appendChild(label)
+  root.appendChild(button)
+
+  let panel: HTMLElement | undefined
+  let statusTimer: ReturnType<typeof setInterval> | undefined
+  let countTimer: ReturnType<typeof setInterval> | undefined
+  let view: PanelView = { kind: 'idle' }
+  let expiresInMs = 0
+  let lastStatus: StatusAnswer | undefined
+  let disposed = false
+
+  const write = (): void => {
+    const next = pillLabel(lastStatus)
+    label.textContent = next.text
+    dot.setAttribute('data-tone', next.tone)
+    button.setAttribute('title', `dsh-remote-control：${next.text}`)
+    button.setAttribute('aria-label', next.text)
+  }
+
+  const text = (tag: string, className: string, content: string): HTMLElement => {
+    const node = doc.createElement(tag)
+    node.className = className
+    node.textContent = content
+    return node
+  }
+
+  const buttonOf = (content: string, onClick: () => void): HTMLElement => {
+    const node = doc.createElement('button')
+    node.type = 'button'
+    node.className = 'drc-btn'
+    node.textContent = content
+    node.addEventListener('click', onClick)
+    return node
+  }
+
+  const paint = (): void => {
+    if (!panel) return
+    panel.replaceChildren()
+    if (view.kind === 'loading') {
+      panel.appendChild(text('p', 'drc-note', '正在生成配对码…'))
+      return
+    }
+    if (view.kind === 'qr') {
+      const image = doc.createElement('img')
+      image.className = 'drc-qr'
+      image.setAttribute('alt', '配对二维码')
+      image.src = view.imageSrc
+      panel.appendChild(image)
+      panel.appendChild(text('p', 'drc-code', view.token))
+      // 6 位码必须和 QR 一起在场：QR 在小屏/低对比度下扫不出来时，手输是唯一退路。
+      panel.appendChild(text('p', 'drc-note', `小程序里扫码，或手输这 6 位数字 · ${secondsText(expiresInMs)}后过期`))
+      const actions = doc.createElement('div')
+      actions.className = 'drc-actions'
+      actions.appendChild(buttonOf('换一张', () => void requestPairing(true)))
+      panel.appendChild(actions)
+      return
+    }
+    const note =
+      view.kind === 'unavailable'
+        ? text('p', 'drc-note', view.reason)
+        : view.kind === 'failed'
+          ? (() => {
+              const node = text('p', 'drc-note', `配对请求没成功：${view.detail}`)
+              node.setAttribute('data-kind', 'failed')
+              return node
+            })()
+          : text('p', 'drc-note', '点一下生成配对二维码。')
+    panel.appendChild(note)
+    if (view.kind !== 'idle') {
+      const actions = doc.createElement('div')
+      actions.className = 'drc-actions'
+      actions.appendChild(buttonOf('再试一次', () => void requestPairing(true)))
+      panel.appendChild(actions)
+    }
+  }
+
+  const closePanel = (): void => {
+    if (countTimer !== undefined) {
+      clearInterval(countTimer)
+      countTimer = undefined
+    }
+    if (panel) {
+      panel.remove()
+      panel = undefined
+    }
+    button.setAttribute('aria-expanded', 'false')
+  }
+
+  async function requestPairing(force: boolean): Promise<void> {
+    if (disposed || !panel) return
+    // 已经有码时不重画成"正在生成"——那会让屏幕上闪一下白。
+    if (view.kind !== 'qr' || force) {
+      view = { kind: 'loading' }
+      paint()
+    }
+    let answer: NewAnswer | undefined
+    let httpStatus = 0
+    try {
+      const response = (await deps.fetchImpl(NEW_ROUTE, { method: 'POST', credentials: 'same-origin' })) as
+        { status?: number; json?(): Promise<unknown> } | undefined
+      httpStatus = typeof response?.status === 'number' ? response.status : 0
+      answer = (await response?.json?.()) as NewAnswer | undefined
+    } catch (error) {
+      view = { kind: 'failed', detail: error instanceof Error ? error.message : String(error) }
+      paint()
+      return
+    }
+    if (disposed || !panel) return
+    view = panelViewFor(answer, httpStatus)
+    if (view.kind === 'qr') {
+      expiresInMs = view.expiresInMs
+      if (countTimer === undefined) {
+        countTimer = setInterval(() => {
+          expiresInMs -= 1000
+          // 到点自动再要一张：此刻宿主那边的 current() 已判过期，幂等入口会真的发新的。
+          if (expiresInMs <= 0) void requestPairing(true)
+          else paint()
+        }, 1000)
+      }
+    }
+    paint()
+  }
+
+  const openPanel = (): void => {
+    if (panel || disposed) return
+    panel = doc.createElement('div')
+    panel.className = 'drc-panel'
+    panel.setAttribute('role', 'dialog')
+    panel.setAttribute('aria-label', 'dsh-remote-control 配对')
+    panel.tabIndex = -1
+    root.appendChild(panel)
+    button.setAttribute('aria-expanded', 'true')
+    paint()
+    void requestPairing(false)
+    try {
+      panel.focus()
+    } catch {
+      /* 焦点进不去不是故障 */
+    }
+  }
+
+  /**
+   * 命中判定用鸭子类型而不是 `instanceof Node`：真浏览器里两者等价，但 vm 里没有 `Node`
+   * 这个全局，`instanceof` 会抛 ReferenceError——那会被吞掉并误判成"没命中"，
+   * 于是"点外面才关"变成"点哪里都关"。这条坑踩过就不留第二次。
+   */
+  const inside = (candidate: unknown): boolean => {
+    if (!candidate || typeof candidate !== 'object') return false
+    try {
+      return root.contains(candidate as Node) || (panel?.contains(candidate as Node) ?? false)
+    } catch {
+      return false
+    }
+  }
+
+  const onPointerDown = (event: Event): void => {
+    if (!panel) return
+    if (inside(event?.target)) return
+    closePanel()
+  }
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.key === 'Escape') closePanel()
+  }
+
+  async function pollStatus(): Promise<void> {
+    if (disposed) return
+    try {
+      if (doc.visibilityState === 'hidden') return
+    } catch {
+      /* 拿不到可见性就照常轮询 */
+    }
+    try {
+      const response = (await deps.fetchImpl(`${STATUS_ROUTE}?t=${Date.now()}`, {
+        headers: { accept: 'application/json' },
+        credentials: 'same-origin',
+      })) as { status?: number; json?(): Promise<unknown> } | undefined
+      if (!response || response.status !== 200) return
+      const body = (await response.json?.()) as StatusAnswer | undefined
+      if (!body || typeof body !== 'object') return
+      lastStatus = body
+      write()
+    } catch (error) {
+      // 路由没挂上时是持续的 404/失败：这是一条降级说明，不是故障。
+      deps.warn?.('status poll failed')
+      warn('status poll failed（pill 会停在默认文案上）', error)
+    }
+  }
+
+  button.addEventListener('click', () => {
+    if (panel) closePanel()
+    else openPanel()
+  })
+  doc.addEventListener('pointerdown', onPointerDown, true)
+  doc.addEventListener('keydown', onKeyDown)
+  write()
+  void pollStatus()
+  statusTimer = setInterval(() => void pollStatus(), POLL_MS)
+
+  return () => {
+    if (disposed) return
+    disposed = true
+    if (statusTimer !== undefined) clearInterval(statusTimer)
+    closePanel()
+    doc.removeEventListener('pointerdown', onPointerDown, true)
+    doc.removeEventListener('keydown', onKeyDown)
+    button.remove()
+  }
+}
+
+/**
+ * 注册进宿主的槽位。返回 false 表示"这颗 pill 不会出现"（没 react / 没 slots / 槽位 API 不对），
+ * 调用方只关心它不外抛。
+ */
+export function mountPill(ctx: PillHost, createElement: CreateElement | undefined): boolean {
+  if (!createElement) {
+    warn('装载器给不出 react：pill 不出现，配对仍可走 /drc pair')
+    return false
+  }
+  const slots = findSlots(ctx)
+  if (!slots) {
+    warn('这代宿主没有 slots 服务：pill 不出现，配对仍可走 /drc pair')
+    return false
+  }
+  /**
+   * `ref` 回调必须是**稳定身份**（模块里这一份闭包，每次渲染都同一个函数），
+   * 否则 React 每次重渲染都会先 `ref(null)` 再 `ref(node)`——那颗 pill 会一闪一闪地重建。
+   */
+  let cleanup: (() => void) | undefined
+  const attach = (node: unknown): void => {
+    const element = node as Element | null
+    if (element && typeof element.appendChild === 'function' && element.ownerDocument) {
+      if (cleanup) return
+      ;(element as HTMLElement).style.position = 'relative'
+      cleanup = buildPill(element, {
+        fetchImpl: (input, init) => globalThis.fetch(input, init as RequestInit | undefined),
+      })
+    } else if (cleanup) {
+      cleanup()
+      cleanup = undefined
+    }
+  }
+  const component = (): unknown => createElement('span', { ref: attach })
+  try {
+    slots.inject(SLOT_NAME, () => {
+      try {
+        slots.register({ name: SLOT_NAME, id: PILL_ID, order: PILL_ORDER, inject: () => ({}) }, component)
+      } catch (error) {
+        warn('槽位注册失败（右栏自动弹码不受影响）', error)
+      }
+    })
+  } catch (error) {
+    warn('槽位注入失败（右栏自动弹码不受影响）', error)
+    return false
+  }
+  try {
+    ctx.effect?.(() => () => {
+      if (cleanup) {
+        cleanup()
+        cleanup = undefined
+      }
+    })
+  } catch {
+    /* 没有 effect 口就不登记卸载：宿主整页卸载会带走这颗 pill */
+  }
+  return true
+}

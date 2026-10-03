@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../src/index.js'
 import { PAIR_VIA_PILL_TEXT } from '../src/shell/pairing-text.js'
-import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE } from '../src/presentation/pair-actions.js'
+import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/presentation/pair-actions.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
@@ -95,7 +95,7 @@ function boot(
   options: {
     webServer?: unknown
     registerThrows?: boolean
-    /** 只有 pill 那两条挂不上（右栏那条照旧成功）——新特性不许把既有特性一起拖死。 */
+    /** 只有 pill 那三条挂不上（右栏那条照旧成功）——新特性不许把既有特性一起拖死。 */
     actionsThrows?: boolean
     sidebarEnabled?: boolean
   } = {},
@@ -278,19 +278,19 @@ test('对照：主链路字段逐个相等、`/drc` 返回逐字节相等，差�
     // 唯一允许的差别。
     assert.equal((a.sidebar as Record<string, string>).webServer, 'none')
     assert.equal((b.sidebar as Record<string, string>).route, 'registered')
-    assert.equal((b.sidebar as Record<string, string>).actions, 'registered', 'pill 那两条路由也要挂上')
+    assert.equal((b.sidebar as Record<string, string>).actions, 'registered', 'pill 那三条路由也要挂上')
     assert.equal((b.sidebar as Record<string, string>).webServer, 'via get')
     assert.deepEqual(
       withWeb.registerCalls.map((call) => call.path),
-      ['/plugins/dsh-remote-control/pairing', PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE],
-      '三条路由一起挂：只读状态 + pill 发码 + pill 的图',
+      ['/plugins/dsh-remote-control/pairing', PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE],
+      '四条路由一起挂：只读状态 + pill 发码 + pill 的图 + pill 抬头状态',
     )
     assert.equal(without.unregistered(), 0)
     // 停机要连着把路由注销掉：漏了的话换一代宿主会撞上"路由名已占用"，
     // 而表现是"重载一次之后右栏再也不弹"。这里在断言之后 dispose，两个 finally 里的
     // dispose 是同一次（helper 内部有 once 守卫）。
     withWeb.dispose()
-    assert.equal(withWeb.unregistered(), 3, '三条路由都要注销')
+    assert.equal(withWeb.unregistered(), 4, '四条路由都要注销')
   } finally {
     without.dispose()
     withWeb.dispose()
@@ -326,6 +326,12 @@ test('配对入口的兵分：pill 点得开时 /drc pair 只指路，点不开�
     const viaCli = await noWeb.runDrc('pair')
     assert.notDeepEqual(viaCli, viaPill, 'pill 不可用时命令行必须走真正发码那一条分支')
     assert.equal((viaCli as { kind?: string }).kind, 'success')
+
+    // `force` 是那颗 pill 没出现时唯一不能堵死的退路（宿主给不出 react / 没有 slots 服务
+    // 时就是这种形状：路由挂上了，pill 却没挂上）。
+    const forced = await withWeb.runDrc('pair force')
+    assert.notDeepEqual(forced, viaPill, 'pill 可用时 `/drc pair force` 也必须走出发码那条分支')
+    assert.equal((forced as { kind?: string }).kind, 'success')
   } finally {
     noWeb.dispose()
     withWeb.dispose()
@@ -351,7 +357,7 @@ test('register() 抛错（路由名被占）：只废掉右栏那一半，注册
       hintWords(hostile.commandShape()?.input?.hint).includes('pair'),
       `路由挂不上时 pair 必须留在 hint 里：${String(hostile.commandShape()?.input?.hint)}`,
     )
-    assert.equal(hostile.registerCalls.length, 1, '第一条注册就抛了，后两条不该再试')
+    assert.equal(hostile.registerCalls.length, 1, '第一条注册就抛了，后三条不该再试')
     assert.equal(
       (state.sidebar as Record<string, string>).actions,
       undefined,
@@ -364,7 +370,7 @@ test('register() 抛错（路由名被占）：只废掉右栏那一半，注册
   }
 })
 
-test('只挂上右栏那条、pill 那两条挂不上：右栏照旧活，命令行把 pair 留回 hint', async () => {
+test('只挂上右栏那条、pill 那三条挂不上：右栏照旧活，命令行把 pair 留回 hint', async () => {
   const partial = boot({ actionsThrows: true })
   try {
     const state = await partial.waitForCarrier()
@@ -375,7 +381,7 @@ test('只挂上右栏那条、pill 那两条挂不上：右栏照旧活，命令
       String(sidebarState.actions).startsWith('register threw'),
       'actions 留痕：' + JSON.stringify(sidebarState),
     )
-    assert.equal(partial.registerCalls.length, 2, '第一条成功、第二条抛了就该停在第二次尝试')
+    assert.equal(partial.registerCalls.length, 2, '第一条成功、pill 第一条就抛了该停在第二次尝试')
     assert.ok(
       hintWords(partial.commandShape()?.input?.hint).includes('pair'),
       `pill 点不开时 pair 必须回来：${String(partial.commandShape()?.input?.hint)}`,
@@ -392,7 +398,7 @@ test('只挂上右栏那条、pill 那两条挂不上：右栏照旧活，命令
   }
 })
 
-test('pill 那两条挂上去的就是带守卫的那两条（接线，不是又拼一遍 deps）', async () => {
+test('pill 那三条挂上去的就是带守卫的那三条（接线，不是又拼一遍 deps）', async () => {
   const withWeb = boot({ webServer: true })
   try {
     const state = await withWeb.waitForCarrier()
@@ -435,6 +441,17 @@ test('pill 那两条挂上去的就是带守卫的那两条（接线，不是又
     // 图片：没有效码 → 204；非环回 Host → 403。
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: '127.0.0.1:5173' })).status, 204)
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: 'evil.example.com' })).status, 403)
+
+    // 抬头那句状态：只读（Origin 缺席放过），字段集合就那三个。
+    // `relay` 允许 offline / connecting 两种——保活重连在跑，这里钉死一种就是计时器测试。
+    const status = await run(PAIR_STATUS_ROUTE, 'GET', { host: '127.0.0.1:5173' })
+    assert.equal(status.status, 200, status.body)
+    const shown = JSON.parse(status.body) as Record<string, unknown>
+    assert.deepEqual(Object.keys(shown).sort(), ['hasCode', 'paired', 'relay'], '状态路由多出字段就是要重新审一遍')
+    assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
+    assert.equal(shown.paired, 0)
+    assert.equal(shown.hasCode, false, '中继不可达时发不出码，hasCode 必须跟着说实话')
+    assert.equal((await run(PAIR_STATUS_ROUTE, 'POST', LOOPBACK_HEADERS)).status, 405)
 
     // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。
     assert.ok(!ok.body.includes('psk'), `回答里出现了 psk：${ok.body}`)

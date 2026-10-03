@@ -7,6 +7,38 @@
 
 ## [未发布]
 
+## [1.2.0] - 2026-10-03
+
+### 新增
+
+- **状态栏那颗 pill：点一下配对**。宿主侧多三条同域路由——`POST /plugins/dsh-remote-control/pairing/new`
+  （幂等发码）、`GET /plugins/dsh-remote-control/pairing.png`（弹窗里那张二维码，按需现渲染，
+  `no-store` + `ETag` 用同一口径的 epoch）、`GET /plugins/dsh-remote-control/status`（pill 抬头那句
+  连接状态：`relay` / `paired` / `hasCode`）。浏览器面把一颗 pill 注册进宿主的
+  `conversation.composer.dock` 槽位：平时显示连接状态，点一下当场发码并把二维码弹在同一颗按钮上方，
+  6 位数字与 QR 同时在屏上（扫不出来时的唯一退路），寿命走完自动再要一张。
+- 三条回答里**都不含 `psk`，也不含完整配对 URI**。发码那条是**会改状态**的路由，所以 Origin
+  缺席也拒（只读那两条沿用"缺席当作同源"的旧判据）。
+- `status.json` 的 `sidebar` 多一个 `actions` 字段：pill 那三条路由的注册结果。
+
+### 变更
+
+- **`/drc pair` 降级成兜底**：pill 三条路由都挂上时，命令的 `hint` 去掉 `pair`，命令行也只把人
+  指回那颗按钮（不顺手再发一张，否则绕过"屏幕上永远只有一张有效码"那条幂等语义）；宿主没有
+  `webServer`、或那三条挂不上时，`pair` 自动回到命令行。开关判据是 `sidebar.available`。
+  `pair force` 始终可用——那是"路由挂上了、那颗 pill 却因为宿主给不出 `react` / 没有 `slots`
+  服务而没出现"时唯一不能堵死的退路；它走的是幂等入口，不会在 pill 之外多挂一张。
+- 一次启动现在挂 **4 条**路由（右栏只读那条 + pill 那三条），停机一起注销。
+
+### 兼容性
+
+- 浏览器面拿 `react` 走**运行期**（模块名用变量，不经打包器静态解析）：拿不到只是少一颗 pill，
+  不会变成"整页 web boot 失败"。`inject` 仍只声明 `sidebarRight`——把 `slots` 写进注入闸门等于
+  给右栏那半加了一道会随宿主版本关死的门。
+- 新增测试：`presentation-pair-actions.test.ts`（守卫、幂等、凭据缺席红线）、
+  `presentation-client-bundle.test.ts` 里那颗 pill 的一段（在 vm 里真跑打出来的 `client.cjs`，
+  含"拿不到 react / 探不到 slots 只许降级、右栏照旧"三条）。
+
 ## [1.1.0] - 2026-10-03
 
 ### 新增

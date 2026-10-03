@@ -47,7 +47,8 @@ export const PAIR_UNAVAILABLE_TEXT = '中继还没连上，暂时无法配对。
  */
 export const PAIR_VIA_PILL_TEXT =
   '配对请点状态栏的 dsh-remote-control：它会当场生成一张一次性码并弹出二维码。\n' +
-  '（`/drc` 现在只剩 status 与 unpair；只有状态栏那条路不可用时，pair 才会回来发码。）'
+  '屏幕上找不到那颗 pill 时执行 `/drc pair force`（宿主给不出 react 或没有 slots 服务时会出现这种情况，' +
+  '这时命令行是唯一退路）。'
 
 export function pairingPairText(view: PairingTextView): string {
   const ttlSec = Math.max(0, Math.round((view.expiresAt - view.now) / 1000))

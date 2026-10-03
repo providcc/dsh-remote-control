@@ -30,6 +30,7 @@ import { pairingPairText, PAIR_UNAVAILABLE_TEXT, PAIR_VIA_PILL_TEXT } from './sh
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { renderTerminalQr, qrPng } from './platform/qr.js'
 import { startSidebarQr, type SidebarHandle } from './presentation/sidebar.js'
+import type { PillStatus } from './presentation/pair-actions.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -405,7 +406,23 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 手机扫到没被显示的那张就全线解不开。那正是当初"多码事故"的形状。
    */
   function ensureFreshPairing(): { qr: string; token: string; expiresAt: number } | null {
-    return currentPairing() ?? createPairing()
+    const fresh = currentPairing() ?? createPairing()
+    if (!fresh) return null
+    // **在这里就把 psk 摘掉**，而不是靠"下游记得只读那三个字段"：这条返回值会被浏览器
+    // 可达的那条发码路由间接消费，红线（PSK 从不上网）要靠形状成立，不靠调用方自律。
+    return { qr: fresh.qr, token: fresh.token, expiresAt: fresh.expiresAt }
+  }
+
+  /**
+   * pill 抬头那句"连接状态"：三个非凭据字段，取值口径与 `status.json` 完全一致
+   * （同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
+   */
+  function pillStatus(): PillStatus {
+    return {
+      relay: relay ? relayState() : 'idle',
+      paired: relay?.conversationCount ?? 0,
+      hasCode: currentPairing() !== null,
+    }
   }
 
   /**
@@ -830,10 +847,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
           return undefined
         }
       },
-      // 状态栏那两条路由要的三件事：幂等发码、只读看当前码、现渲染 PNG。
+      // 状态栏那三条路由要的三件事：幂等发码、只读看当前码、现渲染 PNG。
       ensureFresh: () => ensureFreshPairing(),
       current: () => currentPairing(),
       renderPng: (qr: string) => qrPng(qr),
+      status: () => pillStatus(),
       log,
     })
   } catch (error) {
@@ -871,11 +889,16 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         .trim()
         .toLowerCase()
       if (argument.startsWith('pair')) {
-        if (sidebar?.available === true) {
+        // `force` 是那颗 pill 显示不出来时的退路：宿主给不出 react、或这代宿主没有 slots
+        // 服务时，路由挂上了而 pill 没挂上——这时只指路等于把人堵死。
+        const forced = argument.slice(4).trim().startsWith('force')
+        if (pairViaPill && !forced) {
           // 不顺手发码：那会绕开 pill 的幂等语义，让"屏幕上永远只有一张有效码"这条断言失效。
           return { kind: 'success', text: PAIR_VIA_PILL_TEXT }
         }
-        const pairing = createPairing()
+        // pill 在（只有 force 会走到这里）就走幂等入口，屏幕上那张仍然有效就印那张；
+        // pill 不在时这条是唯一入口，保持 1.1.0 的行为——每次都要一张新的。
+        const pairing = pairViaPill ? ensureFreshPairing() : createPairing()
         if (!pairing) return { kind: 'success', text: PAIR_UNAVAILABLE_TEXT }
         // **默认走图片**：DSH 命令卡按 `line-height:1.6` 渲染等宽输出，行间留白会把半块
         // 二维码横切成条——实测 zxing 在 ≥1.15 行距就解不出来，而宿主固定 1.6，也就是

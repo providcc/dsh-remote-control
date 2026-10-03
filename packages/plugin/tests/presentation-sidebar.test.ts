@@ -20,7 +20,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startSidebarQr, type SidebarQrSettings } from '../src/presentation/sidebar.js'
-import { PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE } from '../src/presentation/pair-actions.js'
+import { PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE } from '../src/presentation/pair-actions.js'
 import { PAIRING_ROUTE } from '../src/presentation/route.js'
 
 const HOST_HEADERS = { host: '127.0.0.1:5173' }
@@ -153,7 +153,7 @@ function tempImageFile(): { file: string; cleanup: () => void } {
 }
 
 /**
- * 状态栏那两条路由要的三条依赖，在这个文件里只是占位——本文件测的是**右栏接线**
+ * 状态栏那三条路由要的依赖，在这个文件里只是占位——本文件测的是**右栏接线**
  * （软探测、节拍、落盘、注销）。发码的幂等、守卫、204 这些判据单独钉在
  * `presentation-pair-actions.test.ts`，因为那是另一档安全姿态（会改状态）。
  */
@@ -161,6 +161,7 @@ const ACTION_DEPS = {
   ensureFresh: () => null,
   current: () => null,
   renderPng: async () => Buffer.from('fake-png'),
+  status: () => ({ relay: 'offline' as const, paired: 0, hasCode: false }),
 }
 
 const LOGS = () => {
@@ -187,8 +188,8 @@ test('webServer 到位：起节拍、挂路由，节拍跑出来的图真的在�
       })
       assert.deepEqual(
         setupResult.routes.map((route) => route.path),
-        [PAIRING_ROUTE, PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE],
-        '三条路由都要挂上：只读状态那条 + pill 的发码 + pill 的图',
+        [PAIRING_ROUTE, PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE],
+        '四条路由都要挂上：只读状态那条 + pill 的发码 + pill 的图 + pill 的抬头状态',
       )
       assert.equal(captured.ticks.length, 1, '节拍必须起起来')
       assert.equal(handle.probe.webServer, 'via get')
@@ -380,7 +381,7 @@ test('服务改从 inject 回调（作用域上下文）里拿：同样能起', 
         log: logs.log,
         ...ACTION_DEPS,
       })
-      assert.equal(setupResult.routes.length, 3, '三条路由一起挂上')
+      assert.equal(setupResult.routes.length, 4, '四条路由一起挂上')
       assert.equal(captured.ticks.length, 1)
       assert.equal(handle.probe.webServer, 'via inject')
       handle.stop()
@@ -497,11 +498,11 @@ test('stop()：路由与节拍一起收回，且幂等', async () => {
       })
       assert.equal(setupResult.unregistered(), 0)
       handle.stop()
-      assert.equal(setupResult.unregistered(), 3, '三条路由都要注销')
+      assert.equal(setupResult.unregistered(), 4, '四条路由都要注销')
       assert.equal(captured.cleared, 1, '节拍要清掉')
       // 重复调用是幂等的（宿主可能既 dispose fiber 又走停机路径）。
       handle.stop()
-      assert.equal(setupResult.unregistered(), 3)
+      assert.equal(setupResult.unregistered(), 4)
       assert.equal(captured.cleared, 1)
     })
   } finally {
@@ -537,7 +538,7 @@ test('register() 自己抛错：不起节拍、probe 留痕、不外抛', async 
   }
 })
 
-test('pill 那两条挂不上：右栏自动弹码照旧起（不能被新特性拖死），但 available 为 false', async () => {
+test('pill 那三条挂不上：右栏自动弹码照旧起（不能被新特性拖死），但 available 为 false', async () => {
   const { file, cleanup } = tempImageFile()
   try {
     const routes: Route[] = []

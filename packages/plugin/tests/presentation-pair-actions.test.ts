@@ -1,9 +1,9 @@
 /**
- * presentation-pair-actions.test — 状态栏 pill 那两条路由的判据。
+ * presentation-pair-actions.test — 状态栏 pill 那三条路由的判据。
  *
- * 这两条与右栏那条**不同一档安全姿态**，所以断言也各自一份：
+ * 这三条与右栏那条**不同一档安全姿态**，所以断言也各自一份：
  * `POST /pairing/new` 会改状态（向中继申请一张新码），因此 Origin 缺席也要拒；
- * `GET /pairing.png` 只读，Origin 缺席放过，但 Host 仍必须环回。
+ * `GET /pairing.png` 与 `GET /status` 只读，Origin 缺席放过，但 Host 仍必须环回。
  *
  * 最重要的一条不是"能发码"，而是**响应里绝不能出现凭据**：`psk` 与完整 `qr` URI
  * 一旦经这条路由出去，就等于把"PSK 从不上网"这条红线（D1）从浏览器面捅了个洞。
@@ -15,8 +15,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   PAIR_IMAGE_ROUTE,
   PAIR_NEW_ROUTE,
+  PAIR_STATUS_ROUTE,
   pairImageHandler,
   pairNewHandler,
+  pillStatusHandler,
   registerPairActionRoutes,
   type LivePairing,
   type PairActionDeps,
@@ -71,6 +73,7 @@ function deps(over: Partial<PairActionDeps> = {}): PairActionDeps & { calls: { e
       return live
     },
     renderPng: async () => Buffer.from('png-bytes'),
+    status: () => ({ relay: 'online', paired: 1, hasCode: true }),
     log: () => {},
     ...over,
   }
@@ -207,9 +210,60 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
   assert.ok((JSON.parse(reply().body).error as string).length <= 200)
 })
 
+// ── GET /status（pill 抬头那句连接状态）──────────────────────────────
+
+test('状态路由只出三个非凭据字段：relay / paired / hasCode', async () => {
+  const d = deps()
+  const { res, reply } = response()
+  await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
+  const got = reply()
+  assert.equal(got.status, 200)
+  assert.deepEqual(JSON.parse(got.body), { relay: 'online', paired: 1, hasCode: true })
+  const raw = got.body
+  for (const secret of [FAKE_PSK, FAKE_QR, FAKE_TOKEN, 'dshr:']) {
+    assert.ok(!raw.includes(secret), `状态回答里出现了 ${secret}：${raw}`)
+  }
+  assert.equal(d.calls.ensure, 0, '看状态绝不顺手发码')
+})
+
+test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的是"没启动"而不是"断了"）', async () => {
+  const d = deps({ status: () => ({ relay: 'idle', paired: 0, hasCode: false }) })
+  const { res, reply } = response()
+  await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
+  assert.deepEqual(JSON.parse(reply().body), { relay: 'idle', paired: 0, hasCode: false })
+})
+
+test('状态路由是只读的：Origin 缺席放过，非环回 Host 仍拒，POST 拒', async () => {
+  const noOrigin = deps()
+  const a = response()
+  await pillStatusHandler(noOrigin)(request('GET', { host: 'localhost:19387' }), a.res)
+  assert.equal(a.reply().status, 200)
+
+  const badHost = deps()
+  const b = response()
+  await pillStatusHandler(badHost)(request('GET', { host: 'evil.example.com' }), b.res)
+  assert.equal(b.reply().status, 403)
+
+  const written = deps()
+  const c = response()
+  await pillStatusHandler(written)(request('POST', LOOPBACK), c.res)
+  assert.equal(c.reply().status, 405)
+})
+
+test('status() 自己抛错 → 500 且不外抛到宿主', async () => {
+  const d = deps({
+    status: () => {
+      throw new Error('relay 被拆了')
+    },
+  })
+  const { res, reply } = response()
+  await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
+  assert.equal(reply().status, 500)
+})
+
 // ── 注册与注销 ───────────────────────────────────────────────────────
 
-test('注册挂上两条、注销把两条都摘掉', () => {
+test('注册挂上三条、注销把三条都摘掉', () => {
   const registered: string[] = []
   let off = 0
   const web = {
@@ -221,12 +275,12 @@ test('注册挂上两条、注销把两条都摘掉', () => {
     },
   }
   const unregister = registerPairActionRoutes(web as never, deps())
-  assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE])
+  assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE])
   unregister()
-  assert.equal(off, 2)
+  assert.equal(off, 3)
 })
 
-test('一条注销抛错不许让另一条留在宿主上', () => {
+test('一条注销抛错不许让其余留在宿主上', () => {
   let off = 0
   const web = {
     register: () => () => {
@@ -236,7 +290,7 @@ test('一条注销抛错不许让另一条留在宿主上', () => {
   }
   const unregister = registerPairActionRoutes(web as never, deps())
   assert.doesNotThrow(() => unregister())
-  assert.equal(off, 2, '第二条必须仍然被调用')
+  assert.equal(off, 3, '后两条必须仍然被调用')
 })
 
 test('反证：把写路由的 Origin 判据退回"缺席也放过"，那条 403 立刻失去牙齿', async () => {

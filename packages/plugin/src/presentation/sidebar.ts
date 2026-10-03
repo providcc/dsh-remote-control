@@ -24,7 +24,7 @@
  * 每个候选都"先 get 再直接读属性"两条路各自包 try。
  */
 import path from 'node:path'
-import { registerPairActionRoutes, type LivePairing } from './pair-actions.js'
+import { registerPairActionRoutes, type LivePairing, type PillStatus } from './pair-actions.js'
 import { liveDeps, PairingPresenter, writePrivatePng, type ActivePairing, type PairingArtifact } from './presenter.js'
 import { registerPairingRoute, type PairingRouteTarget, type WebServerLike } from './route.js'
 
@@ -63,6 +63,8 @@ export interface SidebarDeps {
   current(): LivePairing | null
   /** 把码渲染成 PNG 字节（`pairing.png` 用）。 */
   renderPng(qr: string): Promise<Buffer>
+  /** pill 抬头那句连接状态（`status` 路由用）。 */
+  status(): PillStatus
 }
 
 export interface SidebarHandle {
@@ -70,7 +72,7 @@ export interface SidebarHandle {
   /** 排错入口：为什么没起 / 服务是从哪条路拿到的 / 路由挂上没。 */
   readonly probe: Record<string, string>
   /**
-   * 右栏与状态栏那两条路由**是否真的挂上了**。
+   * 右栏与状态栏那四条路由**是否真的挂上了**。
    * 主插件用它决定 `/drc pair` 要不要作为兜底注册回来：没 webServer 的宿主上
    * 点不了 pill，命令行是唯一退路。
    */
@@ -154,14 +156,15 @@ export function startSidebarQr(ctx: LooseContext, deps: SidebarDeps): SidebarHan
       started = false
       return
     }
-    // 状态栏那两条（点一下发码 + 弹窗的图）**单独 try**：它们挂了不该把右栏自动弹码一起拖死，
-    // 那是 1.1.0 已经在跑的既有行为。但 `available` 取"两条都上"——pill 点不开就是没成，
+    // 状态栏那三条（点一下发码 + 弹窗的图 + 抬头那句状态）**单独 try**：它们挂了不该把右栏自动
+    // 弹码一起拖死，那是 1.1.0 已经在跑的既有行为。但 `available` 取"两条都上"——pill 点不开就是没成，
     // 主插件据此把 `/drc pair` 作为兜底注册回来。
     try {
       unregisterActions = registerPairActionRoutes(web, {
         ensureFresh: () => deps.ensureFresh(),
         current: () => deps.current(),
         renderPng: (qr: string) => deps.renderPng(qr),
+        status: () => deps.status(),
         log,
       })
       probe.actions = 'registered'
