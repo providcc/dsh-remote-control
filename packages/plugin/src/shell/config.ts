@@ -54,6 +54,15 @@ export interface PluginConfig {
    * 中文的"会话已失效，请重新配对"。
    */
   conversationIdleTtlSec: number
+  /**
+   * 右栏自动弹码那一半（原独立包 `dsh-remote-control-presentation`，2026-10-03 折进来）。
+   *
+   * 拆分版里它是**另一行配置**（另一个 cordis 条目），因为那一半要 `webServer` 而主插件
+   * 不写 inject 闸门。合成一个包之后隔离移到代码里：`src/presentation/sidebar.ts` 只软探测
+   * `webServer`，拿不到就整半不起。所以这里的键**绝不能是 error 级**——error 会让主插件
+   * 整个不启动，那等于把一个可选的外观功能变成配对链路的单点。
+   */
+  sidebarQr: { enabled: boolean; imageFile: string; refreshMs: number }
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -89,6 +98,10 @@ export const DEFAULT_CONFIG: PluginConfig = {
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
+  // 图默认落在会话工作区（`<workspace>/.dsh/sidebar-qr.png`），这里只是**兜底位**：
+  // 会话 → 工作区解析不出来时才用它。故意不写进 patch YAML——把某个人的家目录
+  // 焊进分发包是错的（拆分版同一理由）。
+  sidebarQr: { enabled: true, imageFile: path.join(homedir(), '.dsh', 'sidebar-qr.png'), refreshMs: 2000 },
 }
 
 const loopback = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/
@@ -128,6 +141,9 @@ export function readConfig(
     ...DEFAULT_CONFIG,
     ...(injected ?? {}),
     keepAwake: { ...DEFAULT_CONFIG.keepAwake, ...(injected?.keepAwake ?? {}) },
+    // 折进来的那一半同样是**逐键合并**：patch 里只写 `sidebarQr.refreshMs` 时，
+    // enabled 与 imageFile 必须仍取默认值，而不是被整个对象覆盖成 undefined。
+    sidebarQr: { ...DEFAULT_CONFIG.sidebarQr, ...(injected?.sidebarQr ?? {}) },
   }
   const fromEnv = (name: string): string | undefined => env[name]
   if (fromEnv('DRC_SERVER_URL')) merged.serverUrl = env.DRC_SERVER_URL as string
@@ -139,6 +155,9 @@ export function readConfig(
   if (fromEnv('DRC_QR_IMAGE')) merged.qrImage = envFlag(env.DRC_QR_IMAGE, merged.qrImage)
   if (fromEnv('DRC_QR_OPEN')) merged.qrOpen = envFlag(env.DRC_QR_OPEN, merged.qrOpen)
   if (fromEnv('DRC_QR_ANSI')) merged.qrAnsi = envFlag(env.DRC_QR_ANSI, merged.qrAnsi)
+  // 右栏那一半也给一个开关：live 取证要"只验配对链路、不要自动弹图"时用它，
+  // 与 DRC_QR_IMAGE 同样是 1/0/true/false，其余值不猜。
+  if (fromEnv('DRC_SIDEBAR_QR')) merged.sidebarQr.enabled = envFlag(env.DRC_SIDEBAR_QR, merged.sidebarQr.enabled)
   if (fromEnv('DRC_QR_STYLE')) {
     const style = env.DRC_QR_STYLE as PluginConfig['qrStyle']
     // 不猜：值不认识就保留上层（patch 或默认）的值，并由 validateConfig 负责 warn。
@@ -242,6 +261,31 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
       message:
         '提问接管会**取代桌面 UI 的提问能力**（ctx.userQuestions 只允许一个活跃 provider）；手机端不在线时提问会直接失败',
     })
+  }
+  // 右栏那一半的两条都只 warn + 夹回：**绝不用 error**，因为 error 会让主插件整个不启动
+  // （见 PluginConfig.sidebarQr 的注释），把一个可选功能变成了配对链路的单点故障。
+  if (typeof config.sidebarQr.imageFile !== 'string' || config.sidebarQr.imageFile === '') {
+    problems.push({
+      level: 'warn',
+      field: 'sidebarQr.imageFile',
+      message: '为空就无处落兜底图，已夹回 ~/.dsh/sidebar-qr.png（工作区解析得出来时本来也用不到它）',
+    })
+    config.sidebarQr.imageFile = DEFAULT_CONFIG.sidebarQr.imageFile
+  } else if (!path.isAbsolute(config.sidebarQr.imageFile)) {
+    problems.push({
+      level: 'warn',
+      field: 'sidebarQr.imageFile',
+      message: `不是绝对路径（${config.sidebarQr.imageFile}），工作区解析不出来时会被解析到进程工作目录下`,
+    })
+  }
+  if (!secondsSchema.safeParse(config.sidebarQr.refreshMs).success || config.sidebarQr.refreshMs < 200) {
+    // 拆分版是"夹到 200 下限"，这里同一口径：低于 200ms 的节拍只是把渲染与落盘变成刷屏。
+    problems.push({
+      level: 'warn',
+      field: 'sidebarQr.refreshMs',
+      message: '必须是 ≥200 的有限毫秒数，已夹回 2000（原值 ' + JSON.stringify(config.sidebarQr.refreshMs) + '）',
+    })
+    config.sidebarQr.refreshMs = DEFAULT_CONFIG.sidebarQr.refreshMs
   }
   return problems
 }

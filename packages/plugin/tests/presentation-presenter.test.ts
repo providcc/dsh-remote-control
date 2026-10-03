@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { liveDeps, PairingPresenter, writePrivatePng } from '../src/presenter.js'
+import { liveDeps, PairingPresenter, writePrivatePng } from '../src/presentation/presenter.js'
 
 /**
  * 生产用的就是码的哈希。这里用一个**真的**哈希（而不是 `h(qr)` 这种会原样带上码的假货）：

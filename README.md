@@ -7,13 +7,18 @@
 **DSH Remote Control** 的宿主侧——跑在 DeepSeek Harness 里的 cordis 插件。它把本机的 DSH 与
 零知识中继配对，让微信小程序可以**发指令、看流式输出、回答审批**，全程载荷级端到端加密。
 
-本仓是 monorepo，**只发一个 npm 包** `dsh-remote-control`；另一半 `packages/presentation`
-不单独发包，随 [`scripts/install-to-profile.sh`](./scripts/install-to-profile.sh) 以 bundle 装进 profile：
+本仓**只有一个包**：`dsh-remote-control`（发 npm）。它一次构建产出**两半产物**——宿主侧
+`dist/bundle/index.js` 与浏览器面 `dist/bundle/client.cjs`，都由
+[`scripts/install-to-profile.sh`](./scripts/install-to-profile.sh) 装进 profile：
 
-| 目录                                               | 包名                              | 分发方式    | 作用                                                                               |
-| -------------------------------------------------- | --------------------------------- | ----------- | ---------------------------------------------------------------------------------- |
-| [`packages/plugin`](./packages/plugin)             | `dsh-remote-control`              | **npm**     | 主插件：配对、中继连接、会话与命令、审批转发、防休眠                               |
-| [`packages/presentation`](./packages/presentation) | `dsh-remote-control-presentation` | 本仓 bundle | 把当前配对二维码落到磁盘，并让 DSH 右栏**自动弹码**（含一个浏览器面 `client.cjs`） |
+| 路径                                   | 包名                 | 分发方式         | 作用                                                                                                                                  |
+| -------------------------------------- | -------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| [`packages/plugin`](./packages/plugin) | `dsh-remote-control` | **npm** + bundle | 主插件：配对、中继连接、会话与命令、审批转发、防休眠，**外加**右栏自动弹码（配对码落 PNG + 一条同域只读路由 + 浏览器面 `client.cjs`） |
+
+> 右栏那一半原来是独立的 `packages/presentation`（`dsh-remote-control-presentation`，不发 npm）。
+> 拆包只是为了"某一代宿主没有 `webServer` 服务时，只有那一行不激活、配对/中继一行都不受影响"；
+> 折成一个包之后同样的隔离由代码提供——`src/presentation/sidebar.ts` 只软探测 `webServer`，
+> 拿不到就整半不起，`tests/presentation-isolation.test.ts` 用逐字段对照把这条钉住。
 
 其余两半在各自仓库：[`dsh-remote-server`](https://github.com/providcc/dsh-remote-server)（零知识中继）、
 `dsh-remote-mp`（微信小程序客户端）。三者共用
@@ -93,15 +98,17 @@ profile 里，改名等于让线上配置静默失效。
 
 ```sh
 pnpm install
-pnpm typecheck        # 两个包 tsc --noEmit
-pnpm test             # 每个包：先 build 再对 dist/tests 跑 node --test
-pnpm build            # tsc + esbuild → packages/*/dist/bundle/
+pnpm typecheck        # tsc --noEmit（宿主侧 + 浏览器面两套 tsconfig）
+pnpm test             # 先 build 再对 dist/tests 跑 node --test
+pnpm build            # tsc + esbuild → packages/plugin/dist/bundle/{index.js,client.cjs}
 pnpm format:check     # prettier --check
 ```
 
 测试就是普通的 `node --test` 文件，没有测试框架，运行期不做转译。动到二维码形状时务必盯住
 `packages/plugin/tests/pairing-text.test.ts`（文本/半块码）与
-`packages/presentation/tests/presenter.test.ts`（真渲染出 PNG magic bytes、落盘 0600）这两组。
+`packages/plugin/tests/presentation-presenter.test.ts`（真渲染出 PNG magic bytes、落盘 0600）这两组；
+动到右栏那条路由时盯住 `presentation-route.test.ts`（环回/来源守卫）与
+`presentation-isolation.test.ts`（**缺 `webServer` 时配对链路必须逐字段不变**）。
 
 ## 安全
 

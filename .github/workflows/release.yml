@@ -3,8 +3,8 @@ name: Release
 # 打一个 `v*` 标签即发布：先跑一遍完整校验（与 CI 同款，标签也可能打在坏提交上），
 # 版本号对得上标签之后，把插件包发布到 npm（带 provenance），再建一个 GitHub Release。
 #
-# 本仓只发**一个** npm 包：`dsh-remote-control`。`packages/presentation` 是
-# `private: true`，不进 npm——它随 `scripts/install-to-profile.sh` 以 bundle 形式装进 profile。
+# 本仓只发**一个** npm 包：`dsh-remote-control`（2026-10-03 起 `packages/presentation` 已折进插件包并删除）。
+# 包的产物有两半：宿主侧 `index.js` 与浏览器面 `client.cjs`，都随 `scripts/install-to-profile.sh` 装进 profile。
 #
 # 前置条件（仓库公开、账号就绪后一次性配好）：
 #   · repository secret `NPM_TOKEN` —— npm 的 Automation token，需有发包权限；

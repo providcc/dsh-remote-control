@@ -23,7 +23,7 @@ import { createContext, runInContext } from 'node:vm'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT = path.resolve(here, '..', 'bundle', 'client.cjs')
-const ROUTE = '/plugins/dsh-remote-control-presentation/pairing'
+const ROUTE = '/plugins/dsh-remote-control/pairing'
 
 interface ClientModule {
   name: string
@@ -142,7 +142,7 @@ function readyBody(
 
 test('外壳注册的形状：id 与包名一致，导出 name/inject/apply，inject 含 sidebarRight', () => {
   const harness = load()
-  assert.equal(harness.module.name, 'dsh-remote-control-presentation')
+  assert.equal(harness.module.name, 'dsh-remote-control')
   // 展开一次：vm 那个 realm 的数组与本 realm 的 Array.prototype 不是同一个，
   // deepStrictEqual 会因原型不同而红（与代码对错无关）。
   assert.deepEqual([...harness.module.inject], ['sidebarRight'])

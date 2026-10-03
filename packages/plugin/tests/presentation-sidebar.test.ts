@@ -1,30 +1,31 @@
 /**
- * entry.test — 宿主侧的接线：软探测两个服务、起节拍、挂路由、卸载时收干净。
+ * presentation-sidebar.test — 右栏那一半的接线：软探测 `webServer`、起节拍、挂路由、收干净。
  *
  * 这一层不重复测 presenter / route 的判断（那两个文件各测各的），它测的是**它们被接起来了**：
- * 一次 `apply` 之后，真实地渲染出一张 PNG、真实地把它写进磁盘、并且路由给出的地址**指向
- * 那个真的存在的文件**。中间任何一环没接上，这个断言就会红。
+ * 一次启动之后，真实地渲染出一张 PNG、真实地把它写进磁盘、并且路由给出的地址**指向那个真的
+ * 存在的文件**。中间任何一环没接上，这个断言就会红。
  *
- * 另外几条都是"宿主加载纪律"的形状：`apply` 在任何情况下都不许向外抛（抛出去宿主那一行
- * fiber 就失败）、没有服务时什么都不做、只有一半服务时不起、卸载时路由与节拍都要收回。
+ * 原来这些断言写在独立包 `packages/presentation/tests/entry.test.ts` 里，喂的是
+ * `apply(ctx, injected)` + 两个服务（`dshRemoteControl` / `webServer`）。折进主插件之后
+ * 只剩一个服务要探（`webServer`），配对码与工作区都从主插件内部直接拿，所以这里的 fixture
+ * 是 `startSidebarQr(ctx, deps)`。**"另一半服务从 inject 的作用域上下文里到"那条形状没丢**：
+ * 真宿主给 inject 回调的是作用域化上下文而不是服务实例，这一点踩过坑，仍然单独钉住。
  *
- * 落点（2026-10-02 改）：图该落在**请求那条会话的工作区**的 `.dsh` 下，工作区从主插件
- * `provide` 的 `dshRemoteControl.sessionWorkspace()` 问来；问不到才退回配置里的
- * `imageFile`。所以这里既要有"落了工作区、兜底位没被写"的正面，也要有"写不成 → 答 none、
- * 绝不交出指向不存在文件的地址"的反面。
+ * 另外几条是宿主加载纪律：探测抛错不许外抛、没有 webServer 时什么都不做、卸载要收回路由与节拍。
+ * 落点仍是"请求那条会话的工作区"，工作区解析不出来才退回 `config.imageFile`。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { apply } from '../src/entry.js'
-import { PAIRING_ROUTE } from '../src/route.js'
+import { startSidebarQr, type SidebarQrSettings } from '../src/presentation/sidebar.js'
+import { PAIRING_ROUTE } from '../src/presentation/route.js'
 
 const HOST_HEADERS = { host: '127.0.0.1:5173' }
 
 interface Captured {
-  /** setInterval 回调（entry 只起一个）。 */
+  /** setInterval 回调（sidebar 只起一个）。 */
   ticks: Array<() => void>
   /** clearInterval 被调了几次。 */
   cleared: number
@@ -39,38 +40,23 @@ interface Route {
 interface Setup {
   ctx: Record<string, unknown>
   routes: Route[]
-  disposers: Array<() => void>
   unregistered: () => number
 }
 
-function remoteWith(
-  pairing: unknown,
-  sessionWorkspace?: (sessionId: string) => string | undefined,
-): Record<string, unknown> {
-  return { state: { pairing }, ...(sessionWorkspace === undefined ? {} : { sessionWorkspace }) }
+function settings(file: string, enabled = true): SidebarQrSettings {
+  return { enabled, imageFile: file, refreshMs: 1000 }
 }
 
 /**
- * 造一版码，**形状照抄宿主 provide 出来的那一版**：`expiresAt` 是 ISO 字符串
- * （`describeActivePairing()` 的序列化结果，见 packages/plugin/src/index.ts），
- * 不是主插件内部的毫秒数。这一层的测试如果只喂毫秒 fixture，就正好绕过了
- * 真机上"每版码都被判过期"的那个 bug。
+ * 造一版码，**形状照抄 `describeActivePairing()` 序列化出来的那一版**：`expiresAt` 是 ISO
+ * 字符串，不是内部毫秒数。只喂毫秒 fixture 的话，就正好绕过了真机上"每版码都被判过期"那个 bug
+ * （取证写在 `src/presentation/presenter.ts` 的 `toEpochMs`）。
  */
 function pairingWith(qr: string, expiresAtMs: number): { qr: string; expiresAt: string } {
   return { qr, expiresAt: new Date(expiresAtMs).toISOString() }
 }
 
-function setup(
-  options: {
-    remote?: unknown
-    web?: boolean
-    get?: boolean
-    inject?: boolean
-    effect?: boolean
-    onDispose?: boolean
-    scopedInject?: boolean
-  } = {},
-): Setup {
+function setup(options: { web?: boolean; get?: boolean; inject?: boolean; scopedInject?: boolean } = {}): Setup {
   const routes: Route[] = []
   let unregistered = 0
   const web = {
@@ -81,40 +67,23 @@ function setup(
       }
     },
   }
-  const remote = options.remote ?? remoteWith(null)
-  const disposers: Array<() => void> = []
   const ctx: Record<string, unknown> = {}
   if (options.get !== false) {
-    ctx.get = (name: string, _optional?: boolean) => {
-      if (name === 'dshRemoteControl') return remote
-      if (name === 'webServer' && options.web !== false) return web
-      return undefined
-    }
+    ctx.get = (name: string) => (name === 'webServer' && options.web !== false ? web : undefined)
   }
   if (options.inject !== false) {
     ctx.inject = (_names: string[], callback: (scoped: unknown) => void) => {
       // 真宿主给的是**作用域化上下文**（要在它上面 get 才拿得到服务），
       // 这里就按那个形状喂，免得测出来的是"回调参数=服务"这个错的形状。
-      if (options.scopedInject)
-        callback({
-          get: (name: string) => (name === 'dshRemoteControl' ? remote : name === 'webServer' ? web : undefined),
-        })
+      if (options.scopedInject) callback({ get: (name: string) => (name === 'webServer' ? web : undefined) })
     }
   }
-  if (options.effect !== false) {
-    ctx.effect = (execute: () => (() => unknown) | void) => {
-      const dispose = execute()
-      if (typeof dispose === 'function') disposers.push(dispose as () => void)
-    }
-  }
-  if (options.onDispose) ctx.onDispose = (fn: () => void) => disposers.push(fn)
-  return { ctx, routes, disposers, unregistered: () => unregistered }
+  return { ctx, routes, unregistered: () => unregistered }
 }
 
 /**
  * 用真的 Timer 句柄伪装节拍：`clearInterval` 收到的必须是一个真句柄，
  * 否则"卸载时到底清没清"这条断言测的就是假对象的行为了。
- * 补丁在整个测试体期间生效（clearInterval 在 apply 返回之后才被调用）。
  */
 async function withTimers<T>(run: (captured: Captured) => Promise<T> | T): Promise<T> {
   const captured: Captured = { ticks: [], cleared: 0 }
@@ -165,22 +134,36 @@ async function askRoute(route: Route, url: string): Promise<{ status: number; bo
 }
 
 function tempImageFile(): { file: string; cleanup: () => void } {
-  const dir = mkdtempSync(path.join(tmpdir(), 'drc-entry-'))
+  const dir = mkdtempSync(path.join(tmpdir(), 'drc-sidebar-'))
   return { file: path.join(dir, 'sidebar-qr.png'), cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
-test('两个服务都到齐：起节拍、挂路由，节拍跑出来的图真的在磁盘上', async () => {
+const LOGS = () => {
+  const lines: string[] = []
+  return {
+    lines,
+    log: (message: string, fields?: Record<string, unknown>) =>
+      lines.push(`${message} ${JSON.stringify(fields ?? {})}`),
+  }
+}
+
+test('webServer 到位：起节拍、挂路由，节拍跑出来的图真的在磁盘上', async () => {
   const { file, cleanup } = tempImageFile()
   try {
-    const setupResult = setup({
-      remote: remoteWith(pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000)),
-    })
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers(async (captured) => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
-
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000),
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
       assert.equal(setupResult.routes.length, 1, '路由必须挂上')
       assert.equal(setupResult.routes[0]?.path, PAIRING_ROUTE)
       assert.equal(captured.ticks.length, 1, '节拍必须起起来')
+      assert.equal(handle.probe.webServer, 'via get')
+      assert.equal(handle.probe.route, 'registered')
 
       const answer = await waitFor(async () => {
         const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
@@ -195,6 +178,7 @@ test('两个服务都到齐：起节拍、挂路由，节拍跑出来的图真�
       // 地址里绝不能出现码本身（路由是浏览器可达的，码带着一次性 token + PSK）。
       assert.ok(!JSON.stringify(answer).includes('fake-psk'))
       assert.ok(!JSON.stringify(answer).includes('fake-token'))
+      handle.stop()
     })
   } finally {
     cleanup()
@@ -203,16 +187,17 @@ test('两个服务都到齐：起节拍、挂路由，节拍跑出来的图真�
 
 test('会话工作区解析得出来：图落在 <工作区>/.dsh/sidebar-qr.png，配置里的 imageFile 当兜底不用', async () => {
   const { file: fallback, cleanup } = tempImageFile()
-  const workspace = mkdtempSync(path.join(tmpdir(), 'drc-entry-ws-'))
+  const workspace = mkdtempSync(path.join(tmpdir(), 'drc-sidebar-ws-'))
   try {
-    const setupResult = setup({
-      remote: remoteWith(
-        pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000),
-        (sessionId) => (sessionId === 'sess-1' ? workspace : undefined),
-      ),
-    })
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers(async () => {
-      apply(setupResult.ctx, { imageFile: fallback, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(fallback),
+        pairing: () => pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000),
+        workspaceOf: (sessionId) => (sessionId === 'sess-1' ? workspace : undefined),
+        log: logs.log,
+      })
       const answer = await waitFor(async () => {
         const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
         return got.status === 200 && got.body.state === 'ready' ? got : undefined
@@ -223,6 +208,7 @@ test('会话工作区解析得出来：图落在 <工作区>/.dsh/sidebar-qr.png
       assert.ok(address.endsWith('/.dsh/sidebar-qr.png'), address)
       assert.ok(existsSync(path.join(workspace, '.dsh', 'sidebar-qr.png')), '图必须落在会话工作区的 .dsh 下')
       assert.equal(existsSync(fallback), false, '工作区解析得出来时不该再往兜底位置写')
+      handle.stop()
     })
   } finally {
     cleanup()
@@ -230,22 +216,31 @@ test('会话工作区解析得出来：图落在 <工作区>/.dsh/sidebar-qr.png
   }
 })
 
-test('工作区解析不出来（老主插件 / 服务形状不对）：退回配置里的 imageFile，两边仍指同一个文件', async () => {
+test('工作区解析抛错（内核还没起来）：退回配置里的 imageFile，两边仍指同一个文件', async () => {
   const { file: fallback, cleanup } = tempImageFile()
   try {
-    const setupResult = setup({
-      remote: remoteWith(pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000), () => {
-        throw new Error('跨包调用炸了')
-      }),
-    })
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers(async () => {
-      apply(setupResult.ctx, { imageFile: fallback, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(fallback),
+        pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000),
+        workspaceOf: () => {
+          throw new Error('kernel 还没接上')
+        },
+        log: logs.log,
+      })
       const answer = await waitFor(async () => {
         const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
         return got.status === 200 && got.body.state === 'ready' ? got : undefined
       })
       assert.ok(String(answer.body.address).endsWith(encodeURIComponent(path.basename(fallback))))
       assert.ok(existsSync(fallback), '兜底落点必须真的写出文件')
+      assert.ok(
+        logs.lines.some((line) => line.includes('会话工作区解析失败')),
+        '退回兜底这件事要留痕，不然排查时会以为是配置指到这里：' + logs.lines.join(' | '),
+      )
+      handle.stop()
     })
   } finally {
     cleanup()
@@ -254,7 +249,7 @@ test('工作区解析不出来（老主插件 / 服务形状不对）：退回�
 
 test('落盘写不进去 → 200 + none，绝不交出指向不存在文件的地址', async () => {
   const { file: fallback, cleanup } = tempImageFile()
-  const workspace = mkdtempSync(path.join(tmpdir(), 'drc-entry-badws-'))
+  const workspace = mkdtempSync(path.join(tmpdir(), 'drc-sidebar-badws-'))
   try {
     // 把"工作区"指到一个**文件**上：`<文件>/.dsh/` 建不出来，writePrivatePng 必然 false。
     const notADir = path.join(workspace, 'not-a-dir')
@@ -262,14 +257,18 @@ test('落盘写不进去 → 200 + none，绝不交出指向不存在文件的�
     // 这个计数是"路由真的走到了落点解析那一步"的证据：只有快照 ready 才会去问工作区，
     // 于是它排除了"tick 还没跑完所以答 none"这种假绿。
     let asked = 0
-    const setupResult = setup({
-      remote: remoteWith(pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000), () => {
-        asked += 1
-        return notADir
-      }),
-    })
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers(async () => {
-      apply(setupResult.ctx, { imageFile: fallback, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(fallback),
+        pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000),
+        workspaceOf: () => {
+          asked += 1
+          return notADir
+        },
+        log: logs.log,
+      })
       await waitFor(async () => {
         const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
         return asked > 0 ? got : undefined
@@ -277,6 +276,7 @@ test('落盘写不进去 → 200 + none，绝不交出指向不存在文件的�
       const answer = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
       assert.deepEqual(answer.body, { state: 'none' })
       assert.equal(existsSync(fallback), false, '兜底位置也不该被写：写不成就不该交地址')
+      handle.stop()
     })
   } finally {
     cleanup()
@@ -287,27 +287,44 @@ test('落盘写不进去 → 200 + none，绝不交出指向不存在文件的�
 test('过期的码：路由一直答 none，且绝不落盘', async () => {
   const { file, cleanup } = tempImageFile()
   try {
-    const setupResult = setup({ remote: remoteWith(pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() - 1)) })
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers(async () => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() - 1),
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
       await new Promise((resolve) => setTimeout(resolve, 120))
       const answer = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
       assert.deepEqual(answer, { status: 200, body: { state: 'none' } })
       assert.equal(existsSync(file), false, '过期的码不该写出任何文件')
+      handle.stop()
     })
   } finally {
     cleanup()
   }
 })
 
-test('只有 dshRemoteControl、没有 webServer：什么都不做（图落了盘也没人知道地址）', async () => {
+test('没有 webServer：什么都不做（图落了盘也没人知道地址），并把原因留在 probe 里', async () => {
   const { file, cleanup } = tempImageFile()
   try {
     const setupResult = setup({ web: false })
+    const logs = LOGS()
     await withTimers((captured) => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000),
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
       assert.equal(setupResult.routes.length, 0)
       assert.equal(captured.ticks.length, 0)
+      assert.equal(existsSync(file), false, '没起就别写盘')
+      // 这条是"二维码不弹"的排查入口：probe 必须说清是没探到，而不是沉默。
+      assert.equal(handle.probe.webServer, 'none')
+      handle.stop()
     })
   } finally {
     cleanup()
@@ -318,17 +335,46 @@ test('服务改从 inject 回调（作用域上下文）里拿：同样能起', 
   const { file, cleanup } = tempImageFile()
   try {
     const setupResult = setup({ get: false, scopedInject: true })
+    const logs = LOGS()
     await withTimers((captured) => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => null,
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
       assert.equal(setupResult.routes.length, 1)
       assert.equal(captured.ticks.length, 1)
+      assert.equal(handle.probe.webServer, 'via inject')
+      handle.stop()
     })
   } finally {
     cleanup()
   }
 })
 
-test('探测本身抛错（宿主 ctx 是 Proxy，读不存在的属性会抛）：apply 绝不外抛', () => {
+test('探到的对象没有 register()：不收，probe 写明形状不对', async () => {
+  const { file, cleanup } = tempImageFile()
+  try {
+    const ctx: Record<string, unknown> = { get: () => ({ notRegister: true }) }
+    const logs = LOGS()
+    await withTimers((captured) => {
+      const handle = startSidebarQr(ctx, {
+        config: settings(file),
+        pairing: () => null,
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
+      assert.equal(captured.ticks.length, 0, '形状不对就不要起节拍')
+      assert.equal(handle.probe.webServer, 'object without register()')
+      handle.stop()
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('探测本身抛错（宿主 ctx 是 Proxy，读不存在的属性会抛）：绝不向外抛', () => {
   const ctx: Record<string, unknown> = {
     get: () => {
       throw new Error('cannot get property "webServer" without inject')
@@ -336,35 +382,83 @@ test('探测本身抛错（宿主 ctx 是 Proxy，读不存在的属性会抛）
     inject: () => {
       throw new Error('cannot get property "inject" without inject')
     },
-    effect: () => {
-      throw new Error('cannot get property "effect" without inject')
-    },
   }
-  assert.doesNotThrow(() => apply(ctx, { enabled: true }))
-})
-
-test('disabled：直接不做事', async () => {
-  const setupResult = setup({})
-  await withTimers((captured) => {
-    apply(setupResult.ctx, { enabled: false })
-    assert.equal(setupResult.routes.length, 0)
-    assert.equal(captured.ticks.length, 0)
+  const logs = LOGS()
+  assert.doesNotThrow(() => {
+    const handle = startSidebarQr(ctx, {
+      config: settings('/tmp/whatever.png'),
+      pairing: () => null,
+      workspaceOf: () => undefined,
+      log: logs.log,
+    })
+    // 抛过也要留下痕迹：'get threw: …' 是唯一能区分"这代宿主没这服务"和"我们读错了"的证据。
+    assert.ok(String(handle.probe.webServer).startsWith('get threw:'))
+    handle.stop()
   })
 })
 
-test('卸载：effect 的注销函数把路由与节拍一起收回', async () => {
+test('取码那句抛错：节拍继续、不外抛，只记一行', async () => {
   const { file, cleanup } = tempImageFile()
   try {
     const setupResult = setup({})
+    const logs = LOGS()
+    await withTimers(async (captured) => {
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => {
+          throw new Error('slots 被拆了')
+        },
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
+      assert.equal(captured.ticks.length, 1)
+      await captured.ticks[0]!()
+      assert.ok(
+        logs.lines.some((line) => line.includes('read pairing state failed')),
+        '读码失败要留痕：' + logs.lines.join(' | '),
+      )
+      handle.stop()
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('disabled：直接不做事，probe 写明原因', async () => {
+  const setupResult = setup({})
+  const logs = LOGS()
+  await withTimers((captured) => {
+    const handle = startSidebarQr(setupResult.ctx, {
+      config: settings('/tmp/whatever.png', false),
+      pairing: () => null,
+      workspaceOf: () => undefined,
+      log: logs.log,
+    })
+    assert.equal(setupResult.routes.length, 0)
+    assert.equal(captured.ticks.length, 0)
+    assert.equal(handle.probe.sidebar, 'disabled')
+    handle.stop()
+  })
+})
+
+test('stop()：路由与节拍一起收回，且幂等', async () => {
+  const { file, cleanup } = tempImageFile()
+  try {
+    const setupResult = setup({})
+    const logs = LOGS()
     await withTimers((captured) => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
-      assert.equal(setupResult.disposers.length, 1, '必须登记卸载钩子')
+      const handle = startSidebarQr(setupResult.ctx, {
+        config: settings(file),
+        pairing: () => null,
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
       assert.equal(setupResult.unregistered(), 0)
-      setupResult.disposers[0]!()
+      handle.stop()
       assert.equal(setupResult.unregistered(), 1, '路由要注销')
       assert.equal(captured.cleared, 1, '节拍要清掉')
-      // 重复调用是幂等的（宿主可能既 dispose fiber 又走 onDispose）。
-      setupResult.disposers[0]!()
+      // 重复调用是幂等的（宿主可能既 dispose fiber 又走停机路径）。
+      handle.stop()
       assert.equal(setupResult.unregistered(), 1)
       assert.equal(captured.cleared, 1)
     })
@@ -373,16 +467,27 @@ test('卸载：effect 的注销函数把路由与节拍一起收回', async () =
   }
 })
 
-test('没有 effect 口的代际：退回 onDispose，且仍能收回', async () => {
+test('register() 自己抛错：不起节拍、probe 留痕、不外抛', async () => {
   const { file, cleanup } = tempImageFile()
   try {
-    const setupResult = setup({ effect: false, onDispose: true })
-    await withTimers(() => {
-      apply(setupResult.ctx, { imageFile: file, refreshMs: 1000 })
-      assert.equal(setupResult.routes.length, 1)
-      assert.equal(setupResult.disposers.length, 1)
-      setupResult.disposers[0]!()
-      assert.equal(setupResult.unregistered(), 1)
+    const ctx: Record<string, unknown> = {
+      get: () => ({
+        register: () => {
+          throw new Error('这个路由名已经被占了')
+        },
+      }),
+    }
+    const logs = LOGS()
+    await withTimers((captured) => {
+      const handle = startSidebarQr(ctx, {
+        config: settings(file),
+        pairing: () => null,
+        workspaceOf: () => undefined,
+        log: logs.log,
+      })
+      assert.equal(captured.ticks.length, 0, '路由没挂上就不该起节拍')
+      assert.ok(String(handle.probe.route).startsWith('register threw'))
+      handle.stop()
     })
   } finally {
     cleanup()

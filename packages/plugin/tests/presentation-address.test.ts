@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { isUsableSessionId, sessionFileAddress } from '../src/address.js'
+import { isUsableSessionId, sessionFileAddress } from '../src/presentation/address.js'
 
 test('工作区外绝对路径：前导斜杠必须保留（地址里出现双斜杠）', () => {
   assert.equal(

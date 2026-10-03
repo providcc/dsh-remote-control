@@ -7,6 +7,11 @@
  * 同域只读路由是这条边界上既有的、已被验证的姿势（`@chaoset/provider-usage` 的用量
  * 路由就是这么做的）。
  *
+ * 路由按**注册方 bundle 的 id** 走 `/plugins/<id>/pairing`：折进主插件之后那个 id 就是
+ * `dsh-remote-control`（2026-10-03 之前它是 `dsh-remote-control-presentation`，独立一个包）。
+ * 浏览器那一半轮询的是同一个字符串，两边必须同步改——分叉的表现是"右栏永远不弹而日志全绿"，
+ * 因为 404 在这条路上是被容忍的。
+ *
  * 安全姿态**照抄用量路由那一套**（两份实现各自独立、不互相 import，漂移时宁可各自拒绝）：
  * Host 必须环回（挡 DNS 重绑定的导航/表单请求）+ Origin 必须环回或缺席（挡跨站读）。
  * 桌面宿主里 Electron 会在更外层把 `host` / `origin` 头删掉并注入鉴权 cookie
@@ -25,7 +30,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isUsableSessionId, sessionFileAddress } from './address.js'
 import type { PairingSnapshot } from './presenter.js'
 
-export const PAIRING_ROUTE = '/plugins/dsh-remote-control-presentation/pairing'
+export const PAIRING_ROUTE = '/plugins/dsh-remote-control/pairing'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 

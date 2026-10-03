@@ -29,6 +29,7 @@ import { pairingImagePath, StatusFile, writePrivateFile } from './shell/status.j
 import { pairingPairText, PAIR_UNAVAILABLE_TEXT } from './shell/pairing-text.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { renderTerminalQr, qrPng } from './platform/qr.js'
+import { startSidebarQr, type SidebarHandle } from './presentation/sidebar.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -205,6 +206,12 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   let runtime: HostRuntime | undefined
   let relay: RelayClient | undefined
   let startedCarrier = ''
+  /**
+   * 右栏自动弹码那一半（折进来的 presentation）。`undefined` = 还没起 / 起不动。
+   * 它**不在主链路上**：没有 `webServer` 时它就是 undefined，配对、中继、命令一行都不受影响
+   * ——这正是原来"拆成两个包"所提供的隔离，现在由 `startSidebarQr` 的软探测提供。
+   */
+  let sidebar: SidebarHandle | undefined
   // RelayClient 是唯一知道连接此刻怎么样的一方；状态快照读这两个值。
   let lastRelayState: 'online' | 'connecting' | 'offline' = 'connecting'
   let lastRelayProblem: string | undefined
@@ -326,6 +333,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // 出站计数：手机上"没收到 X"的第一现场对比点（插件没发 vs 发了但路上丢了）。
       outbound: runtime?.stats ?? null,
       probe,
+      // 右栏那一半为什么没起，是"二维码不弹"唯一的排查入口：这里直接把软探测的结果带出来。
+      sidebar: sidebar?.probe ?? { webServer: 'not-started' },
       // token 永远不出现真值；这条有测试锁住。
       hostToken: undefined,
       hostTokenShape: config.hostToken ? redact(config.hostToken) : undefined,
@@ -862,6 +871,34 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     /* 没有 commands 服务的代际：静默跳过，配对仍可由 pairOnStartSec 自动发布 */
   }
 
+  // ── 右栏自动弹码（2026-10-03 折进来的 presentation 那一半）────────────
+  //
+  // 放最后：它只依赖 `describeActivePairing` / `kernel.sessionWorkspace` / config / log，
+  // 而那几样在它之前都已经接好了——**主链路必须先成立**，这一半起不来时上面一行都不许被回滚。
+  //
+  // 整段再包一层 try 不是冗余：`startSidebarQr` 内部已经层层兜住，但"层层兜住"是设计不是证明。
+  // 它一旦抛出，宿主会把我们这条 fiber 标 FAILED 并 dispose 掉六个 inject 子 fiber——
+  // 那就等于用一个可选的外观功能砸了配对链路（真机取证见 `apply()` 里那条纪律）。
+  try {
+    sidebar = startSidebarQr(ctx, {
+      config: config.sidebarQr,
+      pairing: () => describeActivePairing(),
+      workspaceOf(sessionId: string): string | undefined {
+        try {
+          return kernel?.sessionWorkspace?.(sessionId)
+        } catch {
+          return undefined
+        }
+      },
+      log,
+    })
+  } catch (error) {
+    sidebar = undefined
+    log('sidebar start threw（配对链路不受影响）', {
+      message: String((error as Error)?.message ?? error).slice(0, 200),
+    })
+  }
+
   return {
     config,
     state,
@@ -876,6 +913,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     stop(): void {
       // 复查定时器要先撤：停机之后它们再去写 status.json，写的是已经过期的取证。
       oneShot.cancelAll()
+      // 右栏那一半的节拍与路由也要一起收：它是不在主链路上的旁路，所以单独一句。
+      sidebar?.stop()
       status.stop()
       runtime?.stop()
       relay?.stop()

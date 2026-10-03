@@ -31,8 +31,8 @@ interface ClientContext {
   effect?(execute: () => (() => unknown) | void): unknown
 }
 
-/** 宿主那一半注册的只读路由（见 src/route.ts 的 PAIRING_ROUTE）。 */
-const ROUTE = '/plugins/dsh-remote-control-presentation/pairing'
+/** 宿主那一半注册的只读路由（见 src/presentation/route.ts 的 PAIRING_ROUTE，两边必须同串）。 */
+const ROUTE = '/plugins/dsh-remote-control/pairing'
 const POLL_MS = 2000
 
 let timer: ReturnType<typeof setInterval> | undefined
@@ -50,7 +50,7 @@ function report(message: string, error?: unknown): void {
   reported.add(message)
   try {
     const detail = error instanceof Error ? (error.stack ?? error.message) : error === undefined ? '' : String(error)
-    console.error(`[dsh-remote-control-presentation] ${message} ${detail}`)
+    console.error(`[dsh-remote-control sidebar] ${message} ${detail}`)
   } catch {
     /* 控制台也可能不可用 */
   }
@@ -134,7 +134,7 @@ function onVisibility(): void {
   if (current && !stopped) void poll(current)
 }
 
-export const name = 'dsh-remote-control-presentation'
+export const name = 'dsh-remote-control'
 
 /** cordis **服务**名列表（不是 dsh.client.inject 那份包名列表）。 */
 export const inject = ['sidebarRight']

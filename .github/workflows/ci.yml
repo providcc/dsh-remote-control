@@ -63,24 +63,25 @@ jobs:
       - name: Run tests on node ${{ matrix.node }}
         run: |
           set -e
-          for pkg in packages/plugin packages/presentation; do
-            cd "$pkg"
-            n="$(find dist/tests -name '*.test.js' | wc -l)"
-            echo "$pkg 测试文件数：$n"
-            [ "$n" -gt 0 ] || { echo "$pkg 的 dist/tests 下没找到 *.test.js"; exit 1; }
-            find dist/tests -name '*.test.js' -print0 | xargs -0 node --test
-            cd ../..
-          done
+          # 2026-10-03 起本仓只有一个包：右栏那一半折进了 packages/plugin
+          # （原来这里是 packages/plugin + packages/presentation 两个）。
+          cd packages/plugin
+          n="$(find dist/tests -name '*.test.js' | wc -l)"
+          echo "packages/plugin 测试文件数：$n"
+          [ "$n" -gt 0 ] || { echo "packages/plugin 的 dist/tests 下没找到 *.test.js"; exit 1; }
+          find dist/tests -name '*.test.js' -print0 | xargs -0 node --test
 
       - name: Verify the bundles are self-contained single files
         run: |
           set -e
+          # 一次打包产出**两半**：宿主侧 index.js 与浏览器面 client.cjs。
+          # client.cjs 缺件不会在 build 步骤红（esbuild 成功了），所以这里必须点名它——
+          # 漏装浏览器面的表现是"右栏永远不弹"，而宿主日志里一句错都没有。
           for f in packages/plugin/dist/bundle/index.js \
-                   packages/presentation/dist/bundle/index.js \
-                   packages/presentation/dist/bundle/client.cjs; do
+                   packages/plugin/dist/bundle/client.cjs; do
             test -s "$f" || { echo "缺少产物：$f"; exit 1; }
             printf '  %-56s %s KB\n' "$f" "$(( $(wc -c < "$f") / 1024 ))"
           done
           # 浏览器面必须是宿主能识别的模块外壳，否则整页 web boot 失败。
-          head -c 32 packages/presentation/dist/bundle/client.cjs | grep -q 'window.__ModuleLoader__.load' \
+          head -c 32 packages/plugin/dist/bundle/client.cjs | grep -q 'window.__ModuleLoader__.load' \
             || { echo "client.cjs 外壳不对"; exit 1; }

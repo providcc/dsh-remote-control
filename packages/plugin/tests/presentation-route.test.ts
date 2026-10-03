@@ -16,7 +16,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { pairingHandler, PAIRING_ROUTE, registerPairingRoute, type PairingRouteOptions } from '../src/route.js'
+import {
+  pairingHandler,
+  PAIRING_ROUTE,
+  registerPairingRoute,
+  type PairingRouteOptions,
+} from '../src/presentation/route.js'
 
 interface Answer {
   status: number
@@ -90,7 +95,7 @@ const ready: PairingRouteOptions = {
 const none: PairingRouteOptions = { snapshot: () => ({ state: 'none' }), target: targetSpy().target }
 
 test('路由路径与包名对齐（客户端硬编码的是同一个字符串）', () => {
-  assert.equal(PAIRING_ROUTE, '/plugins/dsh-remote-control-presentation/pairing')
+  assert.equal(PAIRING_ROUTE, '/plugins/dsh-remote-control/pairing')
 })
 
 test('Host 必须是环回：外部域名（DNS 重绑定）一律 403', async () => {

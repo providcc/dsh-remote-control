@@ -2,7 +2,7 @@
   "name": "dsh-remote-control-workspace",
   "private": true,
   "version": "1.0.0",
-  "description": "Workspace for the DSH Remote Control host-side plugin: the pairing/relay plugin plus the presentation half that renders the pairing QR in the right sidebar.",
+  "description": "Workspace for the DSH Remote Control host-side plugin: pairing/relay/session/command half plus the right-sidebar QR half (same-origin read-only route + browser client).",
   "type": "module",
   "license": "MIT",
   "author": "providcc",

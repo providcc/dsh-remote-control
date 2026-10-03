@@ -19,3 +19,9 @@
           enabled: true
           idleReleaseSec: 300
           keepDisplay: false
+        # 右栏自动弹码（原独立条目 dsh-remote-control-presentation，2026-10-03 折进来）。
+        # imageFile 故意不写在这里：默认值取 homedir（见 src/shell/config.ts），
+        # 写进 YAML 就把某个人的家目录焊进分发包了。
+        sidebarQr:
+          enabled: true
+          refreshMs: 2000
