@@ -141,6 +141,26 @@ export class ConversationBook {
     return [...this.byId.keys()]
   }
 
+  /**
+   * 当前**真正连着**的客户端数（去重后的 clientId，不是会话数）。
+   *
+   * 为什么必须单独算：一条会话（convId）对应一次配对，而**同一部手机**在
+   * 「解除配对再重新配对」之后会开一条新会话 —— 于是 `size`（会话数）会增长，
+   * 手机却还是那一台。把 `size` 当成"有几部手机"报出去，用户解除配对后看到
+   * 数字反而变大，会以为解配没生效。
+   *
+   * 反过来也算不准：会话被剪掉了但手机还在（`pruneStale`），
+   * 所以这个数只保证"不比会话数更离谱"，不保证等于真实在线数 ——
+   * 界面上它只该当"有手机连着没有"的粗判据，不该当精确计数。
+   */
+  clientCount(): number {
+    const ids = new Set<string>()
+    for (const conversation of this.byId.values()) {
+      for (const clientId of conversation.clientIds) ids.add(clientId)
+    }
+    return ids.size
+  }
+
   get size(): number {
     return this.byId.size
   }

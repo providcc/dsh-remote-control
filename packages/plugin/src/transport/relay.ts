@@ -101,6 +101,17 @@ export class RelayClient {
     return this.conversations.size
   }
 
+  /**
+   * 当前连着的**手机台数**（去重的 clientId）。
+   *
+   * 与 `conversationCount` 分开是因为「解除配对 → 重新配对」会开一条新会话，
+   * 手机却还是那一台：拿会话数当手机数报，用户解完配对看到数字变大，
+   * 会以为解配没生效。
+   */
+  get clientCount(): number {
+    return this.conversations.clientCount()
+  }
+
   connect(): void {
     if (this.stopped) return
     this.closeSocket()
@@ -289,6 +300,10 @@ export class RelayClient {
         // 手机回前台时用同一个 convId 回来，成员表还在，路由就能重建。
         // 反过来，发给客户端的 peer-left 只有一个合法触发（主机离开），
         // 那由中继侧保证，本端不猜。
+        // 成员表要在这里摘掉这个 clientId：会话留着 ≠ 这台手机还连着。
+        // 不摘的话，一部解了配的手机在 status.json 里仍然算"已连接"，
+        // 而它再也不会回来 —— 那个状态没有任何东西会清掉。
+        if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.delete(frame.clientId)
         this.options.onClientLeft(frame.sessionId, frame.clientId)
         this.emitState('online')
         return
@@ -323,13 +338,18 @@ export class RelayClient {
     }
   }
 
-  private onEncrypted(frame: { sessionId: string; ciphertext?: string; items?: Array<{ ciphertext: string }> }): void {
+  private onEncrypted(frame: { sessionId: string; clientId?: string; ciphertext?: string; items?: Array<{ ciphertext: string }> }): void {
     const conversation = this.conversations.get(frame.sessionId)
     if (!conversation) {
       // 本端已经没有这把钥匙：留着通道只会让手机对着一个听不见的对端说话。
       this.voidConversation(frame.sessionId)
       return
     }
+    // 登记这台手机。**必须在这里记，不能只在 open() 时记**：open() 那一刻
+    // 成员表是空的（配对刚发生），此后进来的每一帧才带得上 clientId。
+    // 漏了这一步的话 `clientCount()` 恒为 0，status.json 里"有几台手机"
+    // 永远是 0 —— 那不是"没人连"，是没人记。
+    if (frame.clientId) conversation.clientIds.add(frame.clientId)
     const records = frame.items ?? (frame.ciphertext === undefined ? [] : [{ ciphertext: frame.ciphertext }])
     let decryptedAny = false
     for (const record of records) {
@@ -402,7 +422,10 @@ export class RelayClient {
     this.options.onState({
       relay,
       ...(problem === undefined ? {} : { problem }),
-      clients: this.conversations.size,
+      // 之前这里写的是 `conversations.size`，把"会话数"顶替成了"客户端数"：
+      // 一部手机解配再重配就多一条会话，于是这个字段会**变大** ——
+      // 拿它回答"现在有几台手机连着"会得出相反的结论。
+      clients: this.conversations.clientCount(),
       conversations: this.conversations.size,
       generation: this.generation,
     })

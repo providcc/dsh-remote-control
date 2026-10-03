@@ -121,6 +121,37 @@ test('同一条 convId 重复 open 是覆盖而不是并出两条：簿记键只
   assert.equal(book.get('c_dup')?.createdAt, 2, 'createdAt 要跟着更新：status.json 的码年龄判据（<25s）读它')
 })
 
+test('clientCount 数的是**手机台数**，不是会话数：解配重配会让会话变多而手机没变多', () => {
+  const book = new ConversationBook()
+  // 夹具自检：open() 那一刻成员表是空的，配对刚发生、还没有任何一帧过来。
+  const first = book.open({ id: 'c_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 1 })
+  assert.equal(book.clientCount(), 0, 'open() 里不预填成员：此刻确实还没有手机发过帧')
+
+  first.clientIds.add('phone-1')
+  assert.equal(book.clientCount(), 1, '一台手机进来了')
+
+  // 「解除配对 → 重新配对」会开一条**新会话**，手机还是那一台。
+  // 拿会话数当手机数报的话，用户解完配对看到数字反而变大 ——
+  // 那个现象与"我的解配没生效"完全一致。
+  const second = book.open({ id: 'c_2', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 2 })
+  second.clientIds.add('phone-1')
+  assert.equal(book.size, 2, '夹具自检：两条会话')
+  assert.equal(book.clientCount(), 1, '同一台手机不能被算成两台')
+
+  second.clientIds.add('phone-2')
+  assert.equal(book.clientCount(), 2, '第二台手机进来')
+
+  // 手机解配：会话留着（D3），但这台不再算连着 ——
+  // 不摘的话没有任何东西会清掉它，那个状态会一直挂在电脑上。
+  first.clientIds.delete('phone-1')
+  assert.equal(book.size, 2, '解配不许删会话：手机回前台还要用同一个 convId')
+  assert.equal(book.clientCount(), 2, 'phone-1 走了但它还在 c_2 里（重配那条），所以仍是两台')
+
+  second.clientIds.delete('phone-2')
+  second.clientIds.delete('phone-1')
+  assert.equal(book.clientCount(), 0, '全走了就该是 0：status.json 说有人连着而实际没人，是最难查的一种错')
+})
+
 test('PairingSlots 超上限时淘汰最旧那张而不是拒绝新建：发不出去比少一张更糟', () => {
   const clock = ticking()
   const slots = new PairingSlots(clock.now, 3)

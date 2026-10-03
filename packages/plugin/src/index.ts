@@ -287,6 +287,12 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     status.start(() => {
       pairingWindow.tick()
       relay?.pruneConversations()
+      // 配对码簿也要剪枝，理由与上面那句完全一样：一张码是一次性的，
+      // 用掉/过期之后那行 slot 只是留在 Map 里，害得 `status.json` 的
+      // `pendingPairs` 只增不减（实测能涨到 5 以上），而那个数字是排障时
+      // 判断「中继那边攒了多少待配对条目」的唯一依据 —— 涨着就说明不了任何事。
+      // `prune()` 早就写好了，只是**一直没有调用方**（`grep -rn 'prune()'` 只命中定义）。
+      slots.prune()
       return state()
     })
   }
@@ -320,6 +326,15 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       relay: relay ? relayState() : 'idle',
       relayProblem: relayProblem(),
       conversations: relay?.conversationCount ?? 0,
+      /**
+       * 当前连着的手机台数（去重的 clientId）。
+       *
+       * 为什么必须与 `conversations` 分开报：「解除配对 → 重新配对」会开一条**新会话**，
+       * 而手机还是那一台。所以拿会话数回答"几台手机连着"，用户解完配对看到数字反而变大 ——
+       * 那个现象与"我的解配没生效"完全一致，最容易让人把解配按钮当坏的。
+       * `pendingPairs` 是另一个东西：那是**还挂着、还没被用掉的配对码**。
+       */
+      pairedClients: relay?.clientCount ?? 0,
       pendingPairs: slots.size,
       pairing: describeActivePairing(),
       keepAwake: snapshot,
