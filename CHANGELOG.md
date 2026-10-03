@@ -46,27 +46,45 @@
 
 ### 修复
 
-- **审批卡终于能弹到手机上了**（真机 2026-10-03 深夜：策略是 `ask`、桌面在等人点、手机上什么都没有）。
-  根因不在我们读请求的那几行，在**登记的方式**：宿主用
-  `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)` 派发，
-  cordis 的判据是 `hook.global || !filter || filter.call(thisArg, hook.ctx)`，而那条 filter
-  只放行"未打作用域标签的上下文"与"派发键的**祖先**作用域"——插件那条 fiber 与 agent 作用域是
-  **兄弟**。于是 `on('approval/request', …)` 登记成功、`approvalFace` 报 `registered`、
-  监听器却一次都不会被调用。改成带 cordis 唯一的逃生口 **`{ global: true }`** 注册。
+- **审批卡终于能弹到手机上了**（真机 2026-10-03 深夜～10-04 凌晨，两轮才修对）。
+  根因不在我们读请求的那几行，在**登记的方式**——`ctx.on('approval/request', …)` 少了两个选项，
+  各对应一种"没弹"：
+  1. **`global: true`——不被作用域过滤掉**。宿主用
+     `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)` 派发，
+     cordis 的判据是 `hook.global || !filter || filter.call(thisArg, hook.ctx)`，而那条 filter
+     只放行"未打作用域标签的上下文"与"派发键的**祖先**作用域"（原文：
+     'A tag BELOW the dispatch key stays excluded — events flow up the chain, never down'）。
+     插件那条 fiber 与 agent 作用域是**兄弟**，于是登记成功、`approvalFace` 报 `registered`、
+     监听器一次都不会被调用。
+  2. **`prepend: true`——排在桌面那位应答者前面**。只加 `global` 之后真机复测仍然
+     `approvalCalls=0`，而新的审计字段显示 `approvalAsked=1`、`approvalDecided=not-seen`：
+     请求**确实派发了**，但 waterfall 是"外层不 `next()` 内层永远轮不到"，而
+     `dispatch()` 返回数组的第一个就是外层（`register()` 用 `unshift` 实现 prepend）——
+     桌面 UI 的应答者登记得更早，它一拿到请求就去等真人点按钮且不 `next()`。
+  最终形状（真机一次完整闭环的读数）：`approvalCalls=1`、`approvalLast=answered-by-phone(allowed-once)`、
+  `approvalDecided=allowed-once`、`outbound.permission_request=1`，手机侧探针收到的卡是
+  `{action:'write', reason:'escalate sandbox to workspace-write: …', options:[允许一次, 拒绝], expiresAt:…}`。
   抢答安全性不变：拿不到会话或手机没答上时仍然 `next()` 交还桌面，不替用户决定。
-- **`approvalFace` 不再被当成"能弹卡"的证据**：新增 `kernel.approvalCalls`（监听器被调用次数）
-  与 `kernel.approvalLast`（最后一次走到哪一步：`answered-by-phone(…)` /
-  `handed-back(no phone target)` / `handed-back(phone declined or timed out)`）。
-  这次定位靠的就是"`outbound` 里连 `permission_request_no_peer` 都没有"这种间接证据——
-  有了这两个字段，`approvalCalls=0` 一句话就能把"派发没到我们"与"我们抢答了又丢掉"分开。
+  ⚠️ **代价写在代码注释里**：排到最外层意味着也排在 Auto 预置的自动审阅之前。本机没配 Auto
+  （profile 里只有 read-only / workspace-write / danger-full-access），所以没有安全闸门被跳过；
+  哪天接上 Auto，这一行要重新审。
+- **`approvalFace` 不再被当成"能弹卡"的证据**：`status.json` 的 kernel 面新增四条读数——
+  `approvalCalls`（监听器被调用次数）、`approvalLast`（最后一次走到哪一步：
+  `answered-by-phone(…)` / `handed-back(no phone target)` / `handed-back(phone declined or timed out)`）、
+  `approvalAsked`（内核报过几次 `approval/asked`）与 `approvalDecided`（最后一次 `approval/decided`
+  的 outcome）。**"没人答"与"别人抢先答了"在现场长得一模一样**，只有 `decided` 能把它们分开——
+  这一轮就是靠它从"还是被过滤了"翻到"是排在桌面后面"，少一个字段就要多猜一轮。
 - `src/transport/relay.ts` 的 Prettier 格式（随 `4e2528c` 提交进来的长签名），`format:check` 全绿。
 
 ### 测试
 
-272 项（上一版 269）。`carrier-services.test.ts` 新增三条：**登记必须带 `{ global: true }`**
-（把 `global` 摘掉就红——它测的不是"挂没挂上"，而是"挂的地方收不收得到"）、
+273 项（上一版 269）。`carrier-services.test.ts` 新增四条：**登记必须带
+`{ global: true, prepend: true }`**（两个选项各摘一个都会红——它们测的不是"挂没挂上"，
+而是"挂的地方收不收得到、收得到的时候排不排得到"）、
 **被调用时 `approvalCalls`/`approvalLast` 要记到 `answered-by-phone(…)`**、
-**没有会话 id 与手机超时两条交还路径要分得开，且都必须 `next()` 交还桌面**。`client-bundle.test.ts` 新增四条：**"配上之后从二维码翻回状态视图"**
+**没有会话 id 与手机超时两条交还路径要分得开，且都必须 `next()` 交还桌面**、
+**审批审计的 `approvalAsked`/`approvalDecided` 要进 status.json**（`decided` 记最后一次的 outcome）。
+`client-bundle.test.ts` 新增四条：**"配上之后从二维码翻回状态视图"**
 （翻面只重画，不许顺手再要一张）、**"样式表按内容对齐"**（预置一份旧 `<style>`，要求它被换掉、
 且不许插第二份）、**"正文三行各自拿不到值时不占地方"**（老版路由没给 `version` 时那一行消失）
 与**"`状态` 按 relay 取值翻译"**（连接中 / 已断开 / 未启动）。另外三条按新行为改判：
