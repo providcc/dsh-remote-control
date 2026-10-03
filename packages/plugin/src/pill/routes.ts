@@ -3,7 +3,7 @@
  *
  *   `POST /plugins/dsh-remote-control/pairing/new`  点一下要一张能用的码（幂等）
  *   `GET  /plugins/dsh-remote-control/pairing.png`  弹窗里那张二维码图
- *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句状态 + 点开那行中继地址
+ *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句状态 + 点开那三行（中继 / 状态 / 版本）
  *   `POST /plugins/dsh-remote-control/unpair`       退出配对（作废当前那条通道）
  *
  * 四条都是**按需**的：宿主侧不再有"按节拍渲染并落盘"那一半（右栏自动弹码方案 2026-10-03 删除），
@@ -52,13 +52,16 @@ export interface LivePairing {
 }
 
 /**
- * pill 上那句"连接状态"与点开看到的那一行中继地址：三个非凭据字段，别的一律不出。
+ * pill 上那句"连接状态"与点开看到的那三行（中继 / 状态 / 版本）：四个非凭据字段，别的一律不出。
  *
  * `serverUrl` 是**已经印在手机上看到的东西**（配对 URI 里就带着它，`status.json` 也有），
- * 不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，也没有那条 URI 的任何片段。
+ * `version` 是本机装的这一版号，都不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，
+ * 也没有那条 URI 的任何片段。
  *
  * 本机名（`hostLabel`）2026-10-03 从面板上撤了：它是配置里那个名字，配对时手机上已经看到，
  * 留在弹窗里只是占一行。抬头那句"已配对/未配对"由 `paired` 一个字段决定就够了。
+ * 同一轮里 `version` 是**后补的**：面板收成"只有中继一行"之后用户嫌单薄，要凑够三行，
+ * 而"跑的是哪一版"在这项目尤其值钱（profile 里可能就是没发布的字节）。
  */
 export interface PillStatus {
   /** 与 `status.json` 的 `relay` 同一取值集合：`idle` 是"runtime 还没起来"，不是"断了"。 */
@@ -67,6 +70,8 @@ export interface PillStatus {
   paired: number
   /** 中继地址（原样），弹窗里那一行要说清连的是哪台。 */
   serverUrl: string
+  /** 本机装的这一版号（打包时注入，源码直跑时是 `dev`）。 */
+  version: string
 }
 
 export interface PillRouteDeps {
@@ -77,7 +82,7 @@ export interface PillRouteDeps {
   ensureFresh(): LivePairing | null
   /** 只读地看当前有没有仍然有效的码（图片路由用，绝不顺手发码）。 */
   current(): LivePairing | null
-  /** 连接状态（pill 抬头那句 + 弹窗那一行）。 */
+  /** 连接状态（pill 抬头那句 + 弹窗那三行）。 */
   status(): PillStatus
   /** 退出配对：作废当前所有配对通道，返回作废的条数。幂等，没有可配对的通道时返回 0。 */
   unpair(): number
@@ -258,6 +263,7 @@ export function pillStatusHandler(deps: PillRouteDeps) {
         relay: status.relay,
         paired: status.paired,
         serverUrl: status.serverUrl,
+        version: status.version,
       })
     } catch (error) {
       json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })

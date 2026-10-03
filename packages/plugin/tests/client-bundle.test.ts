@@ -178,12 +178,17 @@ class FakeElement {
 
   /** 按 class 找回面板里那一句（比遍历树好读），只在本节点的后代里找。 */
   find(className: string): FakeElement | undefined {
+    return this.findAll(className)[0]
+  }
+
+  /** 正文那三行都是 `drc-info`：要按键取，不能只取第一行。 */
+  findAll(className: string): FakeElement[] {
+    const found: FakeElement[] = []
     for (const child of this.children) {
-      if (child.className === className) return child
-      const nested = child.find(className)
-      if (nested) return nested
+      if (child.className === className) found.push(child)
+      found.push(...child.findAll(className))
     }
-    return undefined
+    return found
   }
 
   allText(): string {
@@ -263,6 +268,7 @@ const DEFAULT_STATUS = {
   relay: 'online',
   paired: 0,
   serverUrl: 'wss://relay.example.com:443/relay',
+  version: '0.0.0-test',
 }
 
 function load(options: LoadOptions = {}): Harness {
@@ -580,7 +586,7 @@ test('页面不可见时不轮状态（Electron 里窗口在后台是常态）',
   )
 })
 
-test('点开只给状态 + 右上角那颗按钮，不许顺手发码；面板上不再有本机/状态/已配对那三行', async () => {
+test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文就是中继/状态/版本三行', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
@@ -595,20 +601,60 @@ test('点开只给状态 + 右上角那颗按钮，不许顺手发码；面板�
   )
   // 抬头那句状态与那颗 pill 同一个来源：面板开着时也读它。
   assert.equal(root.find('drc-head-label')!.textContent, '未配对')
-  const row = root.find('drc-info')!
-  assert.ok(row, `面板正文要留那一行中继地址：${root.allText()}`)
-  assert.equal(row.find('drc-key')!.textContent, '中继')
-  assert.match(
-    row.find('drc-value')!.textContent,
-    /relay\.example\.com:443/,
-    '地址只留 host:port——scheme 和 path 会挤掉别的行',
+  const rows = root.findAll('drc-info')
+  assert.deepEqual(
+    rows.map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent]),
+    [
+      ['中继', 'relay.example.com:443'],
+      ['状态', '已连接'],
+      ['版本', '0.0.0-test'],
+    ],
+    `正文就那三行、按这个次序：${root.allText()}`,
   )
   assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
+  // 这一轮真正删掉的说法：本机名、台数、再配一台、换一张。`状态` 与 `版本` 是**这一轮补回来的**，
+  // 所以它们不在禁列里（上一版那条禁令在这两处会假红）。
   const flat = root.allText()
-  for (const gone of ['本机', '状态', '已配对', '再配一台', '换一张']) {
+  for (const gone of ['本机', '已配对', '再配一台', '换一张']) {
     assert.ok(!flat.includes(gone), `这一轮删掉的说法不该再出现：「${gone}」在 ${flat}`)
   }
   assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+})
+
+test('正文那三行各自拿不到值时不占地方：老版路由没给 version、中继字段不认识', async () => {
+  // 模拟"宿主是上一版、回答里没有 version"：那一行必须自己消失，而不是印一个空白键。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { relay: 'weird-state', paired: 0, serverUrl: 'wss://relay.example.com:443/relay' },
+  })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  const keys = root.findAll('drc-info').map((row) => row.find('drc-key')!.textContent)
+  assert.deepEqual(keys, ['中继'], `拿不到值的那两行不该出现，收到：${JSON.stringify(keys)}`)
+})
+
+test('中继那条链的细态按 relay 取值翻译：连接中 / 已断开 / 未启动', async () => {
+  const cases: Array<[string, string]> = [
+    ['connecting', '连接中'],
+    ['offline', '已断开'],
+    ['idle', '未启动'],
+  ]
+  for (const [relay, expected] of cases) {
+    const harness = load({
+      react: FAKE_REACT,
+      slots: true,
+      status: { relay, paired: 0, serverUrl: 'wss://relay.example.com:443/relay', version: '0.0.0-test' },
+    })
+    const root = harness.mountPill()
+    await flush()
+    root.find('drc-pill')!.emit('click')
+    await flush()
+    const stateRow = root.findAll('drc-info').find((row) => row.find('drc-key')!.textContent === '状态')
+    assert.equal(stateRow?.find('drc-value')!.textContent, expected, `relay=${relay} 时那行状态`)
+  }
 })
 
 test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpair（带同一个守卫头）', async () => {

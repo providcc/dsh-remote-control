@@ -167,7 +167,7 @@ function boot(
     serverUrl: 'ws://127.0.0.1:1',
     hostToken: FAKE_TOKEN,
     hostId: 'isolation_host',
-    // 本机名还在**状态快照**里（配置回显那一路），只是 pill 弹窗里已经撤了（现在只剩一行中继地址）。
+    // 本机名还在**状态快照**里（配置回显那一路），只是 pill 弹窗里已经撤了（现在那三行是中继/状态/版本）。
     hostLabel: 'linbin-desk',
     statusFile: path.join(statusDir, 'status.json'),
     mockBridge: true,
@@ -499,19 +499,22 @@ test('pill 那四条挂上去的就是带守卫的那四条（接线，不是又
     assert.equal((await run(PAIR_UNPAIR_ROUTE, 'GET', { host: '127.0.0.1:5173', 'x-drc-pair': '1' })).status, 405)
     assert.equal((await run(PAIR_UNPAIR_ROUTE, 'POST', { host: '127.0.0.1:5173' })).status, 403)
 
-    // 抬头那句状态 + 点开那一行中继地址：只读（Origin 缺席放过），字段集合就那三个。
+    // 抬头那句状态 + 点开那三行（中继 / 状态 / 版本）：只读（Origin 缺席放过），字段集合就那四个。
     // `relay` 允许 offline / connecting 两种——保活重连在跑，这里钉死一种就是计时器测试。
     const status = await run(PAIR_STATUS_ROUTE, 'GET', { host: '127.0.0.1:5173' })
     assert.equal(status.status, 200, status.body)
     const shown = JSON.parse(status.body) as Record<string, unknown>
     assert.deepEqual(
       Object.keys(shown).sort(),
-      ['paired', 'relay', 'serverUrl'],
-      '状态路由多出字段就是要重新审一遍（这三个全是非凭据；本机名 2026-10-03 撤了）',
+      ['paired', 'relay', 'serverUrl', 'version'],
+      '状态路由多出字段就是要重新审一遍（这四个全是非凭据；本机名 2026-10-03 撤了）',
     )
     assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
     assert.equal(shown.paired, 0)
     assert.equal(shown.serverUrl, 'ws://127.0.0.1:1', '中继地址就是插件连的那个，浏览器面不许自己猜')
+    // 版本号只有 bundle 那一步的 define 能给出；这里跑的是源码，必须落回 dev——
+    // 那条 assert 钉的就是 version.ts 的兜底，别哪天把它变成 undefined 送上屏幕。
+    assert.equal(shown.version, 'dev', `源码直跑的版本必须是 dev：${String(shown.version)}`)
 
     // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。
     assert.ok(!ok.body.includes('psk'), `回答里出现了 psk：${ok.body}`)

@@ -29,6 +29,7 @@ import { StatusFile } from './shell/status.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { startPill, type PillHandle } from './pill/start.js'
 import { type LivePairing, type PillStatus } from './pill/routes.js'
+import { PLUGIN_VERSION } from './version.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -414,15 +415,16 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
 
   /**
-   * pill 抬头那句"连接状态"与点开那一行中继地址：取值口径与 `status.json` 完全一致
-   * （同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
-   * 这里出去的三个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
+   * pill 抬头那句"连接状态"与点开那三行（中继 / 状态 / 版本）：取值口径与 `status.json`
+   * 完全一致（同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
+   * 这里出去的四个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
    */
   function pillStatus(): PillStatus {
     return {
       relay: relay ? relayState() : 'idle',
       paired: relay?.conversationCount ?? 0,
       serverUrl: config.serverUrl,
+      version: PLUGIN_VERSION,
     }
   }
 

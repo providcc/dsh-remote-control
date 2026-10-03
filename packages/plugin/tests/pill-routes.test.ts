@@ -32,6 +32,8 @@ import {
 const FAKE_PSK = 'A'.repeat(64)
 const FAKE_TOKEN = '482913'
 const FAKE_QR = `dshr:/p?v=1&s=ws://relay&n=host&psk=${FAKE_PSK}&t=${FAKE_TOKEN}`
+/** 版本号是弹窗第三行；用明显是假的字样，免得与真包版本混淆。 */
+const FAKE_VERSION = '0.0.0-test'
 /** PNG 的八个魔数字节——图片路由现在自己渲染，判据只能落在字节上。 */
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
@@ -97,6 +99,7 @@ function deps(
       relay: 'online',
       paired: 1,
       serverUrl: 'wss://relay.example.com:443/relay',
+      version: FAKE_VERSION,
     }),
     unpair: () => {
       calls.unpair += 1
@@ -272,7 +275,7 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
 
-test('状态路由只出三个非凭据字段：relay / paired / serverUrl', async () => {
+test('状态路由只出四个非凭据字段：relay / paired / serverUrl / version', async () => {
   const d = deps()
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -282,6 +285,7 @@ test('状态路由只出三个非凭据字段：relay / paired / serverUrl', asy
     relay: 'online',
     paired: 1,
     serverUrl: 'wss://relay.example.com:443/relay',
+    version: FAKE_VERSION,
   })
   const raw = got.body
   for (const secret of [FAKE_PSK, FAKE_QR, FAKE_TOKEN, 'dshr:']) {
@@ -294,7 +298,7 @@ test('状态路由只出三个非凭据字段：relay / paired / serverUrl', asy
 
 test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的是"没启动"而不是"断了"）', async () => {
   const d = deps({
-    status: () => ({ relay: 'idle', paired: 0, serverUrl: 'wss://relay.example.com:443/relay' }),
+    status: () => ({ relay: 'idle', paired: 0, serverUrl: 'wss://relay.example.com:443/relay', version: FAKE_VERSION }),
   })
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -302,6 +306,7 @@ test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的�
     relay: 'idle',
     paired: 0,
     serverUrl: 'wss://relay.example.com:443/relay',
+    version: FAKE_VERSION,
   })
 })
 

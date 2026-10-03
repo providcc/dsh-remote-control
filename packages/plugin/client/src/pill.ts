@@ -5,11 +5,13 @@
  * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时弹面板。
  *
  * **面板的形状**（2026-10-03 重设计，以"精炼"为准）：抬头一行是状态 + 右上角那**一颗**动作按钮，
- * 下面只在拿得到时补一行中继地址。那颗按钮跟着当前视图走：出图时是 `刷新`
- * （同一条幂等发码路由 `POST /pairing/new`，`GET /pairing.png` 画进面板），其余情形
- * **未配对**时是 `生成配对码`、**已配对**时是 `退出配对`（`POST /unpair`）。原来那三行
- * "本机 / 状态 / 已配对"、`再配一台`、`换一张` 与"倒计时走完自动补一张"都在这一轮删掉了：
- * 抬头那句已经是状态，台数只可能是 0 或 1，而一张码过期后该重发还是让用户自己按。
+ * 下面三行**中继 / 状态 / 版本**（各自拿不到值时那一行不占地方）。那颗按钮跟着当前视图走：
+ * 出图时是 `刷新`（同一条幂等发码路由 `POST /pairing/new`，`GET /pairing.png` 画进面板），
+ * 其余情形**未配对**时是 `生成配对码`、**已配对**时是 `退出配对`（`POST /unpair`）。
+ * 更早那版是四行"本机 / 中继 / 状态 / 已配对"，随后收成"只剩中继"、用户嫌单薄又补两条凑三行：
+ * 留下的是"连的哪一台 / 连没连上 / 跑的是哪一版"，本机名与台数不上屏——抬头那句已经是状态，
+ * 台数只可能是 0 或 1。`再配一台`、`换一张` 与"倒计时走完自动补一张"也在这一轮删掉了：
+ * 一张码过期后该重发还是让用户自己按。
  *
  * 颜色就是状态：灰（未启动 / 未配对）、黄（连接中）、绿（已配对）、**红（已断开连接）**。
  *
@@ -69,6 +71,7 @@ interface StatusAnswer {
   relay?: unknown
   paired?: unknown
   serverUrl?: unknown
+  version?: unknown
 }
 
 interface NewAnswer {
@@ -158,14 +161,32 @@ export function relayAddress(url: unknown): string {
 }
 
 /**
- * 面板正文那一行：只剩中继地址——排错时唯一要认的就是"连的哪一台"。
+ * 面板正文那三行（中继 / 状态 / 版本）。每条都**拿不到就返回空串**，调用方据此不占那一行——
+ * 第一次轮询还没回来时面板不该出现三个空壳。
  *
- * 2026-10-03 重设计前这里是四行（本机 / 中继 / 状态 / 已配对）。那三行删掉的理由各自成立：
- * 本机名配对时手机上已经看到、台数只可能是 0 或 1、而"连没连上"抬头那句已经说了。
- * 地址拿不到（第一次轮询还没回来）时返回空串，调用方据此不占那一行。
+ * 2026-10-03 的历史：重设计前这里是四行（本机 / 中继 / 状态 / 已配对），随后收成"只剩中继"、
+ * 用户又说太单薄、补回两条凑三行。留下的这三条各有理由，且**都不与抬头那句重复**：
+ * 中继＝连的哪一台（排错第一眼）、状态＝中继这条链的细态（抬头在线时只说配没配上）、
+ * 版本＝跑的是哪一版（profile 里可能就是没发布的字节）。本机名与台数仍不上屏。
  */
 export function relayRow(status: StatusAnswer | undefined): string {
   return relayAddress(status?.serverUrl)
+}
+
+/** 中继那条链的细态：抬头在线时只讲"配没配上"，这条才讲"连没连上"。 */
+export function relayStateRow(status: StatusAnswer | undefined): string {
+  const relay = status?.relay
+  if (relay === 'online') return '已连接'
+  if (relay === 'connecting') return '连接中'
+  if (relay === 'offline') return '已断开'
+  if (relay === 'idle') return '未启动'
+  return ''
+}
+
+/** 本机装的这一版号；宿主没给（老版路由）时这一行不占地方。 */
+export function versionRow(status: StatusAnswer | undefined): string {
+  const version = status?.version
+  return typeof version === 'string' && version.trim() !== '' ? version.trim().slice(0, 24) : ''
 }
 
 /** 秒数说成人话：62 秒说"1 分 2 秒"——用户扫一张码不该数秒。 */
@@ -206,11 +227,12 @@ const CSS = `
   border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer;
   white-space: nowrap; }
 .drc-btn:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04)); }
-/* 正文那一行中继地址：键左值右（space-between），值被截断时省略号——和那颗 pill 同一套
-   "挤不下就截文字不撑容器"。 */
+/* 正文那三行（中继 / 状态 / 版本）：键左值右（space-between），值被截断时省略号——
+   和那颗 pill 同一套"挤不下就截文字不撑容器"。第一行带那条分隔线，后两行只留行距。 */
 .drc-info { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
   white-space: nowrap; margin-top: 8px; padding-top: 6px;
   border-top: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.08)); }
+.drc-info + .drc-info { margin-top: 2px; padding-top: 0; border-top: 0; }
 .drc-key { flex: 0 0 auto; color: var(--dsw-alias-label-tertiary); }
 .drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .drc-qr { display: block; width: 200px; height: 200px; margin: 8px auto 0; image-rendering: pixelated; }
@@ -407,16 +429,23 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     return head
   }
 
-  /** 正文那一行中继地址；没探到状态（第一次轮询还没回来）或地址为空时不占地方。 */
-  const relayBlock = (): HTMLElement | undefined => {
-    if (!lastStatus) return undefined
-    const address = relayRow(lastStatus)
-    if (address === '') return undefined
-    const row = doc.createElement('div')
-    row.className = 'drc-info'
-    row.appendChild(text('span', 'drc-key', '中继'))
-    row.appendChild(text('span', 'drc-value', address))
-    return row
+  /** 正文那三行（中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
+  const infoRows = (): HTMLElement[] => {
+    if (!lastStatus) return []
+    const rows: Array<[string, string]> = [
+      ['中继', relayRow(lastStatus)],
+      ['状态', relayStateRow(lastStatus)],
+      ['版本', versionRow(lastStatus)],
+    ]
+    return rows
+      .filter(([, value]) => value !== '')
+      .map(([key, value]) => {
+        const row = doc.createElement('div')
+        row.className = 'drc-info'
+        row.appendChild(text('span', 'drc-key', key))
+        row.appendChild(text('span', 'drc-value', value))
+        return row
+      })
   }
 
   const paint = (): void => {
@@ -449,8 +478,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
             })()
       panel.appendChild(note)
     }
-    const relay = relayBlock()
-    if (relay) panel.appendChild(relay)
+    for (const row of infoRows()) panel.appendChild(row)
   }
 
   const closePanel = (): void => {

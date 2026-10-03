@@ -42,6 +42,8 @@ const OUT_FILE = path.join(OUT_DIR, 'index.js')
 const CLIENT_OUT = path.join(OUT_DIR, 'client.cjs')
 /** 装进 profile 后这个 bundle 的 id，也是 loader 认的那个名字。 */
 const BUNDLE_ID = 'dsh-remote-control'
+/** pill 弹窗里那行「版本」读的就是它（`src/version.ts` 里的 `__DRC_VERSION__`）。 */
+const PLUGIN_VERSION = JSON.parse(readFileSync(path.join(PLUGIN, 'package.json'), 'utf8')).version
 
 // esbuild 是插件包自己的 devDependency，所以从包目录解析——
 // 不指望根 node_modules 把它提升上来（pnpm 也不该提升未声明的依赖）。
@@ -63,6 +65,9 @@ const result = await esbuild.build({
   minify: false,
   // 宿主注入的东西绝不能打进包。
   external: ['cordis', '@deepseek-ai/*', 'bufferutil', 'utf-8-validate'],
+  // 版本号只有打包这一刻才知道：`src/version.ts` 探不到这个 define 时退回 `'dev'`，
+  // 于是"装进 profile 的 bundle"与"仓里直跑的源码"在 pill 上不是同一种字样。
+  define: { __DRC_VERSION__: JSON.stringify(PLUGIN_VERSION) },
   // 产物是 ESM，而内联进来的 tweetnacl / ws 是 CJS：esbuild 会把它们的
   // `require('crypto')` 之类换成"运行期抛错"的兜底函数（Dynamic require is not supported）。
   // 补一句真 require。这条不是可选优化——烟测里插件加载即崩过一次。
