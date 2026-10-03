@@ -448,6 +448,10 @@ export class HostRuntime {
    * **没有在线对端就返回 `'decline'`**，让适配器去调平台的 `next()` 把决定权交还桌面 UI；
    * 超时同样返回 `'decline'`（我们已经把卡片发出去了，但手机迟迟没点，
    * 与其替用户决定，不如让桌面去决定）。
+   *
+   * 返回值只说明"手机这一侧算出了什么"，**不代表这张卡是手机答掉的**：
+   * 桌面与手机是同时被问的（见 `carrier-services.ts` 的 `participate`），
+   * 所以收尾时要按"有没有真的有人在手机上点过"决定要不要把卡收回去。
    */
   private async onApprovalRequest(info: {
     sessionId: string
@@ -488,6 +492,14 @@ export class HostRuntime {
     this.sleep.releaseHold(id)
     // 结算点（settleApproval）已经把手机的 'approve'/'reject' 翻成平台词汇了，
     // 这里不再翻第二次——两处映射表迟早会分叉。
+    //
+    // 手机没被点过（我们超时、桌面先答、平台撤回）时，这张挂在手机上的卡**在本侧已经作废**：
+    // `pending` 条目删掉了、`waiting` 角标归零、防休眠的 hold 也放了。
+    // 但手机上那张卡要等到它自己的倒计时走完才会消失——把它立刻收掉需要
+    // `ev.permission_resolved`（协议里已经有了：wire `66e9a63`），而本仓的 `dsh-remote-wire`
+    // 是从 npm 装的 1.1.0，那份里还没有这一帧。**等带它的 wire 版本发布后接上**，
+    // 追踪条目在伞仓 HANDOFF §3.10。这里不留本地伪造的帧：类型上骗过一次，
+    // 下一次改协议的人就再也对不上账了。
     return answered
   }
 

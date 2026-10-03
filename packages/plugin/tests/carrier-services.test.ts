@@ -342,7 +342,7 @@ test('拿不到会话或手机没答上时要交还桌面，并把"交还了"记
     'handed-back(no phone target)',
     '交还原因没进 status.json：下次又要从"为什么没弹"猜起',
   )
-  // ② 手机超时（sink 回 decline）→ 同样交还，而不是替用户拒绝。
+  // ② 手机超时（sink 回 decline）而链子末端也没人答 → 交还 'unavailable'，而不是替用户拒绝。
   const declined = await listeners['approval/request']!(
     { agent: { session: { id: 'ses_live' } }, toolName: 'write_file' },
     async () => 'unavailable',
@@ -351,10 +351,107 @@ test('拿不到会话或手机没答上时要交还桌面，并把"交还了"记
   assert.equal(sinkCalls, 1, '这一条该问到手机')
   assert.equal(
     (kernel.describe() as Record<string, unknown>).approvalLast,
-    'handed-back(phone declined or timed out)',
-    '超时交还与"没有手机"必须分得开：前者是手机没点，后者是没配过',
+    'handed-back(neither answered)',
+    '交还原因没进 status.json：下次又要从"为什么没弹"猜起',
   )
   assert.equal((kernel.describe() as Record<string, unknown>).approvalCalls, 2)
+})
+
+/**
+ * 这三条钉的是同一句红线：**插件不许改变宿主自己的行为**。
+ * 2026-10-04 那次只 `prepend` 不自顾地等手机，结果"手机上弹了、桌面上不弹了"——
+ * 用户当场要求两边都弹。所以形状必须是：一进函数就把 `next()` 叫起来，两边赛跑。
+ */
+test('手机先答也必须把链子交给桌面（next() 要跑到）——不许让 DSH 少弹一个窗', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.attachInteractionSink!({ approval: async () => 'allowed-once', question: async () => null })
+  let nextCalls = 0
+  const never = new Promise<string>(() => {})
+  const outcome = await listeners['approval/request']!(
+    { agent: { session: { id: 'ses_live' } }, toolName: 'write_file' },
+    () => {
+      nextCalls += 1
+      return never
+    },
+  )
+  assert.equal(outcome, 'allowed-once')
+  assert.equal(nextCalls, 1, '手机先答就不叫 next()：桌面那一半整个不弹了，这是改变宿主行为')
+})
+
+test('桌面先答时手机那一侧必须被撤回（signal abort），落点记 answered-by-desktop', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let phoneSignal: AbortSignal | undefined
+  let releasePhone: (value: 'decline') => void = () => {}
+  kernel.attachInteractionSink!({
+    approval: async (info: { signal?: AbortSignal }) => {
+      phoneSignal = info.signal
+      // 手机一直没人点：桌面先答之后，这一侧必须被 abort 叫醒，而不是挂到 180s 超时。
+      return new Promise<'decline'>((resolve) => {
+        releasePhone = resolve
+      })
+    },
+    question: async () => null,
+  })
+  let releaseDesktop: (value: string) => void = () => {}
+  const pending = listeners['approval/request']!(
+    { agent: { session: { id: 'ses_live' } }, toolName: 'write_file' },
+    () =>
+      new Promise<string>((resolve) => {
+        releaseDesktop = resolve
+      }),
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  releaseDesktop('rejected')
+  assert.equal(await pending, 'rejected', '桌面答了却不被采纳：等于我们把宿主的答案吞了')
+  assert.equal(phoneSignal?.aborted, true, '桌面先答却没撤回手机那一侧：手机那张卡会继续倒计时，waiting 角标也不会归零')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalLast,
+    'answered-by-desktop(rejected)',
+    '落点要分得清是手机答的还是桌面答的——排错时这是两件事',
+  )
+  releasePhone('decline')
+})
+
+test('手机超时不算答案：桌面稍后给出的真决定必须赢（不许"手机没电=自动拒绝"）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.attachInteractionSink!({ approval: async () => 'decline', question: async () => null })
+  let releaseDesktop: (value: string) => void = () => {}
+  const inflight = listeners['approval/request']!(
+    { agent: { session: { id: 'ses_live' } }, toolName: 'write_file' },
+    () =>
+      new Promise<string>((resolve) => {
+        releaseDesktop = resolve
+      }),
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  releaseDesktop('allowed-once')
+  assert.equal(await inflight, 'allowed-once', '手机先超时就把这一问判掉，等于替桌面做了决定')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalLast,
+    'answered-by-desktop(allowed-once)',
+    `落点读错了：${String((kernel.describe() as Record<string, unknown>).approvalLast)}`,
+  )
 })
 
 test('takeOverQuestions=true 时才注册提问提供者；没有那个服务要说得出来', () => {

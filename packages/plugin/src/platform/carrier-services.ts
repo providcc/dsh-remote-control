@@ -81,7 +81,7 @@ export interface ServicesBundle {
  * 插件那条 fiber 与 agent 作用域是兄弟不是祖先。`global` 是 cordis 留的唯一一条逃生口
  * （`EventOptions` 原文：'Receive the event regardless of context filter checks'）。
  *
- * ### `prepend: true` —— 排在桌面那一位**前面**
+ * ### `prepend: true` —— 排在桌面那一位**前面**，然后立刻把链子交下去
  *
  * waterfall 是"外层不调 `next()`，内层就永远轮不到"，而 `dispatch()` 返回的数组里
  * **第一个就是外层**（`register()` 用 `unshift` 实现 prepend）。桌面 UI 的应答者登记得比我们早，
@@ -89,10 +89,14 @@ export interface ServicesBundle {
  * `approvalAsked=1`、`approvalDecided=not-seen`（卡在桌面等人）、`approvalCalls=0`（我们没轮到），
  * 手机上什么都没有，而 `approvalFace` 一直报 `registered`。
  *
+ * ⚠️ **但排到前面不等于可以抢答。** 只 `prepend`、然后自己在那儿等手机，结果是
+ * "手机上弹了、桌面上不弹了"——那是插件在改变宿主自己的行为（2026-10-04 真机被用户当场指出）。
+ * 正确的形状写在 `participate()` 里：**一进函数就 `next()` 把桌面启动起来**，手机并行问，两边赛跑。
+ *
  * **代价，说清楚**：排到最外层意味着也排在 Auto 预置的自动审阅之前（那条是 `prepend` 登记的）。
  * 本机没配 Auto 预置（profile 里只有 read-only / workspace-write / danger-full-access），
  * 所以这里没有东西被跳过；哪天接上 Auto，这一行要重新审——正确做法大概是"先让自动审阅跑完，
- * 再由手机答人"，而不是继续抢在最外层。
+ * 再同时问桌面与手机"，而不是继续抢在最外层。
  */
 const APPROVAL_SUBSCRIBE_OPTIONS = { global: true, prepend: true } as const
 
@@ -814,6 +818,23 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   }
 
   /** `approval/request(this, req, next)`：req 是只读审批问题，next 交还给其他应答者。 */
+  /**
+   * `approval/request` 的参与者：**同时**问手机和桌面，谁先给出真实决定谁算。
+   *
+   * 为什么不能抢答（2026-10-04 真机踩过，用户当场指出来）：waterfall 是"外层不调 `next()`
+   * 内层就永远轮不到"，而我们为了排到桌面前面用了 `prepend`——结果**桌面那一半整个不弹了**。
+   * 那是插件在改变宿主自己的行为，红线。所以一进这个函数就要立刻把 `next()` 叫起来
+   * （桌面照常弹、照常等它的人），手机这一侧并行问，两边赛跑。
+   *
+   * "谁先答谁算"里的"答"要收紧：**手机超时（`'decline'`）、手机侧被我们撤回（`'cancelled'`）、
+   * 链子末端没人应答（`'unavailable'`）都不算答案**。把它们当答案的后果很具体：
+   * 手机没电了会变成"自动拒绝"，而桌面上暂时没人会变成"手机还没点就失败"。
+   *
+   * 桌面先答时我们会 `abort` 自己那条信号，`runtime` 收到之后向手机补一帧
+   * `ev.permission_resolved` 把卡收回去。**反方向收不了**：手机先答之后桌面那张卡要等
+   * 宿主自己的 `signal`（这次工具调用的生命周期）结束才消失——插件没有那个句柄，
+   * 这是"两边都弹"必须付的代价，写在注释里是为了下次别去找不存在的解。
+   */
   async function participate(args: unknown[]): Promise<string> {
     approvalCalls += 1
     const request = args.find(
@@ -822,23 +843,60 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const next = args.find((arg) => typeof arg === 'function') as (() => Promise<unknown>) | undefined
     const sessionId = String(request?.agent?.session?.id ?? '')
     if (!sink || !sessionId || !servicesPeers()) {
-      // 没有手机端在线 → 交还桌面 UI。这一步是"插件不抢答"的关键。
+      // 压根没有能收消息的手机 → 一行都不弹，完整交还桌面。这一步是"插件不抢答"的关键。
       approvalLast = 'handed-back(no phone target)'
       return String((await next?.()) ?? 'unavailable')
     }
-    const decision = await sink.approval({
-      sessionId,
-      action: String(request?.toolName ?? '工具调用'),
-      ...(request?.reason ? { reason: String(request.reason) } : {}),
-      ...(request?.signal ? { signal: request.signal } : {}),
-    })
-    if (decision === 'decline') {
-      // 手机超时/没答上 → 也交还桌面，不替用户决定。
-      approvalLast = 'handed-back(phone declined or timed out)'
-      return String((await next?.()) ?? 'unavailable')
+    const controller = new AbortController()
+    // 平台自己撤回这次请求时（回合被取消等）也必须让手机把卡收掉，所以把它的 signal 接回
+    // 我们这条 controller 上——往下只传一个信号源，`reason` 用来区分"桌面先答"与"平台撤回"。
+    if (request?.signal) {
+      if (request.signal.aborted) controller.abort('platform')
+      else request.signal.addEventListener('abort', () => controller.abort('platform'), { once: true })
     }
-    approvalLast = `answered-by-phone(${decision})`
-    return decision
+    // 桌面那一半**现在就启动**，不等手机。
+    const desktop = Promise.resolve()
+      .then(() => next?.())
+      .catch(() => 'unavailable')
+    const phone = sink
+      .approval({
+        sessionId,
+        action: String(request?.toolName ?? '工具调用'),
+        ...(request?.reason ? { reason: String(request.reason) } : {}),
+        signal: controller.signal,
+      })
+      .catch(() => 'decline' as const)
+    // 不算答案的那些取值换成"永远不落地"，于是 `Promise.race` 只会把真答案送出来；
+    // 两边都收场了却都没有真答案时，由最后那条分支兜住（否则这里会挂死）。
+    // 每一支都**带着自己是谁**回来：`'rejected'` 这个词手机和桌面都可能给出，
+    // 只比数值就没法知道该不该收回手机那张卡（第一版就是这么错的）。
+    const pending = new Promise<never>(() => {})
+    const winner = await Promise.race([
+      phone.then((decision) =>
+        decision === 'decline' || decision === 'cancelled'
+          ? pending
+          : { src: 'phone' as const, outcome: decision as string },
+      ),
+      desktop.then((outcome) =>
+        outcome === 'unavailable' ? pending : { src: 'desktop' as const, outcome: String(outcome) },
+      ),
+      Promise.all([phone, desktop]).then(([, outcome]) => ({
+        src: 'desktop' as const,
+        outcome: outcome === 'unavailable' ? 'unavailable' : String(outcome ?? 'unavailable'),
+      })),
+    ])
+    if (winner.outcome === 'unavailable') {
+      // 两边都没答上：交还链子末端的失败闭合（宿主自己解释成"没人可问"）。
+      controller.abort('desktop')
+      approvalLast = 'handed-back(neither answered)'
+      return 'unavailable'
+    }
+    // 桌面先答 → 手机那一侧要立刻作废（pending 条目删掉、`waiting` 归零、
+    // 等 wire 那一帧上线后连手机上的卡也会一起收掉）。
+    if (winner.src === 'desktop') controller.abort('desktop')
+    approvalLast =
+      winner.src === 'phone' ? `answered-by-phone(${winner.outcome})` : `answered-by-desktop(${winner.outcome})`
+    return winner.outcome
   }
 
   /** 有没有能收消息的对端由 runtime 判断；这里只做一个粗筛（有 sink 即可能有对端）。 */
