@@ -153,6 +153,19 @@ pnpm format:check     # prettier --check
   假上下文的 `slots` 既能同步给、也能演"晚到"（`lateSlots` + `flushInject`）——
   只给同步那条的 fixture 演不出"屏幕上没有那颗 pill"，2026-10-03 真机就是这么漏的。
 
+动到**宿主桥**那一半时盯住另外两组：
+
+- `carrier-services.test.ts` — 真实宿主那一代的软探测面。最贵的一条是**审批那条 waterfall
+  登记时必须带 `{ global: true, prepend: true }`**：`global` 管"不被 cordis 的作用域过滤掉"
+  （宿主按 `scopeTarget(req.agent, …)` 派发，插件那条 fiber 是它的兄弟），`prepend` 管
+  "排在桌面那位应答者前面"（外层不 `next()` 内层永远轮不到）。两个各摘一个就会红，
+  而**真机上两种缺法表现完全一样：审批卡不弹、`approvalFace` 却照报 `registered`**。
+  同一文件还钉 `approvalCalls` / `approvalLast` / `approvalAsked` / `approvalDecided`
+  四条读数（"没人答"与"别人抢先答了"只有 `decided` 分得开）。
+- `host-id.test.ts` — 主机身份必须**跨重启稳定**。`config.hostId` 为空时按
+  "磁盘旧值 > 现造并落盘" 定身份（0600，已存在绝不改写）；每次加载现造一个会让中继
+  顶不掉旧 socket、手机那条会话指向"没有钥匙的对端"，`droppedFrames` 一直涨。
+
 二维码编码器本身的防回归在伞仓：`node scripts/validate-qr.mjs`（zxing-cpp 真解码，
 PNG 与裸矩阵两条路径）。
 
