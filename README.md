@@ -122,7 +122,8 @@ pnpm format:check     # prettier --check
 `packages/plugin/tests/presentation-presenter.test.ts`（真渲染出 PNG magic bytes、落盘 0600）这两组；
 动到右栏那条路由时盯住 `presentation-route.test.ts`（环回/来源守卫）与
 `presentation-isolation.test.ts`（**缺 `webServer` 时配对链路必须逐字段不变**）；
-动到状态栏那颗 pill 时盯住 `presentation-pair-actions.test.ts`（发码幂等、Origin 缺席也拒、
+动到状态栏那颗 pill 时盯住 `presentation-pair-actions.test.ts`（发码幂等、写路由的跨站判据是
+那个同源才发得出的 `x-drc-pair` 头而不是 `Origin`、
 回答里不许出现凭据）与 `presentation-client-bundle.test.ts`（在 vm 里真跑**打出来的** `client.cjs`：
 拿不到 react / 探不到 slots 时只许降级成"没有 pill"，右栏那半必须照常）。
 

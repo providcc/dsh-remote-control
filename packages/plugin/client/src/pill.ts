@@ -68,6 +68,7 @@ interface NewAnswer {
   epoch?: unknown
   reason?: unknown
   error?: unknown
+  guard?: unknown
 }
 
 /**
@@ -92,7 +93,16 @@ export function panelViewFor(answer: NewAnswer | undefined, httpStatus: number):
       reason: answer.reason === 'relay-offline' ? '中继还没连上，暂时无法配对。' : '现在发不出配对码。',
     }
   }
-  return { kind: 'failed', detail: typeof answer.error === 'string' ? answer.error : `HTTP ${httpStatus}` }
+  return {
+    kind: 'failed',
+    // 把宿主说的那道守卫一起印出来：这条路由在浏览器里点，屏幕上的这句话就是唯一的现场。
+    detail:
+      typeof answer.error === 'string'
+        ? typeof answer.guard === 'string'
+          ? `${answer.error}（${answer.guard}）`
+          : answer.error
+        : `HTTP ${httpStatus}`,
+  }
 }
 
 export type PanelView =
@@ -357,8 +367,14 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     let answer: NewAnswer | undefined
     let httpStatus = 0
     try {
-      const response = (await deps.fetchImpl(NEW_ROUTE, { method: 'POST', credentials: 'same-origin' })) as
-        { status?: number; json?(): Promise<unknown> } | undefined
+      // 那个 `x-drc-pair` 头是**这条请求的 CSRF 判据**，不是装饰：桌面宿主会删掉转发请求的
+      // `origin`，所以"Origin 必须存在"在真机上永远不成立（2026-10-03 那颗 pill 就是这么撞 403 的）。
+      // 自定义头则只有同源脚本发得出——跨站要带它必然触发 CORS 预检，而这条服务不答应预检。
+      const response = (await deps.fetchImpl(NEW_ROUTE, {
+        method: 'POST',
+        headers: { 'x-drc-pair': '1' },
+        credentials: 'same-origin',
+      })) as { status?: number; json?(): Promise<unknown> } | undefined
       httpStatus = typeof response?.status === 'number' ? response.status : 0
       answer = (await response?.json?.()) as NewAnswer | undefined
     } catch (error) {

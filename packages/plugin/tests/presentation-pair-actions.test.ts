@@ -2,7 +2,8 @@
  * presentation-pair-actions.test — 状态栏 pill 那三条路由的判据。
  *
  * 这三条与右栏那条**不同一档安全姿态**，所以断言也各自一份：
- * `POST /pairing/new` 会改状态（向中继申请一张新码），因此 Origin 缺席也要拒；
+ * `POST /pairing/new` 会改状态（向中继申请一张新码），因此额外要求一个只有同源脚本发得出的
+ * 自定义头 `x-drc-pair: 1`（Origin 缺席**不**是拒的理由——桌面宿主转发时会把它删掉，真机量过）；
  * `GET /pairing.png` 与 `GET /status` 只读，Origin 缺席放过，但 Host 仍必须环回。
  *
  * 最重要的一条不是"能发码"，而是**响应里绝不能出现凭据**：`psk` 与完整 `qr` URI
@@ -57,7 +58,12 @@ function request(method: string, headers: Record<string, string> = {}): Incoming
   return { method, url: '/', headers } as unknown as IncomingMessage
 }
 
-const LOOPBACK = { host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' }
+/**
+ * 真机上那颗 pill 发出来的形状：环回 `Host` + 那个自定义头。
+ * `Origin` **故意不在这里**——桌面宿主转发时会把它删掉，这是 2026-10-03 在真屏幕上量出来的
+ * （当时判据还是"Origin 必须存在"，于是点一下就是 403，弹窗上印着 `origin-missing`）。
+ */
+const LOOPBACK = { host: '127.0.0.1:19387', 'x-drc-pair': '1' }
 
 function deps(over: Partial<PairActionDeps> = {}): PairActionDeps & { calls: { ensure: number; current: number } } {
   const calls = { ensure: 0, current: 0 }
@@ -124,25 +130,55 @@ test('GET 打开发码路由 → 405：这条只接受 POST', async () => {
   assert.equal(d.calls.ensure, 0, '被拒的请求绝不能已经先把码发出去了')
 })
 
-test('Origin 缺席 → 403（写路由不吃"没带就当作同源"这套推断）', async () => {
+test('Origin 缺席 + 带自定义头 → 200：桌面宿主会删 origin，这条不能要求它在', async () => {
+  // 真机形状（2026-10-03）：请求从 `dsh-app://app` 那个文档里发出来，走到我们手上时
+  // `origin` 头已经被宿主转发层去掉了。要求它存在 = 那颗 pill 永远点不动。
   const d = deps()
   const { res, reply } = response()
-  await pairNewHandler(d)(request('POST', { host: '127.0.0.1:19387' }), res)
-  assert.equal(reply().status, 403)
-  assert.equal(d.calls.ensure, 0, '被拦下的请求不许改状态')
+  await pairNewHandler(d)(request('POST', LOOPBACK), res)
+  assert.equal(reply().status, 200, reply().body)
+  assert.equal(JSON.parse(reply().body).state, 'ready')
 })
 
-test('跨站 Origin 与非环回 Host 都 → 403', async () => {
-  for (const headers of [
-    { host: '127.0.0.1:19387', origin: 'https://evil.example.com' },
-    { host: 'evil.example.com', origin: 'http://127.0.0.1:19387' },
-    { host: 'attacker.local:8787', origin: 'http://localhost:8787' },
-  ]) {
+test('Origin 是宿主自己的自定义 scheme（`dsh-app://app`）→ 200：不是只有环回 http 才算自己', async () => {
+  const d = deps()
+  const { res, reply } = response()
+  await pairNewHandler(d)(request('POST', { ...LOOPBACK, origin: 'dsh-app://app' }), res)
+  assert.equal(reply().status, 200, reply().body)
+})
+
+test('少了那个自定义头 → 403 pair-marker-missing：这才是这条真正的 CSRF 判据', async () => {
+  // 跨站页面要带自定义头就必须先过 CORS 预检，而这条服务既不响应 OPTIONS 也不发
+  // `Access-Control-*`，浏览器会拦下；普通 HTML 表单更是没有设头的口子。
+  const missing: Array<Record<string, string>> = [
+    { host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' },
+    { host: '127.0.0.1:19387' },
+    { host: '127.0.0.1:19387', 'x-drc-pair': 'yes' }, // 值不对也算没带
+  ]
+  for (const headers of missing) {
+    const d = deps()
+    const { res, reply } = response()
+    await pairNewHandler(d)(request('POST', headers), res)
+    assert.equal(reply().status, 403, `${JSON.stringify(headers)} 不该被放行`)
+    assert.equal(JSON.parse(reply().body).guard, 'pair-marker-missing')
+    assert.equal(d.calls.ensure, 0, '被拦下的请求不许改状态')
+  }
+})
+
+test('跨站 Origin、`null` 来源与非环回 Host 都 → 403，各自报出自己那道守卫', async () => {
+  const cases: Array<[Record<string, string>, string]> = [
+    [{ ...LOOPBACK, origin: 'https://evil.example.com' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'null' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'not a url' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, host: 'evil.example.com' }, 'host-not-loopback'],
+    [{ host: 'attacker.local:8787', origin: 'http://localhost:8787', 'x-drc-pair': '1' }, 'host-not-loopback'],
+  ]
+  for (const [headers, guard] of cases) {
     const d = deps()
     const { res, reply } = response()
     await pairNewHandler(d)(request('POST', headers), res)
     assert.equal(reply().status, 403, `${JSON.stringify(headers)} 应当被拒`)
-    assert.deepEqual(JSON.parse(reply().body), { error: 'request-not-trusted' })
+    assert.equal(JSON.parse(reply().body).guard, guard, `拒的原因要指对：${JSON.stringify(reply().body)}`)
     assert.equal(d.calls.ensure, 0)
   }
 })
@@ -293,12 +329,15 @@ test('一条注销抛错不许让其余留在宿主上', () => {
   assert.equal(off, 3, '后两条必须仍然被调用')
 })
 
-test('反证：把写路由的 Origin 判据退回"缺席也放过"，那条 403 立刻失去牙齿', async () => {
-  // 这条是给自己看的：上面"Origin 缺席 → 403"的断言依赖 originMustBeLoopback。
-  // 若有人把它改回只读那套（`originIsLoopback`），这里必须显形。
-  const d = deps()
-  const { res, reply } = response()
-  await pairNewHandler(d)(request('POST', { host: '127.0.0.1:19387' }), res)
-  assert.equal(reply().status, 403, '写路由对缺席 Origin 必须拒；这一条变绿就说明守卫被放松了')
-  assert.equal(d.calls.ensure, 0)
+test('反证：环回主机名这份表只有一份，写路由与只读那条必须同一个口径', async () => {
+  // 若有人在这里另写一套字面量，最先露馅的就是这种"边界上那一种写法"：https 的 localhost
+  // 在只读那条一直是放过的，写这条若判成拒，表现就是"右栏弹得出码、pill 点不动"。
+  for (const origin of ['http://localhost:19387', 'https://localhost:19387', 'http://127.0.0.1:19387']) {
+    const d = deps()
+    const { res, reply } = response()
+    await pairNewHandler(d)(request('POST', { ...LOOPBACK, origin }), res)
+    assert.equal(reply().status, 200, `${origin} 应当算宿主自己：${reply().body}`)
+  }
+  // 而这一条钉住的是本轮真机那个结论：**谁把"Origin 必须存在"加回来，上面那条
+  // "Origin 缺席 + 带自定义头 → 200" 就会立刻红**——不是判据松了，是那颗 pill 又点不动了。
 })

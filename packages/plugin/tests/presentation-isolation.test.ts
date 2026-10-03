@@ -30,8 +30,11 @@ import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/pres
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
 
-/** 宿主自己的 webServer 监听形状（环回）+ 同源页面的 Origin——pill 的两条路由要这两个都过。 */
-const LOOPBACK_HEADERS = { host: '127.0.0.1:5173', origin: 'http://127.0.0.1:5173' }
+/**
+ * 那颗 pill 真发出来的请求头（环回 Host + 自定义头）。`origin` 不在这里：桌面宿主转发时
+ * 会把它删掉，真机 2026-10-03 量过。
+ */
+const LOOPBACK_HEADERS = { host: '127.0.0.1:5173', 'x-drc-pair': '1' }
 
 /** 主链路上可比对的稳定字段。`sidebar` 单独断言，`relay`/`probe` 有时序所以另做形状断言。 */
 const MAIN_LINK_KEYS = [
@@ -424,15 +427,18 @@ test('pill 那三条挂上去的就是带守卫的那三条（接线，不是又
       return { status, body }
     }
 
-    // 发码：完整守卫（Host + Origin 都在且环回）走通，落到"现在发不出码"这个确定分支。
+    // 发码：真机那个形状（环回 Host + 自定义头，**没有 Origin**）必须走通——
+    // 桌面宿主转发时会删掉 origin，这一条在 2026-10-03 之前是点一下就 403 的。
     const ok = await run(PAIR_NEW_ROUTE, 'POST', LOOPBACK_HEADERS)
     assert.equal(ok.status, 200, ok.body)
     assert.deepEqual(JSON.parse(ok.body), { state: 'unavailable', reason: 'relay-offline' })
 
     // 三种被拒的形状都要在**挂上去的那条**上生效，而不是只在我的单元测试里生效。
-    assert.equal((await run(PAIR_NEW_ROUTE, 'POST', { host: '127.0.0.1:5173' })).status, 403, 'Origin 缺席')
+    const noMarker = await run(PAIR_NEW_ROUTE, 'POST', { host: '127.0.0.1:5173' })
+    assert.equal(noMarker.status, 403, '少了那个自定义头就该拒')
+    assert.equal(JSON.parse(noMarker.body).guard, 'pair-marker-missing')
     assert.equal(
-      (await run(PAIR_NEW_ROUTE, 'POST', { host: '127.0.0.1:5173', origin: 'https://evil.example.com' })).status,
+      (await run(PAIR_NEW_ROUTE, 'POST', { ...LOOPBACK_HEADERS, origin: 'https://evil.example.com' })).status,
       403,
       '跨站 Origin',
     )

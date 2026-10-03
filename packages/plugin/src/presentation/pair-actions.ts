@@ -7,8 +7,15 @@
  *
  * 为什么单独一个文件、不并进 `route.ts`：**两条路的安全姿态不一样**。
  * `route.ts` 是只读的，Origin 缺席可以放过（同源 GET 常常不带它，而读一张马上过期的码
- * 本身不构成权限）；这里有一条**会改状态**的路由，所以 Origin **必须存在且是环回**，
- * 缺席也拒。两种判据写在同一个文件里，迟早有人"顺手复用"成较松的那一个。
+ * 本身不构成权限）；这里这条**会改状态**，所以额外要求一个只有同源脚本发得出的自定义头。
+ * 两种判据写在同一个文件里，迟早有人"顺手复用"成较松的那一个——分文件 + 各自一份断言就是防这个。
+ *
+ * ⚠️ 那条"额外要求"**不能写成"Origin 必须存在"**：2026-10-03 在真宿主上点那颗 pill 直接 403，
+ * 弹窗里印的就是 `origin-missing`——桌面宿主转发 web 请求时会在更外层把 `origin` 头删掉
+ * （只读那条能活，正是因为它的判据允许缺席）。所以这里的主判据换成 `x-drc-pair` 那个头：
+ * 跨站页面要带自定义头必然先过 CORS 预检，而这条服务既不响应 OPTIONS 也不发 `Access-Control-*`，
+ * 浏览器会拦下；HTML 表单更没有设头的口子。Origin 存在时仍要判（环回 http(s) 或宿主自己的
+ * 自定义 scheme），但它缺席不再是拒的理由。
  *
  * 为什么状态也要一条路由：pill 要在**没点开**的时候就说清"中继在不在"，而浏览器拿不到
  * `status.json`（那是宿主磁盘上的文件）。这里只出三个非凭据字段，`status.json` 里那些
@@ -31,7 +38,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pairingEpoch } from './presenter.js'
-import { hostIsLoopback, json, originMustBeLoopback, type WebServerLike } from './route.js'
+import { hostIsLoopback, json, LOOPBACK_HOSTS, type WebServerLike } from './route.js'
 
 export const PAIR_NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const PAIR_IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
@@ -69,6 +76,42 @@ export interface PairActionDeps {
   log(message: string, fields?: Record<string, string | number | boolean | undefined>): void
 }
 
+/**
+ * 写路由的 CSRF 判据。**不能靠 Origin 存在**：桌面宿主会在更外层转发并删掉 `origin` 头，
+ * 真机 2026-10-03 实测那条点击进来的请求就是 `origin-missing`（403 印在弹窗上看到的）。
+ * 所以这道改用**只有同源脚本才发得出的自定义头**当主判据：跨站页面要带它就必然触发 CORS
+ * 预检，而这条服务不响应 OPTIONS、也不发 `Access-Control-*`，浏览器会直接拦下；
+ * 普通 HTML 表单更是根本没有设头的口子。
+ */
+export const PAIR_MARKER_HEADER = 'x-drc-pair'
+export const PAIR_MARKER_VALUE = '1'
+
+/** Origin 存在时它必须像"这台宿主自己"：环回的 http(s)，或宿主自己注册的自定义 scheme。 */
+function originLooksLikeTheHostItself(origin: string): boolean {
+  try {
+    const url = new URL(origin)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      // `dsh-app://app` 这类自定义 scheme 只有宿主自己能产生；`null`（file:// 文档）不算。
+      return origin.trim() !== 'null'
+    }
+    return LOOPBACK_HOSTS.has(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 这条写路由到底被哪一道拦下的：**必须分开报**，因为桌面宿主会改写转发请求的头，
+ * "哪个头没了"在真机上是量出来的而不是猜的（见上面那段）。返回 undefined 表示放行。
+ */
+export function rejectedBy(request: IncomingMessage): string | undefined {
+  if (!hostIsLoopback(request.headers.host)) return 'host-not-loopback'
+  if (request.headers[PAIR_MARKER_HEADER] !== PAIR_MARKER_VALUE) return 'pair-marker-missing'
+  const origin = request.headers.origin
+  if (origin !== undefined && origin.trim() !== '' && !originLooksLikeTheHostItself(origin)) return 'origin-not-trusted'
+  return undefined
+}
+
 /** `POST /pairing/new`：点一下配对。 */
 export function pairNewHandler(deps: PairActionDeps): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response) => {
@@ -77,8 +120,13 @@ export function pairNewHandler(deps: PairActionDeps): (request: IncomingMessage,
       json(response, 405, { error: 'method not allowed' })
       return
     }
-    if (!hostIsLoopback(request.headers.host) || !originMustBeLoopback(request.headers.origin)) {
-      json(response, 403, { error: 'request-not-trusted' })
+    const guard = rejectedBy(request)
+    if (guard) {
+      // 把**是哪一道**回出去：这条路由在浏览器里点，谁也没法 curl 调试，
+      // 而"403 但不知道为什么 403"正是那颗 pill 在生产上最难查的形状。
+      // 这里只出守卫名，不出请求内容。
+      deps.log('发码请求被守卫拒', { guard })
+      json(response, 403, { error: 'request-not-trusted', guard })
       return
     }
     try {

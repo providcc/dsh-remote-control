@@ -24,7 +24,13 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext, runInContext } from 'node:vm'
-import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/presentation/pair-actions.js'
+import {
+  PAIR_IMAGE_ROUTE,
+  PAIR_MARKER_HEADER,
+  PAIR_MARKER_VALUE,
+  PAIR_NEW_ROUTE,
+  PAIR_STATUS_ROUTE,
+} from '../src/presentation/pair-actions.js'
 import { PAIRING_ROUTE } from '../src/presentation/route.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -263,11 +269,18 @@ function load(options: LoadOptions = {}): Harness {
       return timers.length
     },
     clearInterval: () => {},
-    fetch: async (url: string, init?: { method?: string }) => {
+    fetch: async (url: string, init?: { method?: string; headers?: Record<string, string> }) => {
       requests.push(url)
       const method = init?.method ?? 'GET'
       if (url.startsWith(PAIR_NEW_ROUTE)) {
         assert.equal(method, 'POST', '发码那条只接受 POST')
+        // 那个自定义头是这条写路由唯一的 CSRF 判据（桌面宿主会删 `origin`，真机 2026-10-03 量过）。
+        // 浏览器面**忘了带**、或宿主侧改了头名，表现都是"点一下永远 403"，所以两边在这里对上。
+        assert.equal(
+          init?.headers?.[PAIR_MARKER_HEADER],
+          PAIR_MARKER_VALUE,
+          `发码请求必须带 ${PAIR_MARKER_HEADER}: ${PAIR_MARKER_VALUE}，实际 init=${JSON.stringify(init)}`,
+        )
         if (options.newThrows) throw new Error('发码那条断了')
         return {
           ok: true,

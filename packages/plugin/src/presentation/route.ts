@@ -32,7 +32,11 @@ import type { PairingSnapshot } from './presenter.js'
 
 export const PAIRING_ROUTE = '/plugins/dsh-remote-control/pairing'
 
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+/**
+ * 环回主机名集合。**两条路共用同一份**：只读那条判 `Host`、写那条判 `Origin`，
+ * 各留一份字面量迟早会漂（漂了的表现是"某一种环回写法一边通一边不通"）。
+ */
+export const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
 /** 去掉端口与 IPv6 方括号，只留主机名。 */
 function hostnameOf(host: string): string {
@@ -59,16 +63,6 @@ export function hostIsLoopback(host: string | undefined): boolean {
 /** Origin 缺席是合法的：同源 GET 上浏览器本来就可能不带它。 */
 function originIsLoopback(origin: string | undefined): boolean {
   if (origin === undefined) return true
-  return originHostIsLoopback(origin)
-}
-
-/**
- * 写路由用的严版本：**Origin 缺席也拒**。
- * 只读那条允许缺席是因为同源 GET 常常不带它，而"读一张马上过期的码"本身不构成权限；
- * 会改状态的动作不能靠"没带就当作同源"这种推断。
- */
-export function originMustBeLoopback(origin: string | undefined): boolean {
-  if (origin === undefined || origin.trim() === '') return false
   return originHostIsLoopback(origin)
 }
 
