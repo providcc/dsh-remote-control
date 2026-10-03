@@ -7,24 +7,23 @@
  *
  * 三条形状上的决定都有据可查，不是随手挑的：
  *
- * 1. **`slots` 走软探测，绝不写进模块的 `inject`**。声明成注入闸门意味着"这代宿主没有
- *    slots 服务"时**整个 client 条目不激活**——那会连累已经在生产跑的右栏自动弹码
- *    （同一个 bundle）。`@chaoset/provider-usage` 用 `ctx.get('modelDirectories')` 读
- *    可选服务，就是这条姿势。
+ * 1. **`slots` 按宿主模板声明进 `inject`，并且留软探测当退路**。宿主自带的
+ *    `templates/decoration/client.js` 就是 `inject: ['slots']` + `ctx.slots.inject(...)`；
+ *    不声明的话 `apply()` 跑在槽位服务之前，那颗 pill 整颗不出现（见 `mountPill` 的注释，
+ *    2026-10-03 真机踩过）。声明成闸门换来的正是"激活时机在服务之后"，而软探测与注入回调
+ *    留着，是为了在"这一代宿主没把 slots 当服务给"时还能挂上、并且留下一行 warn 说清原因。
  * 2. **react 只用来 `createElement`，而且是运行期向 loader 要**（`__drcRequire`，见
  *    `scripts/bundle-plugin.mjs` 的外壳）。静态 import 的解析失败发生在 factory 顶层，
  *    那是"整页 web boot 失败"的形状（真机踩过：`web boot: N entry/entries did not activate`）；
  *    运行期拿不到就只是没有 pill。**不用 hooks**：组件只返回一个带 `ref` 的空 `<span>`，
  *    UI 全由下面那段 DOM 管——`ref` 回调身份稳定，宿主重渲染 dock 不会把我们这块拆掉重建。
- * 3. **图走同域 HTTP，不走 `dsh-resource://`**。右栏能吃那个自定义 scheme 是因为宿主的
- *    文档预览页型认领了它；pill 里一个 `<img>` 能不能吃没有证据，而 `/plugins/**` 是
- *    必然可行的那条路。
+ * 3. **图走同域 HTTP，不走 `dsh-resource://`**。pill 里一个 `<img>` 能不能吃那个自定义
+ *    scheme 没有证据，而 `/plugins/**` 是必然可行的那条路。
  *
- * 纪律与主文件同一条：**任何一步抛出都只留一行日志，绝不把异常抛进 loader，也不许连累
- * 右栏那半条轮询**。
+ * 纪律与主文件同一条：**任何一步抛出都只留一行日志，绝不把异常抛进 loader**。
  */
 
-/** pill 用到的三条路由（宿主侧定义在 `src/presentation/pair-actions.ts`，字符串必须一致）。 */
+/** pill 用到的三条路由（宿主侧定义在 `src/presentation/pill-routes.ts`，字符串必须一致）。 */
 export const STATUS_ROUTE = '/plugins/dsh-remote-control/status'
 export const NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'
@@ -48,6 +47,8 @@ interface Gettable {
 }
 
 interface PillHost extends Gettable {
+  /** 声明在模块的 `inject` 里之后才可读（宿主模板就是这么写的）；没声明时读它会抛。 */
+  slots?: unknown
   inject?(names: string[], callback: (scoped: unknown) => void): unknown
   effect?(execute: () => (() => unknown) | void): unknown
 }
@@ -153,43 +154,31 @@ const CSS = `
   border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
 `
 
+/** 认得出 slots 服务吗：`inject`（认领槽位）与 `register`（往里放组件）两个函数都得在。 */
+function isSlots(value: unknown): value is SlotRegistry {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return typeof record.inject === 'function' && typeof record.register === 'function'
+}
+
 /**
- * 软探测 `slots`：先 `ctx.get`，拿不到再走 `ctx.inject`（回调参数是**作用域化上下文**，
- * 要在它上面再 get 一次才拿得到服务）。两条路各自包 try——宿主 ctx 读没声明的属性是
- * **抛错**，不是返回 undefined。
+ * 从一个候选里认出 slots：候选本身就是服务，或者它是个能 `get('slots')` 的上下文。
+ * 真 cordis 两种都会出现——`ctx.get` 给的是服务本身，而 `ctx.inject` 的回调参数是
+ * **作用域化上下文**，要在它上面再 get 一次。读没声明的属性是**抛错**而不是返回
+ * undefined，所以这里整段包 try（调用方还要为"抛了"留一条 warn）。
  */
-function findSlots(ctx: PillHost): SlotRegistry | undefined {
-  let found: SlotRegistry | undefined
-  const accept = (value: unknown): boolean => {
-    if (!value || typeof value !== 'object') return false
-    const record = value as Record<string, unknown>
-    if (typeof record.inject !== 'function' || typeof record.register !== 'function') return false
-    found = value as SlotRegistry
-    return true
+function pickSlots(source: unknown): SlotRegistry | undefined {
+  if (isSlots(source)) return source
+  const asGettable = source as Gettable | null | undefined
+  if (asGettable && typeof asGettable.get === 'function') {
+    try {
+      const got = asGettable.get('slots', true)
+      if (isSlots(got)) return got
+    } catch {
+      /* 这个候选没有该服务 */
+    }
   }
-  try {
-    if (accept(ctx.get?.('slots', true))) return found
-  } catch {
-    /* 这一代宿主没这个服务名 */
-  }
-  try {
-    ctx.inject?.(['slots'], ((...args: unknown[]) => {
-      for (const candidate of [...args, ctx]) {
-        if (accept(candidate)) return
-        const asGettable = candidate as Gettable | null | undefined
-        if (asGettable && typeof asGettable.get === 'function') {
-          try {
-            if (accept(asGettable.get('slots', true))) return
-          } catch {
-            /* 这个候选没有该服务 */
-          }
-        }
-      }
-    }) as never)
-  } catch {
-    /* 没有 inject 口 */
-  }
-  return found
+  return undefined
 }
 
 /**
@@ -203,7 +192,7 @@ declare const require: ((id: string) => unknown) | undefined
  *
  * 模块名走**变量**而不是字面量，这条不是风格问题：字面量 `require('react')` 会被打包器在
  * 构建期解析成 factory 顶层那一句，一旦宿主给不出这个模块，抛出发生在 factory 第一行——
- * 那是"web boot: N entry/entries did not activate"，连已经在生产跑的右栏弹码一起没。
+ * 那是"web boot: N entry/entries did not activate"，整页都起不来。
  * 走变量则留在运行期，被这里的 try 接住。（`scripts/bundle-plugin.mjs` 里有一条断言
  * 盯着产物中不得出现 `require("react")` 那种静态形式。）
  */
@@ -485,59 +474,96 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
 }
 
 /**
- * 注册进宿主的槽位。返回 false 表示"这颗 pill 不会出现"（没 react / 没 slots / 槽位 API 不对），
- * 调用方只关心它不外抛。
+ * 注册进宿主的槽位。返回 false 表示"**到这一刻**这颗 pill 还没挂上"（没 react / 没 slots /
+ * 槽位 API 不对），调用方只关心它不外抛。
+ *
+ * **`slots` 什么时候到位，决定这颗 pill 存不存在**。模块的 `inject` 声明是空的时，
+ * `apply()` 跑在 `slots` 服务之前，只软探一次就返回的表现是"屏幕上永远没有这颗按钮"——
+ * 2026-10-03 删掉右栏那半之后在真机上就是这么打的（当时 262 项单测全绿，屏幕是空的；
+ * 旧的 `inject: ['sidebarRight']` 无意中把激活时机推到了服务齐之后）。
+ * 现在按宿主自带模板（`templates/decoration/client.js`：`inject: ['slots']` +
+ * `ctx.slots.inject(...)`）把 `slots` 声明进闸门，同时保留两条退路：软探测，以及
+ * `ctx.inject(['slots'], …)` 的晚到回调（回调里只 mount 一次）。
  */
 export function mountPill(ctx: PillHost, createElement: CreateElement | undefined): boolean {
   if (!createElement) {
-    warn('装载器给不出 react：pill 不出现，配对仍可走 /drc pair')
+    warn('装载器给不出 react：配对那颗 pill 不会出现')
     return false
   }
-  const slots = findSlots(ctx)
-  if (!slots) {
-    warn('这代宿主没有 slots 服务：pill 不出现，配对仍可走 /drc pair')
-    return false
-  }
-  /**
-   * `ref` 回调必须是**稳定身份**（模块里这一份闭包，每次渲染都同一个函数），
-   * 否则 React 每次重渲染都会先 `ref(null)` 再 `ref(node)`——那颗 pill 会一闪一闪地重建。
-   */
-  let cleanup: (() => void) | undefined
-  const attach = (node: unknown): void => {
-    const element = node as Element | null
-    if (element && typeof element.appendChild === 'function' && element.ownerDocument) {
-      if (cleanup) return
-      ;(element as HTMLElement).style.position = 'relative'
-      cleanup = buildPill(element, {
-        fetchImpl: (input, init) => globalThis.fetch(input, init as RequestInit | undefined),
-      })
-    } else if (cleanup) {
-      cleanup()
-      cleanup = undefined
-    }
-  }
-  const component = (): unknown => createElement('span', { ref: attach })
-  try {
-    slots.inject(SLOT_NAME, () => {
-      try {
-        slots.register({ name: SLOT_NAME, id: PILL_ID, order: PILL_ORDER, inject: () => ({}) }, component)
-      } catch (error) {
-        warn('槽位注册失败（右栏自动弹码不受影响）', error)
-      }
-    })
-  } catch (error) {
-    warn('槽位注入失败（右栏自动弹码不受影响）', error)
-    return false
-  }
-  try {
-    ctx.effect?.(() => () => {
-      if (cleanup) {
+  let mounted = false
+  const mount = (slots: SlotRegistry): void => {
+    if (mounted) return
+    /**
+     * `ref` 回调必须是**稳定身份**（模块里这一份闭包，每次渲染都同一个函数），
+     * 否则 React 每次重渲染都会先 `ref(null)` 再 `ref(node)`——那颗 pill 会一闪一闪地重建。
+     */
+    let cleanup: (() => void) | undefined
+    const attach = (node: unknown): void => {
+      const element = node as Element | null
+      if (element && typeof element.appendChild === 'function' && element.ownerDocument) {
+        if (cleanup) return
+        ;(element as HTMLElement).style.position = 'relative'
+        cleanup = buildPill(element, {
+          fetchImpl: (input, init) => globalThis.fetch(input, init as RequestInit | undefined),
+        })
+      } else if (cleanup) {
         cleanup()
         cleanup = undefined
       }
-    })
-  } catch {
-    /* 没有 effect 口就不登记卸载：宿主整页卸载会带走这颗 pill */
+    }
+    const component = (): unknown => createElement('span', { ref: attach })
+    mounted = true
+    try {
+      slots.inject(SLOT_NAME, () => {
+        try {
+          slots.register({ name: SLOT_NAME, id: PILL_ID, order: PILL_ORDER, inject: () => ({}) }, component)
+        } catch (error) {
+          warn('槽位注册失败（那颗 pill 不出现）', error)
+        }
+      })
+    } catch (error) {
+      mounted = false
+      warn('槽位注入失败（那颗 pill 不出现）', error)
+      return
+    }
+    try {
+      ctx.effect?.(() => () => {
+        if (cleanup) {
+          cleanup()
+          cleanup = undefined
+        }
+      })
+    } catch {
+      /* 没有 effect 口就不登记卸载：宿主整页卸载会带走这颗 pill */
+    }
   }
-  return true
+
+  let early: SlotRegistry | undefined
+  try {
+    // 模块 `inject: ['slots']` 声明之后，`ctx.slots` 直接可读——宿主自带的
+    // `templates/decoration/client.js` 就是这个写法。后面两条是给"这一代宿主没把它
+    // 当服务给"留的退路。
+    early = pickSlots(ctx.slots) ?? pickSlots(ctx.get?.('slots', true))
+  } catch {
+    /* 这一代宿主没这个服务名，或读它就是抛 */
+  }
+  if (early) mount(early)
+
+  try {
+    ctx.inject?.(['slots'], ((...args: unknown[]) => {
+      for (const candidate of [...args, ctx]) {
+        const found = pickSlots(candidate)
+        if (found) {
+          mount(found)
+          return
+        }
+      }
+    }) as never)
+  } catch (error) {
+    warn('ctx.inject 口不可用：slots 再晚到也没人补挂', error)
+  }
+  if (!mounted) {
+    warn('apply 时没探到 slots（已挂注入回调等它晚到）；pill 一直不出现就是这代宿主没这个服务')
+  }
+  return mounted
 }

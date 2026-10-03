@@ -25,12 +25,10 @@ import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
-import { pairingImagePath, StatusFile, writePrivateFile } from './shell/status.js'
-import { pairingPairText, PAIR_UNAVAILABLE_TEXT, PAIR_VIA_PILL_TEXT } from './shell/pairing-text.js'
+import { StatusFile, writePrivateFile } from './shell/status.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
-import { renderTerminalQr, qrPng } from './platform/qr.js'
-import { startSidebarQr, type SidebarHandle } from './presentation/sidebar.js'
-import type { PillStatus } from './presentation/pair-actions.js'
+import { startPill, type PillHandle } from './presentation/pill.js'
+import { renderPairingPng, type LivePairing, type PillStatus } from './presentation/pill-routes.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -67,8 +65,6 @@ export interface RuntimeHandle {
   readonly config: PluginConfig
   state(): Record<string, unknown>
   createPairing(): { qr: string; token: string; psk: string; expiresAt: number } | null
-  /** 某条会话的工作区目录；解析不出来是 undefined（二维码 PNG 因此退回 `~/.dsh/`）。 */
-  sessionWorkspace(sessionId: string): string | undefined
   stop(): void
 }
 
@@ -129,10 +125,6 @@ export function apply(ctx: LooseContext, injected: Partial<PluginConfig> = {}): 
       },
       createPairing: (): { qr: string; token: string; psk: string; expiresAt: number } | null =>
         handle?.createPairing() ?? null,
-      // presentation 那一半要按会话解析落点（右栏那张图放哪），而"会话 → 工作区"这点
-      // 平台知识只在本插件里有。**在这里开一个口，而不是让那一半自己去探内核服务**：
-      // 两份探测迟早分叉，而分叉的表现是"卡片说 A 地、右栏读 B 地"，很难查。
-      sessionWorkspace: (sessionId: string): string | undefined => handle?.sessionWorkspace(sessionId),
     })
   } catch {
     /* 这一代宿主可能不支持 provide */
@@ -208,11 +200,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   let relay: RelayClient | undefined
   let startedCarrier = ''
   /**
-   * 右栏自动弹码那一半（折进来的 presentation）。`undefined` = 还没起 / 起不动。
+   * 状态栏那颗 pill 的三条路由（配对的唯一入口）。`undefined` = 还没起 / 起不动。
    * 它**不在主链路上**：没有 `webServer` 时它就是 undefined，配对、中继、命令一行都不受影响
-   * ——这正是原来"拆成两个包"所提供的隔离，现在由 `startSidebarQr` 的软探测提供。
+   * ——这正是原来"拆成两个包"所提供的隔离，现在由 `startPill` 的软探测提供。
    */
-  let sidebar: SidebarHandle | undefined
+  let pillRoutes: PillHandle | undefined
   // RelayClient 是唯一知道连接此刻怎么样的一方；状态快照读这两个值。
   let lastRelayState: 'online' | 'connecting' | 'offline' = 'connecting'
   let lastRelayProblem: string | undefined
@@ -334,13 +326,21 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // 出站计数：手机上"没收到 X"的第一现场对比点（插件没发 vs 发了但路上丢了）。
       outbound: runtime?.stats ?? null,
       probe,
-      // 右栏那一半为什么没起，是"二维码不弹"唯一的排查入口：这里直接把软探测的结果带出来。
-      sidebar: sidebar?.probe ?? { webServer: 'not-started' },
+      // 配对入口（那颗 pill 的三条路由）为什么没起，是"配不了对"唯一的排查入口：
+      // 这里直接把软探测的结果带出来。
+      pill: pillRoutes?.probe ?? { webServer: 'not-started' },
       // token 永远不出现真值；这条有测试锁住。
       hostToken: undefined,
       hostTokenShape: config.hostToken ? redact(config.hostToken) : undefined,
       mockBridgeForced: config.mockBridge,
-      problems: problems.map((problem) => `${problem.level}:${problem.field}`),
+      problems: [
+        ...problems.map((problem) => `${problem.level}:${problem.field}`),
+        // **每次快照现判，不在 apply 里 push 一次**。`webServer` 可能是 `ctx.inject` 的回调
+        // 晚到才拿到的，apply 返回那一刻 `available` 还是 false——留在 apply 里就会写出
+        // `routes:"registered"` 与 `problems:["warn:pill"]` 并存的假警报
+        // （2026-10-03 真机重启后实测抓到）。为什么没挂上从同一个快照的 `pill` 探针读。
+        ...(pillRoutes?.available ? [] : ['warn:pill']),
+      ],
       ...(config.pairOnStartSec > 0 ? { pairOnStartWarn: 'status.json 里带着仍然有效的配对码与 PSK' } : {}),
     }
   }
@@ -391,7 +391,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 状态栏那条图片路由间接消费；这里要的只是"屏幕上现在该显示哪张"。
    * `slots.resolveFor` 顺手把已过期的剔掉，所以 `pairing.png` 在没有效码时拿到 null → 204。
    */
-  function currentPairing(): { qr: string; token: string; expiresAt: number } | null {
+  function currentPairing(): LivePairing | null {
     const shown = active.pairing
     if (!shown) return null
     if (!slots.resolveFor(shown.token)) return null
@@ -405,7 +405,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 中继的 pending 表里会同时挂着三个 PSK，屏幕上显示的却是其中一张——
    * 手机扫到没被显示的那张就全线解不开。那正是当初"多码事故"的形状。
    */
-  function ensureFreshPairing(): { qr: string; token: string; expiresAt: number } | null {
+  function ensureFreshPairing(): LivePairing | null {
     const fresh = currentPairing() ?? createPairing()
     if (!fresh) return null
     // **在这里就把 psk 摘掉**，而不是靠"下游记得只读那三个字段"：这条返回值会被浏览器
@@ -806,60 +806,34 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     log('no kernel carrier available', { hint: '需要 sessions/apiProxy 服务，或把 mockBridge 打开做开发' })
   }
 
-  /**
-   * 这次 `/drc pair` 是在哪条会话里敲的 → 那条会话的工作区目录。
-   *
-   * `agent` 是宿主交给 handler 的**接收 agent**（`@deepseek-ai/dsh-commands` 的
-   * `handler: ({ agent, rawInput })`），会话 id 在 `agent.session.id`——与
-   * `platform/carrier-services.ts` 读审批/提问事件里那个 agent 是同一个形状。
-   * 拿不到 agent、会话、工作区**都不算失败**：那时二维码退回 `~/.dsh/`，卡片上印的就是
-   * 退回去的那个路径。这里绝不能"猜一个应该在的工作区"——卡片路径与真落盘路径必须同一个。
-   */
-  const workspaceOfInvocation = (invocation: { agent?: unknown }): string | undefined => {
-    const agent = invocation?.agent as { session?: { id?: unknown } } | undefined
-    const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : ''
-    if (sessionId === '') return undefined
-    try {
-      // runtime 还没起来（carrier=none）时 kernel 是 undefined：退回家目录那条路。
-      return kernel?.sessionWorkspace?.(sessionId)
-    } catch {
-      return undefined
-    }
-  }
-
-  // ── 右栏自动弹码 + 状态栏 pill 的路由（2026-10-03 折进来的那一半）──────
+  // ── 配对入口：状态栏那颗 pill 的三条路由 ────────────────────────────
   //
-  // 放在 `/drc` 命令**之前**：命令的说明文字要按"pill 到底点不点得开"来写，而那个答案
-  // 只有 `startSidebarQr` 跑过才知道（软探测与路由注册都在它里面同步完成）。
+  // 放在 `/drc` 命令**之前**：命令的说明文字与"配对入口还在不在"那条判断都要先知道结果，
+  // 而软探测与路由注册在 `startPill` 里同步完成。
   // 主链路仍然先成立：这一半起不来时，上面接好的那些一行都不许被回滚。
   //
-  // 整段再包一层 try 不是冗余：`startSidebarQr` 内部已经层层兜住，但"层层兜住"是设计不是证明。
+  // 整段再包一层 try 不是冗余：`startPill` 内部已经层层兜住，但"层层兜住"是设计不是证明。
   // 它一旦抛出，宿主会把我们这条 fiber 标 FAILED 并 dispose 掉那几个 inject 子 fiber——
-  // 那就等于用一个可选的外观功能砸了配对链路（真机取证见 `apply()` 里那条纪律）。
+  // 那就等于用一个界面功能砸了配对链路（真机取证见 `apply()` 里那条纪律）。
   try {
-    sidebar = startSidebarQr(ctx, {
-      config: config.sidebarQr,
-      pairing: () => describeActivePairing(),
-      workspaceOf(sessionId: string): string | undefined {
-        try {
-          return kernel?.sessionWorkspace?.(sessionId)
-        } catch {
-          return undefined
-        }
-      },
-      // 状态栏那三条路由要的三件事：幂等发码、只读看当前码、现渲染 PNG。
+    pillRoutes = startPill(ctx, {
+      enabled: config.pill.enabled,
+      // 三条路由要的三件事：幂等发码、只读看当前码、读连接状态。
       ensureFresh: () => ensureFreshPairing(),
       current: () => currentPairing(),
-      renderPng: (qr: string) => qrPng(qr),
       status: () => pillStatus(),
       log,
     })
   } catch (error) {
-    sidebar = undefined
-    log('sidebar start threw（配对链路不受影响）', {
+    pillRoutes = undefined
+    log('pill start threw（配对链路不受影响）', {
       message: String((error as Error)?.message ?? error).slice(0, 200),
     })
   }
+  // **配对入口没了必须说得出为什么**：`/drc pair` 与终端文本码都在 2026-10-03 删掉了，
+  // "这台主机配不了对"如果没有一条可查的记录，表现就是静默失败。那条 `warn:pill` 由
+  // `state()` 每次快照现判（理由见那里），原因本身落在同一个快照的 `pill` 探针里——
+  // 通常就在软探测那一步（宿主没 `webServer`，或者路由名被占）。
 
   // ── /drc 命令 ──────────────────────────────────────────────────────
   // 拿 commands 的方式和拿内核服务完全一样：`ctx.commands` 这种"直接点属性"的读法在
@@ -873,56 +847,20 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   // 于是 `/drc pair` 报 `unknown result kind "text"`。
   // 现在**两道锁**：类型上 `CommandResult` 让写错 kind 编译就红（`pnpm -r typecheck`），
   // 运行时有 `tests/command-result.test.ts` 走一遍 apply() 注册出来的真 handler。
-  // 常态下**配对是点状态栏那颗 pill**（`src/presentation/pair-actions.ts` 的
-  // `POST /pairing/new` + `GET /pairing.png`）。`pair` 子命令只作为兜底存在：
-  // 宿主没有 `webServer`、或那两条路由没挂上时，pill 点不动，这时命令行必须是唯一退路——
-  // 否则那台主机根本配不了对（`pairOnStartSec` 是配置级逃生口，不该指望普通用户去改）。
-  const pairViaPill = sidebar?.available === true
+  //
+  // **命令列表里没有 `pair`**（2026-10-03 拍板）：配对唯一入口是状态栏那颗 pill
+  // （`src/presentation/pill-routes.ts` 的 `POST /pairing/new` + `GET /pairing.png`）。
+  // 命令行发码那条路删掉不是嫌它多余，是因为它**发第二张**：`/drc pair` 走的是
+  // `createPairing()`，会在 pill 那张之外再挂一个仍然有效的 PSK，而手机扫的是屏幕上那张——
+  // 正是当初"多码事故"的形状。入口不可用时的排查走 `problems` 里那条 `warn:pill`。
   const commandDefinition = {
     name: 'drc',
-    description: pairViaPill
-      ? 'DSH 远程控制：配对请点状态栏的 dsh-remote-control；/drc status 看连接与问题，/drc unpair 解配'
-      : 'DSH 远程控制：发布配对二维码、查看中继与内核接合状态',
-    input: { hint: pairViaPill ? 'status | unpair' : 'pair | status | unpair' },
+    description: 'DSH 远程控制：配对请点状态栏的 dsh-remote-control；/drc status 看连接与问题，/drc unpair 解配',
+    input: { hint: 'status | unpair' },
     handler: async (invocation: { commandId: string; rawInput: string; agent?: unknown }): Promise<CommandResult> => {
       const argument = String(invocation.rawInput ?? '')
         .trim()
         .toLowerCase()
-      if (argument.startsWith('pair')) {
-        // `force` 是那颗 pill 显示不出来时的退路：宿主给不出 react、或这代宿主没有 slots
-        // 服务时，路由挂上了而 pill 没挂上——这时只指路等于把人堵死。
-        const forced = argument.slice(4).trim().startsWith('force')
-        if (pairViaPill && !forced) {
-          // 不顺手发码：那会绕开 pill 的幂等语义，让"屏幕上永远只有一张有效码"这条断言失效。
-          return { kind: 'success', text: PAIR_VIA_PILL_TEXT }
-        }
-        // pill 在（只有 force 会走到这里）就走幂等入口，屏幕上那张仍然有效就印那张；
-        // pill 不在时这条是唯一入口，保持 1.1.0 的行为——每次都要一张新的。
-        const pairing = pairViaPill ? ensureFreshPairing() : createPairing()
-        if (!pairing) return { kind: 'success', text: PAIR_UNAVAILABLE_TEXT }
-        // **默认走图片**：DSH 命令卡按 `line-height:1.6` 渲染等宽输出，行间留白会把半块
-        // 二维码横切成条——实测 zxing 在 ≥1.15 行距就解不出来，而宿主固定 1.6，也就是
-        // 文本码在这个（唯一）宿主上扫不出来。图片是自包含位图矩阵，跟行高/字体/配色无关。
-        // 只有显式关掉 qrImage 时才渲染文本码当退路（另有可粘贴的 URI 兜底）。
-        const workspaceDir = workspaceOfInvocation(invocation)
-        const imageFile = config.qrImage ? pairingImagePath(config.statusFile, workspaceDir) : ''
-        if (imageFile) writePairingImage(imageFile, pairing.qr, config, log)
-        const terminal = config.qrImage
-          ? undefined
-          : await renderTerminalQr(pairing.qr, { style: config.qrStyle, ansi: config.qrAnsi })
-        return {
-          kind: 'success',
-          text: pairingPairText({
-            token: pairing.token,
-            qr: pairing.qr,
-            expiresAt: pairing.expiresAt,
-            now: clock.now(),
-            qrImage: config.qrImage,
-            imageFile,
-            terminalQr: terminal,
-          }),
-        }
-      }
       if (argument.startsWith('unpair')) {
         for (const id of relay?.conversationIds() ?? []) relay?.voidConversation(id)
         return { kind: 'success', text: '已解除所有配对；手机端会显示"主机已断开，请重新配对"。' }
@@ -967,59 +905,17 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     config,
     state,
     createPairing,
-    sessionWorkspace(sessionId: string): string | undefined {
-      try {
-        return kernel?.sessionWorkspace?.(sessionId)
-      } catch {
-        return undefined
-      }
-    },
     stop(): void {
       // 复查定时器要先撤：停机之后它们再去写 status.json，写的是已经过期的取证。
       oneShot.cancelAll()
-      // 右栏那一半的节拍与路由也要一起收：它是不在主链路上的旁路，所以单独一句。
-      sidebar?.stop()
+      // pill 那三条路由也要一起收：它是不在主链路上的旁路，所以单独一句。
+      pillRoutes?.stop()
       status.stop()
       runtime?.stop()
       relay?.stop()
       sleep.stop()
     },
   }
-}
-
-/**
- * 图片版是**默认路径**（`qrImage` 默认 true）。
- *
- * 为什么翻转：DSH 命令卡把等宽输出按 `line-height:1.6` 渲染，行间留白把半块二维码
- * 横切成条；用真机输出做的受控实验里，行距 1.0 时 zxing 解得出来、≥1.15 就扫不出来。
- * 文本码在这个宿主上不可用，所以主产物只能是图片。
- *
- * 落到磁盘的仍然是**旁路**：命令 API 只收纯文本，我们写 PNG + 把**路径**写进卡片，
- * 但绝不替用户打开查看器——`qrOpen` 默认关（原话「不要用打开一个图片的方式」）。
- *
- * `file` 由调用方按会话工作区解析好（`pairingImagePath`）后传进来，本函数只管写。
- */
-function writePairingImage(
-  file: string,
-  qrText: string,
-  config: PluginConfig,
-  log: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void,
-): void {
-  if (!config.qrImage || !file) return
-  qrPng(qrText)
-    .then((buffer) => {
-      if (!writePrivateFile(file, buffer)) {
-        log('qr png write failed', { file })
-        return
-      }
-      if (!config.qrOpen) return
-      const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open'
-      const args = process.platform === 'win32' ? ['/c', 'start', '', file] : [file]
-      execFile(opener, args, () => {
-        /* 打不开就算了：卡片里仍有图片路径与可粘贴的 URI */
-      })
-    })
-    .catch((error: unknown) => log('qr png render failed', { message: String((error as Error)?.message ?? error) }))
 }
 
 export { DEFAULT_CONFIG }

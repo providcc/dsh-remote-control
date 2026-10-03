@@ -6,17 +6,18 @@
  * "装载之后到底注册了什么"。外壳写错的表现是整页 web boot 失败——真机上要重启应用才看得见，
  * 所以这里用 Node 的 vm 造一个最小的浏览器环境，把产物原样执行：
  *
- *   1. 外壳注册成功、id 与包名一致、导出的是 `{name, inject, apply}`（inject 必须含 sidebarRight，
- *      否则宿主 ctx 的 Proxy 读它会抛错 → apply 失败 → 整页起不来）；
- *   2. apply 之后会把路由地址推进右栏，且**同一个 epoch 只推一次**（换码才再推）；
- *   3. 页面不可见时一次请求都不发；会话面板没挂上时静默等待；
- *   4. 任何一步出错都只记一条 console.error，绝不把异常抛出 apply；
- *   5. 状态栏那颗 pill：向装载器拿 react、往 `conversation.composer.dock` 注册、点击发码、
- *      把图与 6 位码画进面板。**拿不到 react / 探不到 slots 时只降级成"没有 pill"**——
- *      那是新功能唯一能连累已在生产的老功能（右栏自动弹码）的通道，所以每条都钉住。
+ *   1. 外壳注册成功、id 与包名一致、导出的是 `{name, inject, apply}`；
+ *   2. 状态栏那颗 pill：向装载器拿 react、软探测 `slots`、往 `conversation.composer.dock`
+ *      注册、点击发码、把图与 6 位码画进面板；
+ *   3. **任何一条依赖拿不到时只降级成"没有 pill"**：apply 绝不外抛（那会整页起不来），
+ *      并且留下一行 warn 说明缺的是哪一样；
+ *   4. 发码请求必须带宿主那道守卫要的自定义头（两半的分叉在这里对上）。
  *
- * 这里不测"右栏会不会真的打开"，也不测"那颗 pill 好不好看"——那两条是真机验收
- * （见 HANDOFF 的验收清单）。
+ * 2026-10-03 这一半原来还有一条"每 2 秒轮只读路由、把当前码推进右栏"的轮询（连同
+ * `inject: ['sidebarRight']`）。右栏方案删除后那些用例一起删了——留下的每条都指着 pill。
+ *
+ * 这里不测"那颗 pill 好不好看"、也不测"宿主的槽位会不会真的把它画出来"——那是真机验收
+ * （配方见伞仓 `docs/HOST-SIDE.md` §6.1）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -30,12 +31,10 @@ import {
   PAIR_MARKER_VALUE,
   PAIR_NEW_ROUTE,
   PAIR_STATUS_ROUTE,
-} from '../src/presentation/pair-actions.js'
-import { PAIRING_ROUTE } from '../src/presentation/route.js'
+} from '../src/presentation/pill-routes.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT = path.resolve(here, '..', 'bundle', 'client.cjs')
-const ROUTE = PAIRING_ROUTE
 
 interface ClientModule {
   name: string
@@ -45,12 +44,17 @@ interface ClientModule {
 
 interface LoadOptions {
   hidden?: boolean
-  requireThrows?: boolean
-  reply?: { body: unknown; ok?: boolean; status?: number }
-  /** 装载器能不能给出 react。缺省给不出——那是老用例的形状，也是"最坏只少一颗 pill"那条。 */
+  /** 装载器能不能给出 react。缺省给不出——"最坏只少一颗 pill"那条。 */
   react?: unknown
   /** 软探测能不能拿到 `slots` 这个服务。 */
   slots?: boolean
+  /**
+   * `slots` 只在 `flushInject()` 之后才"到"——真机就是这个形状：浏览器面 `inject` 声明是空的，
+   * 于是 `apply()` 在 web boot 那一刻就跑，而 `slots` 服务还在后面。2026-10-03 删掉右栏之后
+   * 那颗 pill 在这台机器上**整颗不出现**，就是被这个形状打中的（旧的假上下文只给同步的 `get`，
+   * 所以 262 项全绿也没抓到它）。
+   */
+  lateSlots?: boolean
   /** `ctx.get` 本身抛不抛：真 cordis 的 Proxy 读一个没声明的服务名就是**抛**。 */
   getThrows?: boolean
   /** `/status` 那条的回答。 */
@@ -63,26 +67,20 @@ interface LoadOptions {
 
 interface Harness {
   module: ClientModule
-  /** 右栏被推开的地址（按先后顺序）。 */
-  opened: string[]
   /** fetch 收到的 URL。 */
   requests: string[]
   /** 被记下来的 console.error。 */
   errors: string[]
   /** 被记下来的 console.warn——pill 那一路的降级说的是 warn，不是 error。 */
   warnings: string[]
-  /** 触发一次宿主侧节拍（第 0 个，也就是右栏那条轮询）。 */
-  tick(): void
-  /** 换掉下一次 fetch 的应答。 */
-  reply(body: unknown, init?: { ok?: boolean; status?: number }): void
-  /** 登记过的卸载函数（apply 最后注册的那一份）。 */
-  disposable(): (() => void) | undefined
-  /** 装载到现在创建的节拍个数（右栏 1 个；pill 挂了再加状态轮询与倒计时）。 */
+  /** 装载到现在创建的节拍个数（pill 挂了才有状态轮询）。 */
   timerCount(): number
   fire(index: number): void
   fireAndFlush(index: number): Promise<void>
   /** pill 注册进槽位时 `register` 收到的入参。 */
   slotRegisters(): Array<{ definition: Record<string, unknown>; component?: () => unknown }>
+  /** 只有 `lateSlots` 用：把宿主欠我们的那次 `inject(['slots'], cb)` 回调补上。 */
+  flushInject(): void
   /** 把那颗 pill 的挂载点交给它的 ref（= 宿主把它挂进 DOM）。 */
   mountPill(): FakeElement
   /** 同一个 ref 再交一次 null（= 宿主把那颗 pill 卸掉）。 */
@@ -228,33 +226,18 @@ async function flush(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function readyBody(
-  epoch: string,
-  address = 'dsh-resource://file/session/sess-1//Users/x/.dsh/a.png',
-): Record<string, unknown> {
-  return { state: 'ready', epoch, address, expiresAt: Date.now() + 60_000 }
-}
-
 /** 一颗够用的假 react：这一半只用 createElement。 */
 const FAKE_REACT = {
   createElement: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
 }
 
 function load(options: LoadOptions = {}): Harness {
-  const opened: string[] = []
   const requests: string[] = []
   const errors: string[] = []
   const warnings: string[] = []
   const timers: Array<() => void> = []
   const slotRegisters: Array<{ definition: Record<string, unknown>; component?: () => unknown }> = []
   const doc = new FakeDocument(options.hidden ? 'hidden' : 'visible')
-  // apply 一返回就会跑第一次 poll（fetch 是**同步**发出去的），所以"第一次应答"必须在这里给，
-  // 不能等 load() 返回之后再 reply —— 那时响应对象已经建好了。
-  let next: { body: unknown; ok: boolean; status: number } = {
-    body: options.reply?.body ?? { state: 'none' },
-    ok: options.reply?.ok ?? true,
-    status: options.reply?.status ?? 200,
-  }
   let spec: { id?: string; factory?: (require: unknown) => ClientModule } | undefined
 
   const sandbox: Record<string, unknown> = {
@@ -296,7 +279,7 @@ function load(options: LoadOptions = {}): Harness {
         }
       }
       assert.equal(method, 'GET', `${url} 不该收到 ${method}`)
-      return { ok: next.ok, status: next.status, json: async () => next.body }
+      return { ok: true, status: 200, json: async () => ({}) }
     },
     window: {
       __ModuleLoader__: {
@@ -327,26 +310,35 @@ function load(options: LoadOptions = {}): Harness {
       }
     : undefined
 
-  let disposable: (() => void) | undefined
-  const ctx = {
-    sidebarRight: {
-      require: () => {
-        if (options.requireThrows) throw new Error('sidebarRight: no session surface is mounted')
-        return { sessionId: 'sess-1' }
-      },
-      openResource: (address: string) => {
-        opened.push(address)
-      },
-    },
+  // 真 cordis 的 `ctx.inject(names, cb)`：cb 可能在 apply 返回之后很久才触发，
+  // 参数是一个只能读那些服务名的作用域上下文。
+  const pendingInject: Array<(scoped: unknown) => void> = []
+  const scopedContext = {
+    get: (name: string) => (name === 'slots' ? slots : undefined),
+  }
+  // 模块声明了 `inject: ['slots']`，所以真宿主上 `ctx.slots` 是直接可读的那一条
+  // （宿主自带模板同款）。`lateSlots` 时它在补注入之前必须读不到。
+  let delivered = !options.lateSlots
+  const ctx: Record<string, unknown> = {
     get: (name: string) => {
       if (options.getThrows) throw new Error(`cannot get property "${name}" without inject`)
+      if (!delivered) return undefined
       return name === 'slots' ? slots : undefined
     },
+    inject: (names: string[], callback: (scoped: unknown) => void) => {
+      if (options.lateSlots && names.includes('slots')) pendingInject.push(callback)
+      return () => undefined
+    },
     effect: (execute: () => unknown) => {
-      const returned = execute()
-      if (typeof returned === 'function') disposable = returned as () => void
+      execute()
     },
   }
+  Object.defineProperty(ctx, 'slots', {
+    get() {
+      if (options.getThrows) throw new Error('cannot get property "slots" without inject')
+      return delivered ? slots : undefined
+    },
+  })
   module.apply(ctx)
 
   /**
@@ -364,18 +356,9 @@ function load(options: LoadOptions = {}): Harness {
 
   return {
     module,
-    opened,
     requests,
     errors,
     warnings,
-    tick: () => {
-      assert.ok(timers.length >= 1, 'apply 必须起一个轮询节拍')
-      timers[0]!()
-    },
-    reply: (body: unknown, init) => {
-      next = { body, ok: init?.ok ?? true, status: init?.status ?? 200 }
-    },
-    disposable: () => disposable,
     timerCount: () => timers.length,
     fire: (index: number) => {
       assert.ok(timers[index], `第 ${index} 个节拍不存在（一共 ${timers.length} 个）`)
@@ -386,6 +369,10 @@ function load(options: LoadOptions = {}): Harness {
       await flush()
     },
     slotRegisters: () => slotRegisters,
+    flushInject(): void {
+      delivered = true
+      for (const callback of pendingInject.splice(0)) callback(scopedContext)
+    },
     mountPill(): FakeElement {
       const element = doc.createElement('span')
       pillRef()(element)
@@ -398,98 +385,34 @@ function load(options: LoadOptions = {}): Harness {
   }
 }
 
-test('外壳注册的形状：id 与包名一致，导出 name/inject/apply，inject 含 sidebarRight', () => {
+test('外壳注册的形状：id 与包名一致，导出 name/inject/apply；inject 声明 slots（宿主模板同款）', () => {
   const harness = load()
   assert.equal(harness.module.name, 'dsh-remote-control')
   // 展开一次：vm 那个 realm 的数组与本 realm 的 Array.prototype 不是同一个，
   // deepStrictEqual 会因原型不同而红（与代码对错无关）。
-  assert.deepEqual([...harness.module.inject], ['sidebarRight'])
+  assert.deepEqual(
+    [...harness.module.inject],
+    ['slots'],
+    '这条声明决定激活时机：空列表时 apply 跑在槽位服务之前，那颗 pill 整颗不出现（2026-10-03 真机）',
+  )
   assert.equal(typeof harness.module.apply, 'function')
   assert.equal(harness.errors.length, 0)
 })
 
-test('有码就推右栏，地址原样来自路由；同一个 epoch 只推一次，换码再推', async () => {
-  const harness = load({ reply: { body: readyBody('e1') } })
+test('拿不到 react：一颗 pill 都不注册，apply 不外抛，且留下一行说得清的 warn', async () => {
+  const harness = load()
   await flush()
-  assert.deepEqual(harness.requests, [`${ROUTE}?session=sess-1`])
-  assert.deepEqual(harness.opened, ['dsh-resource://file/session/sess-1//Users/x/.dsh/a.png'])
-
-  harness.tick()
-  await flush()
-  assert.equal(harness.opened.length, 1, '同一版码不该重复顶开右栏')
-
-  harness.reply(readyBody('e2', 'dsh-resource://file/session/sess-1//Users/x/.dsh/b.png'))
-  harness.tick()
-  await flush()
-  assert.deepEqual(harness.opened[1], 'dsh-resource://file/session/sess-1//Users/x/.dsh/b.png')
-})
-
-test('没有码 / 已过期 / state 不认识：一次都不推', async () => {
-  const harness = load({ reply: { body: { state: 'none' } } })
-  await flush()
-  harness.reply({ state: 'ready', epoch: 'e9', address: 'x', expiresAt: Date.now() - 1 })
-  harness.tick()
-  await flush()
-  assert.deepEqual(harness.opened, [])
-  assert.equal(harness.errors.length, 0)
-})
-
-test('页面不可见时一次请求都不发（Electron 里窗口在后台是常态）', async () => {
-  const harness = load({ hidden: true, reply: { body: readyBody('e1') } })
-  await flush()
-  harness.tick()
-  await flush()
-  assert.deepEqual(harness.requests, [])
-  assert.deepEqual(harness.opened, [])
-})
-
-test('会话面板还没挂上（require 抛错）：静默等下一轮，不当故障记', async () => {
-  const harness = load({ requireThrows: true, reply: { body: readyBody('e1') } })
-  await flush()
-  harness.tick()
-  await flush()
-  assert.deepEqual(harness.requests, [])
-  assert.equal(harness.errors.length, 0, '这是正常的启动态，不该刷日志')
-})
-
-test('路由报错：只记一条 console.error，并把状态码带出来', async () => {
-  const harness = load({ reply: { body: { error: 'boom' }, ok: false, status: 500 } })
-  await flush()
-  assert.ok(
-    harness.errors.some((line) => line.includes('500')),
-    harness.errors.join('\n'),
-  )
-  assert.deepEqual(harness.opened, [])
-})
-
-test('卸载函数被登记：调用它之后节拍停掉（再 tick 也不发请求）', async () => {
-  const harness = load({ reply: { body: readyBody('e1') } })
-  await flush()
-  const dispose = harness.disposable()
-  assert.equal(typeof dispose, 'function', '必须用 ctx.effect 登记卸载')
-  dispose!()
-  const requestsBefore = harness.requests.length
-  harness.tick()
-  await flush()
-  assert.equal(harness.requests.length, requestsBefore, '停掉之后不该再发请求')
-})
-
-// ── 状态栏那颗 pill ────────────────────────────────────────────────
-
-test('拿不到 react：只少一颗 pill，右栏那半照常推地址、一条 error 都不许有', async () => {
-  const harness = load({ reply: { body: readyBody('e1') } })
-  await flush()
-  assert.deepEqual(harness.opened, ['dsh-resource://file/session/sess-1//Users/x/.dsh/a.png'], '老功能不能被新功能连累')
   assert.equal(harness.slotRegisters().length, 0, '没有 react 就不该去碰槽位')
-  assert.equal(harness.errors.length, 0)
+  assert.equal(harness.errors.length, 0, '这是降级，不是故障')
+  assert.equal(harness.timerCount(), 0, 'pill 没起来就不该留节拍')
   assert.ok(
     harness.warnings.some((line) => line.includes('react')),
     `降级要留下能查的一句：${harness.warnings.join(' | ')}`,
   )
 })
 
-test('探不到 slots（这代宿主没这个服务）：同样只降级，右栏照旧', async () => {
-  const harness = load({ react: FAKE_REACT, reply: { body: readyBody('e1') } })
+test('探不到 slots（这代宿主没这个服务）：同样只降级，并指名是没探到 slots', async () => {
+  const harness = load({ react: FAKE_REACT })
   await flush()
   assert.equal(harness.slotRegisters().length, 0)
   assert.equal(harness.errors.length, 0)
@@ -497,15 +420,30 @@ test('探不到 slots（这代宿主没这个服务）：同样只降级，右�
     harness.warnings.some((line) => line.includes('slots')),
     `要指名是没探到 slots：${harness.warnings.join(' | ')}`,
   )
-  assert.deepEqual(harness.opened, ['dsh-resource://file/session/sess-1//Users/x/.dsh/a.png'])
 })
 
-test('软探测不许抛出 apply：ctx.get 抛（真 cordis 的 Proxy 就是这个形状）时右栏照旧', async () => {
-  const harness = load({ react: FAKE_REACT, getThrows: true, reply: { body: readyBody('e1') } })
+test('slots 晚到（真机形状：apply 时拿不到，注入回调之后才有）：pill 必须补挂上，而不是永久没有', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, lateSlots: true })
+  await flush()
+  assert.equal(harness.slotRegisters().length, 0, 'apply 那一刻还没拿到 slots，不该已经注册')
+  harness.flushInject()
+  await flush()
+  assert.equal(
+    harness.slotRegisters().length,
+    1,
+    '晚到的 slots 必须把那颗 pill 补挂上：浏览器面不声明任何 inject，于是 apply 早于服务到位是常态——' +
+      '2026-10-03 删掉右栏之后，这台机器上那颗 pill 整颗不出现就是这个形状打的',
+  )
+  const root = harness.mountPill()
+  await flush()
+  assert.ok(root.find('drc-pill'), `补挂之后按钮要建得出来：${root.allText()}`)
+})
+
+test('软探测不许抛出 apply：ctx.get 抛（真 cordis 的 Proxy 就是这个形状）时只降级', async () => {
+  const harness = load({ react: FAKE_REACT, getThrows: true })
   await flush()
   assert.equal(harness.errors.length, 0, `抛出 apply 就是整页起不来：${harness.errors.join(' | ')}`)
   assert.equal(harness.slotRegisters().length, 0)
-  assert.deepEqual(harness.opened, ['dsh-resource://file/session/sess-1//Users/x/.dsh/a.png'])
 })
 
 test('注册进 conversation.composer.dock：槽位名、id、order 都要对', async () => {
@@ -538,6 +476,24 @@ test('中继没连上时说的是"远程未连接"，不许假装有得配', asy
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'off')
 })
 
+test('runtime 还没起来时说"远程未启动"：idle 与 offline 是两件事', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'idle', paired: 0, hasCode: false } })
+  const root = harness.mountPill()
+  await flush()
+  assert.equal(root.find('drc-label')!.textContent, '远程未启动')
+})
+
+test('页面不可见时不轮状态（Electron 里窗口在后台是常态）', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, hidden: true })
+  harness.mountPill()
+  await flush()
+  assert.equal(
+    harness.requests.filter((url) => url.startsWith(PAIR_STATUS_ROUTE)).length,
+    0,
+    `不可见时一次都不该发：${harness.requests.join(' | ')}`,
+  )
+})
+
 test('点击：POST 发码那条，再把图与 6 位码画进面板；epoch 进图片 URL', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
@@ -566,6 +522,20 @@ test('200 + state:"unavailable" 不是成功：面板要说明白，不许弹一
   assert.equal(root.find('drc-qr'), undefined, '没有码就不该有那张图')
   assert.match(root.find('drc-note')!.textContent, /中继还没连上/)
   assert.ok(root.find('drc-btn'), '要给一句"再试一次"，别让人以为插件坏了')
+})
+
+test('守卫拒了就把是哪一道印在屏幕上：那是浏览器面唯一的现场', async () => {
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { error: 'request-not-trusted', guard: 'pair-marker-missing' },
+  })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  assert.match(root.find('drc-note')!.textContent, /request-not-trusted/, '要把宿主说的原因带出来')
+  assert.match(root.find('drc-note')!.textContent, /pair-marker-missing/, '更要带出是哪一道守卫')
 })
 
 test('发码那条直接断（fetch 抛）：面板显示失败原因，不抛出、不白屏', async () => {
@@ -612,9 +582,9 @@ test('码的寿命走完会自动再要一张（幂等入口此刻才会真的�
   root.find('drc-pill')!.emit('click')
   await flush()
   assert.equal(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length, 1)
-  // 节拍次序：0 = 右栏轮询，1 = pill 状态轮询，2 = 面板倒计时。
-  assert.equal(harness.timerCount(), 3, '该有三个节拍')
-  await harness.fireAndFlush(2)
+  // 节拍次序：0 = pill 状态轮询，1 = 面板倒计时。
+  assert.equal(harness.timerCount(), 2, '该有两个节拍')
+  await harness.fireAndFlush(1)
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
     2,
@@ -635,17 +605,17 @@ test('卸载（宿主把 pill 摘掉）之后节拍停、文档监听摘干净',
 
   harness.unmountPill()
   const after = harness.requests.length
-  await harness.fireAndFlush(1)
+  await harness.fireAndFlush(0)
   assert.equal(harness.requests.length, after, '卸载后不该再轮状态')
   assert.equal(doc.listenerCount('pointerdown'), 0, '文档级监听必须摘掉，否则每次重挂都多一份')
 })
 
 test('反证：产物里的路由常量与宿主侧定义逐字一致（分叉的表现是"点了没反应而日志全绿"）', () => {
   const bundle = readFileSync(CLIENT, 'utf8')
-  for (const constant of [ROUTE, PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE]) {
+  for (const constant of [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_MARKER_HEADER]) {
     assert.ok(bundle.includes(constant), `client.cjs 里缺 ${constant}`)
   }
   // 出现一条宿主侧没有的 /plugins 路径就是两边分叉了。
   const found = [...new Set([...bundle.matchAll(/\/plugins\/[a-z0-9./-]+/g)].map((match) => match[0]))].sort()
-  assert.deepEqual(found, [ROUTE, PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE].sort())
+  assert.deepEqual(found, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE].sort())
 })

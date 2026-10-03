@@ -117,8 +117,8 @@ for (const [ok, message] of shape) {
     process.exit(1)
   }
 }
-if (!clientText.includes('sidebarRight')) {
-  console.error('[bundle-plugin] client.cjs 里看不到 sidebarRight，八成是打包入口写错了')
+if (!clientText.includes('conversation.composer.dock')) {
+  console.error('[bundle-plugin] client.cjs 里看不到那个槽位名，八成是打包入口写错了（pill 没进 bundle？）')
   process.exit(1)
 }
 // 状态栏那颗 pill 要向装载器拿 react。它**必须**是运行期那一句（模块名走变量），

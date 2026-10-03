@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
-import { pairingImagePath, StatusFile, writePrivateFile } from '../src/shell/status.js'
+import { StatusFile, writePrivateFile } from '../src/shell/status.js'
 import { DEFAULT_SYSTEM_CLOCK, FakeClock } from '../src/core/clock.js'
 import { redact } from '../src/shell/config.js'
 
@@ -249,28 +249,7 @@ test('嵌套字段（pairing / keepAwake / kernel）必须原样落地：那是�
   }
 })
 
-test('pairingImagePath：会话工作区的 .dsh，解析不出工作区才退回 ~/.dsh，空串表示关闭', () => {
-  assert.equal(pairingImagePath(''), '', 'statusFile 为空时二维码路径也必须为空，否则 PNG 会写到进程 CWD')
-  assert.equal(
-    pairingImagePath('/home/u/.dsh/dsh-remote-control/status.json', '/Users/u/project'),
-    path.join('/Users/u/project', '.dsh', 'pairing-qr.png'),
-    '有工作区就落在工作区的 .dsh 下：2026-10-02 用户拍板"要工作区的 .dsh，不是 home 下的 .dsh"',
-  )
-  assert.equal(
-    pairingImagePath('/home/u/.dsh/dsh-remote-control/status.json'),
-    path.join(homedir(), '.dsh', 'pairing-qr.png'),
-    '解析不出会话工作区时退回 ~/.dsh 根部（而不是埋进 ~/.dsh/dsh-remote-control/ 实现目录）',
-  )
-  for (const bogus of ['', undefined]) {
-    assert.equal(
-      pairingImagePath('status.json', bogus),
-      path.join(homedir(), '.dsh', 'pairing-qr.png'),
-      `工作区为空（${String(bogus)}）时必须退回 home，而不是拼出一个相对路径写到进程 CWD`,
-    )
-  }
-})
-
-test('writePrivateFile 也是 0600：里面躺着一张仍然有效的配对二维码', () => {
+test('writePrivateFile 也是 0600：status.json 里可能躺着一张仍然有效的配对码', () => {
   const { dir, cleanup } = tempDir()
   try {
     const png = path.join(dir, 'sub', 'pairing-qr.png')

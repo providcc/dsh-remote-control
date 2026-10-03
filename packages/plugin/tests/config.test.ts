@@ -199,25 +199,35 @@ test('redact() 不许泄露 token：短 token 全打星，长 token 只留前 4 
   assert.equal(redact('fakefake'), '****', '边界值 8 个字符必须全打星')
 })
 
-test('qrStyle 非法值不猜、保留上层值：把非法样式悄悄换成别的样式，等于运维写了没生效还不知道', () => {
-  assert.equal(readConfig(undefined, { DRC_QR_STYLE: 'block' }).qrStyle, 'block', '合法值要透过去')
-  assert.equal(readConfig(undefined, { DRC_QR_STYLE: 'half' }).qrStyle, 'half', 'half 是默认的紧凑样式')
-  assert.equal(readConfig(undefined, {}).qrStyle, 'half', '什么都没设时是 half（文本二维码是主路径）')
-  for (const garbage of ['svg', 'ASCII', 'unicode', 'svg,png']) {
-    const config = readConfig({ qrStyle: 'block' }, { DRC_QR_STYLE: garbage })
-    assert.equal(
-      config.qrStyle,
-      'block',
-      `DRC_QR_STYLE=${JSON.stringify(garbage)} 非法时必须保留上层值，而不是换成一个没人写过的样式`,
-    )
-  }
-  // 非法值要有人说话：静默保留上层值 = 运维以为改了但其实没改。
-  const injected = base({ qrStyle: 'svg' as unknown as 'ascii' })
-  assert.ok(
-    validateConfig(injected).some((problem) => problem.field === 'qrStyle'),
-    '非法 qrStyle 必须 warn',
+test('pill.enabled 默认开；关掉它不是错误，但配对入口的代价必须由 index.ts 说话', () => {
+  assert.equal(DEFAULT_CONFIG.pill.enabled, true, '配对的唯一入口默认必须开着')
+  assert.equal(readConfig(undefined, {}).pill.enabled, true, '什么都没设时也是开')
+  assert.equal(readConfig({ pill: { enabled: false } }, {}).pill.enabled, false, 'patch 里能关')
+  // 关掉它 config 层不报 error 也不报 warn——那是 index.ts 的职责（它才知道路由到底挂没挂上）。
+  assert.equal(
+    validateConfig(readConfig({ pill: { enabled: false } }, {})).some((problem) => problem.field.startsWith('pill')),
+    false,
+    '这里不该重复报一遍；报的地方要能指到 probe',
   )
-  assert.equal(injected.qrStyle, 'half', 'warn 之后夹回默认样式，渲染层才不会拿到不认识的样式')
+})
+
+test('已经删掉的键必须报出来，不许静默失效：这些键写在用户的 profile 里', () => {
+  // 2026-10-03 随"右栏自动弹码"与"终端文本码"两案删除的键。
+  const injected = {
+    sidebarQr: { enabled: false },
+    qrImage: false,
+    qrOpen: true,
+    qrAnsi: true,
+    qrStyle: 'half',
+  } as unknown as Partial<PluginConfig>
+  const problems = validateConfig(readConfig(injected, {}))
+  const reported = problems.filter((problem) => problem.level === 'warn').map((problem) => problem.field)
+  for (const key of ['sidebarQr', 'qrImage', 'qrOpen', 'qrAnsi', 'qrStyle']) {
+    assert.ok(reported.includes(key), `${key} 还留在 patch 里却没人说话：${JSON.stringify(reported)}`)
+  }
+  // 改名那条要说清现在叫什么，否则用户会去翻一个不存在的键。
+  const renamed = problems.find((problem) => problem.field === 'sidebarQr')
+  assert.match(String(renamed?.message), /pill/, 'sidebarQr 的提示必须指向 pill')
 })
 
 test('布尔型环境变量只认显式的 1/0：拼错的值不许把功能打开或关掉', () => {
@@ -227,8 +237,11 @@ test('布尔型环境变量只认显式的 1/0：拼错的值不许把功能打�
     true,
     '文档约定的开关是 =1，0 只表示"没打开"，不许把 patch 里的设置反掉',
   )
-  assert.equal(readConfig({ qrImage: true }, { DRC_QR_IMAGE: '0' }).qrImage, false, 'DRC_QR_IMAGE=0 必须关掉 PNG 落盘')
-  assert.equal(readConfig({ qrOpen: true }, { DRC_QR_OPEN: '0' }).qrOpen, false, 'DRC_QR_OPEN=0 必须关掉"自动打开"')
+  assert.equal(
+    readConfig({ pill: { enabled: true } }, { DRC_PILL: '0' }).pill.enabled,
+    false,
+    'DRC_PILL=0 必须关掉配对入口',
+  )
   assert.equal(
     readConfig({ takeOverQuestions: true }, { DRC_TAKE_OVER_QUESTIONS: '1' }).takeOverQuestions,
     true,
@@ -284,9 +297,9 @@ test('DRC_PAIR_ON_START_SEC 的非数字值折成 0（关）：绝不能折成 N
     '空串被当成 0 会静默关掉自动发码',
   )
   assert.equal(
-    readConfig({ qrStyle: 'block' }, { DRC_QR_STYLE: '' }).qrStyle,
-    'block',
-    '空串同样不该覆盖 patch 里的样式',
+    readConfig({ pill: { enabled: false } }, { DRC_PILL: '' }).pill.enabled,
+    false,
+    '空串同样不该覆盖 patch 里的设置',
   )
 })
 
@@ -330,55 +343,19 @@ test('一份典型配置在合法输入下不该有任何 error：否则插件�
 })
 
 /**
- * 配对二维码的呈现默认值是一条拍板，2026-10-02 翻转：
- * 真机取证发现 DSH 命令卡按 `line-height:1.6` 渲染等宽输出，行间留白把半块二维码
- * 横切成条（zxing ≥1.15 行距即失败），文本码在唯一宿主上扫不出来——于是默认产物改成图片。
- * **仍然不许把用户赶到 DSH 外面去"看预览"**：`qrOpen` 保持关（写图 ≠ 替用户开查看器）。
- * 这条断言存在的意义是：哪天有人把 `qrOpen` 默认打开、或把关掉的文本默认改回来，测试会拦住他。
+ * DRC_PILL 与其余布尔开关同一条规矩：只认显式的 1/0/true/false，其余值不猜、退回上层。
+ *
+ * 顺带钉住"为什么不再有 qrImage/qrOpen/qrAnsi/qrStyle"：配对二维码只剩 pill 那一条出口
+ * （`GET /pairing.png` 现渲染），文本码在唯一宿主上扫不出来的取证写在 `src/platform/qr.ts`
+ * 文件头——那套键删了就不会回来，这里只保证**残留的旧键会 warn**（见上面那条）。
  */
-test('二维码默认出图片（qrImage 开）、但不自动打开（qrOpen 关）；qrAnsi 关、样式 half', () => {
-  assert.equal(DEFAULT_CONFIG.qrImage, true, '文本码在 DSH 命令卡里扫不出来（行高把它切条），默认必须出图片')
-  assert.equal(DEFAULT_CONFIG.qrOpen, false, '默认调用系统打开图片：配对动作被搬到了宿主外面')
-  assert.equal(DEFAULT_CONFIG.qrAnsi, false, '默认套 ANSI：宿主按纯文本渲染时会把转义序列打成乱码')
-  assert.equal(DEFAULT_CONFIG.qrStyle, 'half', '默认文本样式仍是半块（供关了图片时当退路）')
-})
-
-test('qr* 三个开关的环境变量只认 1/0/true/false，其余值退回上层值（不猜）', () => {
+test('DRC_PILL 只认 1/0/true/false：拼错的值不许把配对入口悄悄关掉', () => {
+  assert.equal(readConfig(undefined, { DRC_PILL: '0' }).pill.enabled, false, '=0 要能关掉（默认是开）')
+  assert.equal(readConfig(undefined, { DRC_PILL: 'false' }).pill.enabled, false, 'false 也认')
+  assert.equal(readConfig(undefined, { DRC_PILL: '1' }).pill.enabled, true, '=1 幂等打开')
   assert.equal(
-    readConfig(undefined, { DRC_QR_IMAGE: '1' }).qrImage,
-    true,
-    'DRC_QR_IMAGE=1 要能把图片打开（默认已是开，这里要幂等）',
-  )
-  assert.equal(readConfig({ qrImage: true }, { DRC_QR_IMAGE: '0' }).qrImage, false, '=0 要能关掉 patch 里开的值')
-  assert.equal(
-    readConfig({ qrAnsi: true }, { DRC_QR_ANSI: 'yes' }).qrAnsi,
-    true,
-    '无法识别的值必须退回上层值，而不是静默变成关',
-  )
-  assert.equal(
-    readConfig({ qrStyle: 'block' }, { DRC_QR_STYLE: 'fancy' }).qrStyle,
-    'block',
-    '非法样式在 readConfig 阶段不猜',
-  )
-  const injected = base({ qrStyle: 'fancy' as unknown as 'ascii' })
-  const problems = validateConfig(injected)
-  assert.equal(injected.qrStyle, 'half', '非法 qrStyle 要在 validateConfig 里夹回并留痕')
-  assert.ok(
-    problems.some((problem) => problem.field === 'qrStyle'),
-    '夹回必须 warn',
-  )
-})
-
-test('qrOpen 而 qrImage 关着是无效组合：要 warn（关了图片就没有文件可开）', () => {
-  const problems = validateConfig(base({ qrImage: false, qrOpen: true }))
-  const warn = problems.find((problem) => problem.field === 'qrOpen')
-  assert.ok(
-    warn && warn.level === 'warn',
-    `这个组合什么都没打开，却没人告诉运维：${JSON.stringify(problems.map((problem) => problem.field))}`,
-  )
-  assert.equal(
-    validateConfig(base({ qrImage: true, qrOpen: true })).some((problem) => problem.field === 'qrOpen'),
+    readConfig({ pill: { enabled: false } }, { DRC_PILL: 'maybe' }).pill.enabled,
     false,
-    '两个都开是合法组合，不该刷屏',
+    '无法识别的值必须退回上层值，而不是静默变成关（或开）',
   )
 })

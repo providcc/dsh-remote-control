@@ -1,10 +1,11 @@
 /**
- * presentation-pair-actions.test — 状态栏 pill 那三条路由的判据。
+ * presentation-pill-routes.test — 状态栏那颗 pill 那三条路由的判据。
  *
- * 这三条与右栏那条**不同一档安全姿态**，所以断言也各自一份：
- * `POST /pairing/new` 会改状态（向中继申请一张新码），因此额外要求一个只有同源脚本发得出的
- * 自定义头 `x-drc-pair: 1`（Origin 缺席**不**是拒的理由——桌面宿主转发时会把它删掉，真机量过）；
- * `GET /pairing.png` 与 `GET /status` 只读，Origin 缺席放过，但 Host 仍必须环回。
+ * 三条路由分两档安全姿态（动机写在 `src/presentation/pill-routes.ts` 文件头）：
+ * `POST /pairing/new` 会改状态（向中继申请一张新码），跨站判据是只有同源脚本发得出的
+ * 自定义头 `x-drc-pair: 1`——**不是** `Origin`：桌面宿主的转发层会把它删掉，这一条是
+ * 2026-10-03 在真屏幕上点出来才发现的。`GET /pairing.png` 与 `GET /status` 只读，
+ * Origin 缺席放过，但 Host 仍必须环回。
  *
  * 最重要的一条不是"能发码"，而是**响应里绝不能出现凭据**：`psk` 与完整 `qr` URI
  * 一旦经这条路由出去，就等于把"PSK 从不上网"这条红线（D1）从浏览器面捅了个洞。
@@ -14,31 +15,35 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
+  pairingEpoch,
   PAIR_IMAGE_ROUTE,
   PAIR_NEW_ROUTE,
   PAIR_STATUS_ROUTE,
   pairImageHandler,
   pairNewHandler,
   pillStatusHandler,
-  registerPairActionRoutes,
+  registerPillRoutes,
   type LivePairing,
-  type PairActionDeps,
-} from '../src/presentation/pair-actions.js'
-import { pairingEpoch } from '../src/presentation/presenter.js'
+  type PillRouteDeps,
+} from '../src/presentation/pill-routes.js'
 
 const FAKE_PSK = 'A'.repeat(64)
 const FAKE_TOKEN = '482913'
 const FAKE_QR = `dshr:/p?v=1&s=ws://relay&n=host&psk=${FAKE_PSK}&t=${FAKE_TOKEN}`
+/** PNG 的八个魔数字节——图片路由现在自己渲染，判据只能落在字节上。 */
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
 interface Reply {
   status: number
   headers: Record<string, unknown>
   body: string
+  /** 原样的字节。图片路由现在自己渲染，判据只能落在字节上，不能落在 utf8 转码后的字符串上。 */
+  raw: Buffer
   ended: boolean
 }
 
 function response(): { res: ServerResponse; reply: () => Reply } {
-  const captured: Reply = { status: 0, headers: {}, body: '', ended: false }
+  const captured: Reply = { status: 0, headers: {}, body: '', raw: Buffer.alloc(0), ended: false }
   const res = {
     writeHead(status: number, headers?: Record<string, unknown>) {
       captured.status = status
@@ -46,7 +51,13 @@ function response(): { res: ServerResponse; reply: () => Reply } {
       return res
     },
     end(chunk?: unknown) {
-      captured.body = typeof chunk === 'string' ? chunk : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : ''
+      if (Buffer.isBuffer(chunk)) {
+        captured.raw = chunk
+        captured.body = chunk.toString('utf8')
+      } else {
+        captured.raw = Buffer.from(typeof chunk === 'string' ? chunk : '')
+        captured.body = typeof chunk === 'string' ? chunk : ''
+      }
       captured.ended = true
       return res
     },
@@ -65,7 +76,7 @@ function request(method: string, headers: Record<string, string> = {}): Incoming
  */
 const LOOPBACK = { host: '127.0.0.1:19387', 'x-drc-pair': '1' }
 
-function deps(over: Partial<PairActionDeps> = {}): PairActionDeps & { calls: { ensure: number; current: number } } {
+function deps(over: Partial<PillRouteDeps> = {}): PillRouteDeps & { calls: { ensure: number; current: number } } {
   const calls = { ensure: 0, current: 0 }
   const live: LivePairing = { qr: FAKE_QR, token: FAKE_TOKEN, expiresAt: Date.now() + 60_000 }
   return {
@@ -78,7 +89,6 @@ function deps(over: Partial<PairActionDeps> = {}): PairActionDeps & { calls: { e
       calls.current += 1
       return live
     },
-    renderPng: async () => Buffer.from('png-bytes'),
     status: () => ({ relay: 'online', paired: 1, hasCode: true }),
     log: () => {},
     ...over,
@@ -193,7 +203,7 @@ test('中继不在线：200 + state:"unavailable"，不是 500（pill 要能显�
 
 // ── GET /pairing.png ────────────────────────────────────────────────
 
-test('有码时图片路由回 PNG + no-store + ETag 是这一版的 epoch', async () => {
+test('有码时图片路由**真的渲染出**一张 PNG：魔数字节 + Content-Length + no-store + ETag 是这一版的 epoch', async () => {
   const d = deps()
   const { res, reply } = response()
   await pairImageHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -202,8 +212,10 @@ test('有码时图片路由回 PNG + no-store + ETag 是这一版的 epoch', asy
   assert.equal(got.headers['Content-Type'], 'image/png')
   assert.equal(got.headers['Cache-Control'], 'no-store', '一张码会被就地换掉，缓存等于弹窗里停在废码上')
   assert.equal(got.headers.ETag, `"${pairingEpoch(FAKE_QR)}"`)
-  assert.equal(got.body, 'png-bytes')
+  assert.ok(got.raw.subarray(0, 8).equals(PNG_MAGIC), '必须是真 PNG 字节，不是"某个回调给的东西"')
+  assert.equal(Number(got.headers['Content-Length']), got.raw.length, 'Content-Length 与字节数不一致会被截断')
   assert.equal(d.calls.ensure, 0, '看图不许顺手发码')
+  assert.equal(d.calls.current, 1, '看图只问"当前有没有"，绝不问幂等入口——那等于顺手发码')
 })
 
 test('没有效码 → 204（路由在、只是现在没码），不是 404', async () => {
@@ -231,19 +243,19 @@ test('HEAD 不写 body（宿主可能用它探活）', async () => {
   const { res, reply } = response()
   await pairImageHandler(d)(request('HEAD', { host: '127.0.0.1:19387' }), res)
   assert.equal(reply().status, 200)
-  assert.equal(reply().body, '')
+  assert.equal(reply().raw.length, 0, 'HEAD 连一个字节都不该写出去')
 })
 
 test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async () => {
+  // 不注入假渲染器了——渲染就在路由里，那就用一份**真的编不出来**的码：
+  // QR 的容量上限远小于这个长度，node-qrcode 会抛"code length overflow"。
   const d = deps({
-    renderPng: () => {
-      throw new Error('boom'.repeat(200))
-    },
+    current: () => ({ qr: 'x'.repeat(20_000), token: FAKE_TOKEN, expiresAt: Date.now() + 60_000 }),
   })
   const { res, reply } = response()
   await pairImageHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
   assert.equal(reply().status, 500)
-  assert.ok((JSON.parse(reply().body).error as string).length <= 200)
+  assert.ok((JSON.parse(reply().body).error as string).length <= 200, '原因要截断，不许把整段栈喷出去')
 })
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
@@ -310,10 +322,27 @@ test('注册挂上三条、注销把三条都摘掉', () => {
       }
     },
   }
-  const unregister = registerPairActionRoutes(web as never, deps())
+  const unregister = registerPillRoutes(web as never, deps())
   assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE])
   unregister()
   assert.equal(off, 3)
+})
+
+test('第二条挂不上时，第一条必须被回滚掉：半途失败不许在宿主上留下摘不走的路由', () => {
+  const registered: string[] = []
+  let off = 0
+  const web = {
+    register: (route: { path: string }) => {
+      registered.push(route.path)
+      if (registered.length === 2) throw new Error('这条路径宿主不给挂')
+      return () => {
+        off += 1
+      }
+    },
+  }
+  assert.throws(() => registerPillRoutes(web as never, deps()), /宿主不给挂/, '原始错误要抛回去，让上层留痕')
+  assert.equal(registered.length, 2, '确实只挂上第一条就失败了')
+  assert.equal(off, 1, '第一条必须被注销掉——否则它永久留在宿主上，重载之后谁都挂不上那条')
 })
 
 test('一条注销抛错不许让其余留在宿主上', () => {
@@ -324,7 +353,7 @@ test('一条注销抛错不许让其余留在宿主上', () => {
       if (off === 1) throw new Error('宿主已经先拆了')
     },
   }
-  const unregister = registerPairActionRoutes(web as never, deps())
+  const unregister = registerPillRoutes(web as never, deps())
   assert.doesNotThrow(() => unregister())
   assert.equal(off, 3, '后两条必须仍然被调用')
 })

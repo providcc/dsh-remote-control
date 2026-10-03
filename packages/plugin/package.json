@@ -1,7 +1,7 @@
 {
   "name": "dsh-remote-control",
   "version": "1.1.0",
-  "description": "DSH Remote Control host plugin: pairs a running DeepSeek Harness with the DRC relay so a WeChat Mini Program can send prompts, watch streamed output, and answer approvals. Payload-level E2E encryption; the relay never sees plaintext. Also renders the pairing QR into the DSH right sidebar (same-origin read-only route + browser half).",
+  "description": "DSH Remote Control host plugin: pairs a running DeepSeek Harness with the DRC relay so a WeChat Mini Program can send prompts, watch streamed output, and answer approvals. Payload-level E2E encryption; the relay never sees plaintext. Pairing is one click on the status-bar pill (three same-origin routes + a browser half).",
   "type": "module",
   "license": "MIT",
   "author": "providcc",
@@ -54,7 +54,7 @@
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p client/tsconfig.json",
-    "build": "tsc -p tsconfig.json && tsc -p client/tsconfig.json && node ../../scripts/bundle-plugin.mjs",
+    "build": "pnpm clean && tsc -p tsconfig.json && tsc -p client/tsconfig.json && node ../../scripts/bundle-plugin.mjs",
     "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

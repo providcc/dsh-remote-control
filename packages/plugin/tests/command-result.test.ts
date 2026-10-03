@@ -20,9 +20,10 @@
  *      `normalizeResult`。复刻件自身先用 `{kind:'text'}` 做反证（见"带牙"那条），
  *      确保它不是"永远返回 ok"的空壳。
  *
- * 覆盖分工：离线 `pair`（PAIR_UNAVAILABLE_TEXT）、`status`、`unpair` 三个返回点在本文件；
- * 在线 `pair`（真的渲染二维码文本）在 `e2e/run.mjs`（那里有真中继，relay 是 online）。
- * 四个 `kind:'success'` 返回点因此全部落到过断言。
+ * 覆盖分工：`status`、`unpair`、以及"打字习惯还留在 `/drc pair` 上的人拿到什么"这三个返回点
+ * 在本文件——每个返回点都必须过一遍宿主那个 kind 校验，因为这条契约破过的现场就是
+ * "命令整个失败"（见文件头）。`pair` 子命令本身在 2026-10-03 删了：配对唯一入口是状态栏那颗
+ * pill，命令行再发一张会绕过它的幂等语义（多码事故的原样）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -30,7 +31,6 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply, type CommandResult } from '../src/index.js'
-import { PAIR_UNAVAILABLE_TEXT } from '../src/shell/pairing-text.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
@@ -113,8 +113,6 @@ function bootCommandHost(): { definition: RegisteredDefinition; dispose: () => v
     statusFile: path.join(statusDir, 'status.json'),
     mockBridge: false,
     pairOnStartSec: 0,
-    qrImage: false,
-    qrOpen: false,
   })
   const definition = registered.drc
   assert.ok(definition, 'apply() 必须把名为 drc 的命令注册进 ctx.commands')
@@ -151,18 +149,22 @@ test('复刻件带牙：{kind:"text"} 必须被拒，且报错就是事故那一
   assert.deepEqual(harnessNormalizeResult('drc', { kind: 'error', text: '不行' }), { kind: 'error', text: '不行' })
 })
 
-test('离线 pair：handler 返回的 result 过得了宿主 normalizeResult（事故点）', async (t) => {
+test('打字习惯还留在 `/drc pair` 上的人：拿到状态快照，且命令行不再发出任何配对凭据', async (t) => {
   const host = bootCommandHost()
   t.after(host.dispose)
   const raw = await host.definition.handler({ commandId: 'cmd-1', rawInput: 'pair' })
   // 先过契约校验：这一行若红，就是用户看到的 `unknown result kind` 又回来了。
   const result = harnessNormalizeResult('drc', raw)
   assert.equal(result.kind, 'success', 'kind 必须是 success（旧实现写的 text 会被宿主抛错）')
-  assert.equal(
-    (result as { text?: string }).text,
-    PAIR_UNAVAILABLE_TEXT,
-    '中继离线时必须是那句可操作的提示，而不是空串或栈',
-  )
+  const text = (result as { text?: string }).text ?? ''
+  // `pair` 已经不是子命令，落到默认那条 = 状态快照。断"是 JSON"而不是断"含某个词"：
+  // 说明文字会改，快照形状才是这条分支的身份。
+  const snapshot = JSON.parse(text) as Record<string, unknown>
+  assert.ok('relay' in snapshot && 'pill' in snapshot, `应当是状态快照：${text.slice(0, 160)}`)
+  // 关键判据：**命令行没有发出第二张码**。这条 fixture 的中继根本不可达，
+  // 一旦有人把发码逻辑塞回来，这里就会出现一张码或一句"中继还没连上"。
+  assert.doesNotMatch(text, /dshr:|psk/, '命令行不许再把配对凭据印出来')
+  assert.doesNotMatch(text, /配对码 \d{6}/, '发码那句不该再出现在命令行的任何输出里')
 })
 
 test('status：handler 返回的 result 是 success + 可 JSON.parse 的快照', async (t) => {

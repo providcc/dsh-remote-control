@@ -32,18 +32,23 @@ export interface PluginConfig {
   pairOnStartSec: number
   /** 向中继申请 PSK 有效期；服务端权威值会覆盖它（见 transport/relay.ts）。 */
   pairTtlMs: number
-  /** 是否把配对二维码写成 PNG（默认**开**：文本二维码在 DSH 命令卡里扫不出来，见下方默认值注释）。 */
-  qrImage: boolean
-  qrOpen: boolean
-  /** 是否给文本二维码套 ANSI 反色。默认关：宿主按纯文本渲染时会把转义序列打成乱码。 */
-  qrAnsi: boolean
-  qrStyle: 'ascii' | 'block' | 'half'
   /** 强 carrier 未到时，等多久才落到弱 carrier。 */
   carrierGraceMs: number
   /** 提问接管：会剥夺桌面 UI 的提问能力，所以默认关（见 core/runtime.ts）。 */
   takeOverQuestions: boolean
   approvalTimeoutSec: number
   listingRefreshSec: number
+  /**
+   * 状态栏那颗 pill（**配对的唯一入口**）。
+   *
+   * 2026-10-03 这一半原来是"右栏自动弹码"（独立包 `dsh-remote-control-presentation`，键名
+   * `sidebarQr`，带 `imageFile`/`refreshMs` 两个落盘参数）。那套删了之后 pill 不需要任何
+   * 宿主侧节拍与落盘——它要图的时候自己发请求。剩下的唯一开关就是"挂不挂那三条路由"。
+   *
+   * ⚠️ 这里的键**绝不能是 error 级**：error 会让主插件整个不启动，那等于把一个界面功能
+   * 变成配对链路的单点。同理 `pill.enabled:false` 的代价要能被查见（见 index.ts 的 problems）。
+   */
+  pill: { enabled: boolean }
   /**
    * 一条配对通道多久没有任何收发就可以被剪掉（秒）。
    *
@@ -54,15 +59,6 @@ export interface PluginConfig {
    * 中文的"会话已失效，请重新配对"。
    */
   conversationIdleTtlSec: number
-  /**
-   * 右栏自动弹码那一半（原独立包 `dsh-remote-control-presentation`，2026-10-03 折进来）。
-   *
-   * 拆分版里它是**另一行配置**（另一个 cordis 条目），因为那一半要 `webServer` 而主插件
-   * 不写 inject 闸门。合成一个包之后隔离移到代码里：`src/presentation/sidebar.ts` 只软探测
-   * `webServer`，拿不到就整半不起。所以这里的键**绝不能是 error 级**——error 会让主插件
-   * 整个不启动，那等于把一个可选的外观功能变成配对链路的单点。
-   */
-  sidebarQr: { enabled: boolean; imageFile: string; refreshMs: number }
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -78,30 +74,14 @@ export const DEFAULT_CONFIG: PluginConfig = {
   unarchiveOnPrompt: true,
   pairOnStartSec: 0,
   pairTtlMs: 120_000,
-  // **默认走图片**。2026-10-02 取证推翻了原判断（原判断：文本二维码在任何等宽渲染器下
-  // 都能扫，图片是可有可无的旁路）：
-  //   · DSH 命令卡的等宽输出块是 `white-space: pre` + `line-height: 1.6`（app bundle 里
-  //     的那条规则，实测行间留白约占行高 37%），每两行模块之间被塞进一条整行宽的缝隙，
-  //     半块二维码被横切成条。
-  //   · 用用户真机贴出来的那段输出做受控实验：把字号行距调到 1.0 时 zxing 解得出来，
-  //     调到 ≥1.15 就扫不出来；而 DSH 固定 1.6。也就是说"文本码能扫"在**唯一宿主**上不成立。
-  //   · 而 ANSI 反色救不了：TerminalBlock 把每行渲染成内联 span，背景只覆盖字形盒，
-  //     不覆盖行间留白（见 dsh-client-ui-primitives 的 parseAnsiLines/renderLine）。
-  // 图片是自包含位图矩阵，跟宿主的行高、字体、配色都无关——这才是"扫得出来"的那条路。
-  qrImage: true,
-  // 写图片 ≠ 替用户打开查看器：仍然默认关（原话「不要用打开一个图片的方式」）。
-  qrOpen: false,
-  qrAnsi: false,
-  qrStyle: 'half',
   carrierGraceMs: 5000,
   takeOverQuestions: false,
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
-  // 图默认落在会话工作区（`<workspace>/.dsh/sidebar-qr.png`），这里只是**兜底位**：
-  // 会话 → 工作区解析不出来时才用它。故意不写进 patch YAML——把某个人的家目录
-  // 焊进分发包是错的（拆分版同一理由）。
-  sidebarQr: { enabled: true, imageFile: path.join(homedir(), '.dsh', 'sidebar-qr.png'), refreshMs: 2000 },
+  // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
+  // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
+  pill: { enabled: true },
 }
 
 const loopback = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/
@@ -141,28 +121,18 @@ export function readConfig(
     ...DEFAULT_CONFIG,
     ...(injected ?? {}),
     keepAwake: { ...DEFAULT_CONFIG.keepAwake, ...(injected?.keepAwake ?? {}) },
-    // 折进来的那一半同样是**逐键合并**：patch 里只写 `sidebarQr.refreshMs` 时，
-    // enabled 与 imageFile 必须仍取默认值，而不是被整个对象覆盖成 undefined。
-    sidebarQr: { ...DEFAULT_CONFIG.sidebarQr, ...(injected?.sidebarQr ?? {}) },
+    // 逐键合并：patch 里只写 `pill.enabled` 时不能把整个对象覆盖掉（虽然它现在只有一个键，
+    // 但"注入对象整体替换默认对象"这个形状在 keepAwake 上已经坑过一次）。
+    pill: { ...DEFAULT_CONFIG.pill, ...(injected?.pill ?? {}) },
   }
   const fromEnv = (name: string): string | undefined => env[name]
   if (fromEnv('DRC_SERVER_URL')) merged.serverUrl = env.DRC_SERVER_URL as string
   if (fromEnv('DRC_HOST_LABEL')) merged.hostLabel = env.DRC_HOST_LABEL as string
   if (fromEnv('DRC_HOST_ID')) merged.hostId = env.DRC_HOST_ID as string
   if (fromEnv('DRC_PAIR_ON_START_SEC')) merged.pairOnStartSec = envSeconds(env.DRC_PAIR_ON_START_SEC)
-  // 这两个开关默认就是关的，所以环境变量只用于**打开**（`=1`）；
-  // 仍然接受 `=0` 显式关闭，覆盖 patch 里开的情况。
-  if (fromEnv('DRC_QR_IMAGE')) merged.qrImage = envFlag(env.DRC_QR_IMAGE, merged.qrImage)
-  if (fromEnv('DRC_QR_OPEN')) merged.qrOpen = envFlag(env.DRC_QR_OPEN, merged.qrOpen)
-  if (fromEnv('DRC_QR_ANSI')) merged.qrAnsi = envFlag(env.DRC_QR_ANSI, merged.qrAnsi)
-  // 右栏那一半也给一个开关：live 取证要"只验配对链路、不要自动弹图"时用它，
-  // 与 DRC_QR_IMAGE 同样是 1/0/true/false，其余值不猜。
-  if (fromEnv('DRC_SIDEBAR_QR')) merged.sidebarQr.enabled = envFlag(env.DRC_SIDEBAR_QR, merged.sidebarQr.enabled)
-  if (fromEnv('DRC_QR_STYLE')) {
-    const style = env.DRC_QR_STYLE as PluginConfig['qrStyle']
-    // 不猜：值不认识就保留上层（patch 或默认）的值，并由 validateConfig 负责 warn。
-    if (['ascii', 'block', 'half'].includes(style)) merged.qrStyle = style
-  }
+  // 界面那一半的开关：live 取证要"只验配对链路、不要弹图"时用它。与其余开关同样是
+  // 1/0/true/false，其余值不猜、退回上层。
+  if (fromEnv('DRC_PILL')) merged.pill.enabled = envFlag(env.DRC_PILL, merged.pill.enabled)
   if (fromEnv('DRC_MOCK_BRIDGE') === '1') merged.mockBridge = true
   if (fromEnv('DRC_TAKE_OVER_QUESTIONS') === '1') merged.takeOverQuestions = true
   // token 只从环境变量取：patch 文件是 600 权限的 yaml，但把凭据写在配置文件里
@@ -219,22 +189,6 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
     problems.push({ level: 'warn', field: 'pairOnStartSec', message: '必须是非负的有限秒数，已折回 0（关闭自动发码）' })
     config.pairOnStartSec = 0
   }
-  if (config.qrOpen && !config.qrImage) {
-    problems.push({
-      level: 'warn',
-      field: 'qrOpen',
-      message:
-        'qrOpen 需要 qrImage=true 才会写图片文件；现在只出文本二维码（文本码在 DSH 命令卡里扫不出来，见 config.ts 默认值注释）',
-    })
-  }
-  if (!['ascii', 'block', 'half'].includes(config.qrStyle)) {
-    problems.push({
-      level: 'warn',
-      field: 'qrStyle',
-      message: `qrStyle 只认 ascii/block/half，收到 ${JSON.stringify(config.qrStyle)}，已退回 half`,
-    })
-    config.qrStyle = 'half'
-  }
   if (!secondsSchema.safeParse(config.conversationIdleTtlSec).success || config.conversationIdleTtlSec <= 0) {
     // 0 或非法值**不表示"永不剪枝"**：永不剪枝就是那条无界的密钥簿。夹回默认值并说明。
     problems.push({
@@ -262,33 +216,32 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
         '提问接管会**取代桌面 UI 的提问能力**（ctx.userQuestions 只允许一个活跃 provider）；手机端不在线时提问会直接失败',
     })
   }
-  // 右栏那一半的两条都只 warn + 夹回：**绝不用 error**，因为 error 会让主插件整个不启动
-  // （见 PluginConfig.sidebarQr 的注释），把一个可选功能变成了配对链路的单点故障。
-  if (typeof config.sidebarQr.imageFile !== 'string' || config.sidebarQr.imageFile === '') {
+  // 已经删掉的键**必须报出来**，不能静默失效：这些键写在用户的 profile 里，
+  // 一句"没这个键了"比"它看起来还在、但什么都不做"诚实得多。
+  // 之所以能在合并后的对象上看到它们，是因为 readConfig 用 `...injected` 原样摊开——
+  // 类型里没有的键在运行期仍然在。
+  const leftovers = config as unknown as Record<string, unknown>
+  for (const gone of RETIRED_KEYS) {
+    if (leftovers[gone.key] === undefined) continue
     problems.push({
       level: 'warn',
-      field: 'sidebarQr.imageFile',
-      message: '为空就无处落兜底图，已夹回 ~/.dsh/sidebar-qr.png（工作区解析得出来时本来也用不到它）',
+      field: gone.key,
+      message:
+        `${gone.key} 这个键已经不存在了${gone.now ? `（现在叫 ${gone.now}）` : '（随那条路一起删了）'}，` +
+        '它留在 patch 里不会产生任何效果，请删掉',
     })
-    config.sidebarQr.imageFile = DEFAULT_CONFIG.sidebarQr.imageFile
-  } else if (!path.isAbsolute(config.sidebarQr.imageFile)) {
-    problems.push({
-      level: 'warn',
-      field: 'sidebarQr.imageFile',
-      message: `不是绝对路径（${config.sidebarQr.imageFile}），工作区解析不出来时会被解析到进程工作目录下`,
-    })
-  }
-  if (!secondsSchema.safeParse(config.sidebarQr.refreshMs).success || config.sidebarQr.refreshMs < 200) {
-    // 拆分版是"夹到 200 下限"，这里同一口径：低于 200ms 的节拍只是把渲染与落盘变成刷屏。
-    problems.push({
-      level: 'warn',
-      field: 'sidebarQr.refreshMs',
-      message: '必须是 ≥200 的有限毫秒数，已夹回 2000（原值 ' + JSON.stringify(config.sidebarQr.refreshMs) + '）',
-    })
-    config.sidebarQr.refreshMs = DEFAULT_CONFIG.sidebarQr.refreshMs
   }
   return problems
 }
+
+/** 2026-10-03 随"右栏自动弹码"与"终端文本码"两案删除的键。 */
+const RETIRED_KEYS: Array<{ key: string; now?: string }> = [
+  { key: 'sidebarQr', now: 'pill' },
+  { key: 'qrImage' },
+  { key: 'qrOpen' },
+  { key: 'qrAnsi' },
+  { key: 'qrStyle' },
+]
 
 /** 令牌脱敏：日志与 status.json 里都只允许出现这个形态。 */
 export function redactSecret(value: string): string {

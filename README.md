@@ -11,16 +11,16 @@
 `dist/bundle/index.js` 与浏览器面 `dist/bundle/client.cjs`，都由
 [`scripts/install-to-profile.sh`](./scripts/install-to-profile.sh) 装进 profile：
 
-| 路径                                   | 包名                 | 分发方式         | 作用                                                                                                                                                                                 |
-| -------------------------------------- | -------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`packages/plugin`](./packages/plugin) | `dsh-remote-control` | **npm** + bundle | 主插件：配对、中继连接、会话与命令、审批转发、防休眠，**外加**界面上的那一半：状态栏那颗"点一下配对"的 pill，以及右栏自动弹码（配对码落 PNG + 四条同域路由 + 浏览器面 `client.cjs`） |
+| 路径                                   | 包名                 | 分发方式         | 作用                                                                                                                                                |
+| -------------------------------------- | -------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`packages/plugin`](./packages/plugin) | `dsh-remote-control` | **npm** + bundle | 主插件：配对、中继连接、会话与命令、审批转发、防休眠，**外加**界面上的那一半：状态栏那颗"点一下配对"的 pill（三条同域路由 + 浏览器面 `client.cjs`） |
 
 > 界面上那一半原来是独立的 `packages/presentation`（`dsh-remote-control-presentation`，不发 npm）。
 > 拆包只是为了"某一代宿主没有 `webServer` 服务时，只有那一行不激活、配对/中继一行都不受影响"；
-> 折成一个包之后同样的隔离由代码提供——`src/presentation/sidebar.ts` 只软探测 `webServer`，
+> 折成一个包之后同样的隔离由代码提供——`src/presentation/pill.ts` 只软探测 `webServer`，
 > 拿不到就整半不起，`tests/presentation-isolation.test.ts` 用逐字段对照把这条钉住。
-> 2026-10-03 加那颗 pill 时同一条规矩又用了一次：新那三条路由单独一个 try，它们挂了不许把
-> 已经在跑的右栏弹码一起拖死；浏览器面拿 `react` 走运行期，拿不到也只是少一颗 pill。
+> 那一半原来还带着"右栏自动弹码"（宿主按节拍渲染 PNG 落到会话工作区、浏览器面轮询后顶开右栏）；
+> 2026-10-03 连终端文本码一起删了，**配对入口只剩这颗 pill**。
 
 其余两半在各自仓库：[`dsh-remote-server`](https://github.com/providcc/dsh-remote-server)（零知识中继）、
 `dsh-remote-mp`（微信小程序客户端）。三者共用
@@ -65,15 +65,24 @@ sh scripts/install-to-profile.sh
 > **改代码后必须重启 Harness。** HMR 只热更 `cordis.patch.yml` 的配置，不会重新 import 产物；
 > 浏览器面要**重新加载页面**才会重新拉 `client.cjs`。
 
-配对：**点状态栏那颗 `dsh-remote-control`**，它会当场生成一张一次性码并把二维码弹在弹出面板里；
-手机扫码即完成配对。那颗 pill 平时显示的是连接状态（`远程未连接` / `连接中` / `已连 N 台`）。
+配对：**点状态栏那颗 `dsh-remote-control`**（输入框那一排）。它当场生成一张一次性码，
+二维码弹在同一颗按钮上方，6 位数字与图同时在场（扫不出来时手输是唯一退路），寿命走完自动换一张。
+那颗 pill 平时显示的是连接状态：`远程未启动` / `远程未连接` / `连接中` / `配对中` / `已连 N 台`。
 
-`/drc pair` 没有删掉，但降级成兜底：pill 三条路由都挂上时，命令的 `hint` 里不再出现 `pair`，
-打 `/drc pair` 也只把人指回那颗按钮（**不顺手再发一张**——"屏幕上永远只有一张有效码"是配对能成事
-的前提）。这时 `pair` 仍然接受 `force`：宿主给不出 `react`、或这代宿主没有 `slots` 服务时，路由
-挂上了而那颗 pill 没出现，`/drc pair force` 就是那条不能堵死的退路（它走幂等入口，仍然只有一张）。
-宿主没有 `webServer`、或那三条路由挂不上时，`pair` 自动回到命令行主路径
-（`status.json` 的 `sidebar.actions` 会写明是哪一步没挂上）。右栏那条自动弹码（1.1.0）照旧在。
+**命令行没有配对入口了**（2026-10-03 拍板）：`/drc` 只剩 `status` 与 `unpair`。删掉 `/drc pair`
+不是嫌它多余——它走的是"每次发一张新码"，会在 pill 那张之外再多挂一个仍然有效的 PSK，
+而手机扫的是屏幕上那张，取错密钥就全线解不开（当初"多码事故"的原样）。
+终端文本码同日删除：DSH 命令卡按 `line-height:1.6` 渲染等宽输出，行间留白会把半块码横切成条，
+实测 zxing 在 ≥1.15 行距就解不出来，也就是它在这个唯一宿主上从来扫不出。
+
+配对入口不可用时**必须查得到为什么**：宿主没有 `webServer`、或那三条路由挂不上、
+或 `pill.enabled:false`，都会在 `status.json` 里留下 `problems: ["warn:pill"]`
+与 `pill` 那块探针（`webServer:"none"` / `routes:"register threw: …"` / `pill:"disabled"`）。
+这条 warn 是**每次写快照时现判**的：`webServer` 可能经 `ctx.inject` 晚到，一次性判断会留下
+"路由已 `registered` 却仍报配对入口不可用"的假警报（2026-10-03 真机抓到）。
+浏览器面那一半（拿 `react`、拿 `slots`）失败只在 DevTools 里留一行 `[dsh-remote-control pill]` 的 warn；
+`slots` 按宿主模板声明在 client 模块的 `inject` 里（**空列表 = apply 跑在槽位服务之前 = 屏幕上没有
+那颗 pill**），软探测与晚到回调只是退路。
 
 ## 配置
 
@@ -81,28 +90,27 @@ sh scripts/install-to-profile.sh
 **环境变量 > patch 里的 `config` > 内置默认值**。分发包自带的默认行见
 [`packages/plugin/cordis.patch.yml`](./packages/plugin/cordis.patch.yml)。
 
-| 键                         | 默认                    | 说明                                                                                   |
-| -------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
-| `enabled`                  | `true`                  | 关掉即整行不干活                                                                       |
-| `serverUrl`                | `ws://127.0.0.1:8787`   | 中继地址。生产必须 `wss://`（写非回环的 `ws://` 只 warn 不拦，但明文链路上配对码可见） |
-| `hostTokenEnv`             | `DRC_HOST_TOKEN`        | **token 所在的环境变量名**。token 本身不进 patch                                       |
-| `hostLabel`                | `dsh-host`              | 手机上显示的主机名                                                                     |
-| `keepAwake.enabled`        | `true`                  | 有会话时阻止系统休眠                                                                   |
-| `keepAwake.idleReleaseSec` | `300`                   | 空闲多久后释放防休眠                                                                   |
-| `unarchiveOnPrompt`        | `true`                  | 收到指令时自动取消会话归档                                                             |
-| `takeOverQuestions`        | `false`                 | 提问接管（会**取代桌面 UI 的提问能力**，默认关）                                       |
-| `approvalTimeoutSec`       | `180`                   | 审批等待上限                                                                           |
-| `pairTtlMs`                | `120000`                | 向中继申请 PSK 的有效期；**服务端权威值会覆盖它**                                      |
-| `qrImage`                  | `true`                  | 配对码出 PNG（文本码在 DSH 命令卡的行高下扫不出来）                                    |
-| `sidebarQr.enabled`        | `true`                  | 右栏自动弹码 + 状态栏那颗 pill（两条都由这一开关管）                                   |
-| `sidebarQr.imageFile`      | `~/.dsh/sidebar-qr.png` | 右栏那张图的**兜底**落点；正常落在当前会话工作区的 `.dsh/sidebar-qr.png`               |
-| `sidebarQr.refreshMs`      | `2000`                  | 宿主侧看一眼"码换没换"的节拍                                                           |
-| `conversationIdleTtlSec`   | `86400`                 | 空闲多久剪掉一条配对通道（不接受"永不剪枝"）                                           |
+| 键                         | 默认                  | 说明                                                                                     |
+| -------------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| `enabled`                  | `true`                | 关掉即整行不干活                                                                         |
+| `serverUrl`                | `ws://127.0.0.1:8787` | 中继地址。生产必须 `wss://`（写非回环的 `ws://` 只 warn 不拦，但明文链路上配对码可见）   |
+| `hostTokenEnv`             | `DRC_HOST_TOKEN`      | **token 所在的环境变量名**。token 本身不进 patch                                         |
+| `hostLabel`                | `dsh-host`            | 手机上显示的主机名                                                                       |
+| `keepAwake.enabled`        | `true`                | 有会话时阻止系统休眠                                                                     |
+| `keepAwake.idleReleaseSec` | `300`                 | 空闲多久后释放防休眠                                                                     |
+| `unarchiveOnPrompt`        | `true`                | 收到指令时自动取消会话归档                                                               |
+| `takeOverQuestions`        | `false`               | 提问接管（会**取代桌面 UI 的提问能力**，默认关）                                         |
+| `approvalTimeoutSec`       | `180`                 | 审批等待上限                                                                             |
+| `pairTtlMs`                | `120000`              | 向中继申请 PSK 的有效期；**服务端权威值会覆盖它**                                        |
+| `pill.enabled`             | `true`                | 状态栏那颗 pill = **配对的唯一入口**。关掉它这台主机就没有配对入口，会留一条 `warn:pill` |
+| `conversationIdleTtlSec`   | `86400`               | 空闲多久剪掉一条配对通道（不接受"永不剪枝"）                                             |
 
 对应的环境变量覆盖见
 [`packages/plugin/src/shell/config.ts`](./packages/plugin/src/shell/config.ts)（`DRC_SERVER_URL`、
-`DRC_HOST_LABEL`、`DRC_QR_IMAGE`、`DRC_MOCK_BRIDGE` 等）。**键名刻意继承旧名**：它们写在用户的
-profile 里，改名等于让线上配置静默失效。
+`DRC_HOST_LABEL`、`DRC_PILL`、`DRC_MOCK_BRIDGE` 等）。**留下的那些键名刻意继承旧名**：它们写在
+用户的 profile 里，改名等于让线上配置静默失效。已经删掉的键（`qrImage`/`qrOpen`/`qrAnsi`/
+`qrStyle`/`sidebarQr`）**不会静默失效**——留在 patch 里会在 `problems` 里各报一条 warn 并说清
+现在叫什么或为什么没了。
 
 排错入口是状态快照 `~/.dsh/dsh-remote-control/status.json`（0600）；关键字段 `carrier`
 （`services` = 真内核 / `mock` = 内存替身 / `none`）、`relay`、`relayProblem`。
@@ -117,15 +125,23 @@ pnpm build            # tsc + esbuild → packages/plugin/dist/bundle/{index.js,
 pnpm format:check     # prettier --check
 ```
 
-测试就是普通的 `node --test` 文件，没有测试框架，运行期不做转译。动到二维码形状时务必盯住
-`packages/plugin/tests/pairing-text.test.ts`（文本/半块码）与
-`packages/plugin/tests/presentation-presenter.test.ts`（真渲染出 PNG magic bytes、落盘 0600）这两组；
-动到右栏那条路由时盯住 `presentation-route.test.ts`（环回/来源守卫）与
-`presentation-isolation.test.ts`（**缺 `webServer` 时配对链路必须逐字段不变**）；
-动到状态栏那颗 pill 时盯住 `presentation-pair-actions.test.ts`（发码幂等、写路由的跨站判据是
-那个同源才发得出的 `x-drc-pair` 头而不是 `Origin`、
-回答里不许出现凭据）与 `presentation-client-bundle.test.ts`（在 vm 里真跑**打出来的** `client.cjs`：
-拿不到 react / 探不到 slots 时只许降级成"没有 pill"，右栏那半必须照常）。
+测试就是普通的 `node --test` 文件，没有测试框架，运行期不做转译。动到界面那一半时盯住三组：
+
+- `presentation-pill-routes.test.ts` — 三条路由的判据：发码幂等、写路由的跨站判据是那个
+  **同源才发得出的 `x-drc-pair` 头而不是 `Origin`**（桌面宿主会删 `origin`，真机量过）、
+  回答里不许出现 `psk`/完整 URI、图片路由真的渲染出 PNG 字节、半途挂不上要回滚已挂的那几条。
+- `presentation-isolation.test.ts` — 对照：同一份假上下文跑两遍 `apply()`，只差有没有
+  `webServer`，主链路可观察字段**逐个相等**、`/drc unpair` 返回**逐字节相等**，
+  差别只许出现在 `pill` 探针与那一条 `warn:pill` 上；`hint` 在两种宿主上都不许再有 `pair`。
+  含一条 `lateWeb`：`webServer` 由注入回调**晚到**时，挂上之后 `warn:pill` 必须自己消失。
+- `presentation-client-bundle.test.ts` — 在 vm 里真跑**打出来的** `client.cjs`：pill 注册进
+  `conversation.composer.dock`、点击发码、图与 6 位码进面板、倒计时走完自动换码，
+  以及拿不到 react / 探不到 slots 时**只许降级成"没有 pill"、绝不抛出 apply**。
+  假上下文的 `slots` 既能同步给、也能演"晚到"（`lateSlots` + `flushInject`）——
+  只给同步那条的 fixture 演不出"屏幕上没有那颗 pill"，2026-10-03 真机就是这么漏的。
+
+二维码编码器本身的防回归在伞仓：`node scripts/validate-qr.mjs`（zxing-cpp 真解码，
+PNG 与裸矩阵两条路径）。
 
 ## 安全
 
