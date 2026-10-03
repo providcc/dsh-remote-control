@@ -192,10 +192,13 @@ export class RelayClient {
     return dropped
   }
 
-  /** 向一条配对会话发一条载荷；返回 false = 这条会话已经没了或没人接。 */
+  /** 向一条配对会话发一条载荷；返回 false = 这条会话已经没了，或**现在没有活着的客户端**。 */
   send(conversationId: string, payload: EvPayload): boolean {
     const conversation = this.conversations.get(conversationId)
     if (!conversation) return false
+    // 有密钥 ≠ 有人能收到。手机退到后台/断开时会话要留着（D3 靠它重建路由），
+    // 但往一条空会话发帧只有两个后果：中继计一次丢帧，和本地白做一次加密。
+    if (conversation.clientIds.size === 0) return false
     const record = seal(conversation.kH2C, payload)
     conversation.lastActivityAt = this.options.clock.now()
     return this.raw({ t: 'enc', sessionId: conversationId, seq: ++conversation.seqHost, ciphertext: record.ciphertext })
@@ -204,13 +207,25 @@ export class RelayClient {
   broadcast(payload: EvPayload): number {
     let sent = 0
     for (const id of this.conversations.ids()) {
+      // 没有活客户端的会话**跳过而不计数**：手机不在的时候主机照样每 15 秒产生一轮状态，
+      // 把它记成"发了但没人收到"会让 `_no_peer` 变成常态噪声，
+      // 而这个计数存在的目的正是"这一次真的丢了"（真机 45 秒涨 9 帧就是这么来的）。
+      if (!this.conversations.hasClient(id)) continue
       if (this.send(id, payload)) sent += 1
     }
     return sent
   }
 
-  hasPeer(conversationId: string): boolean {
-    return this.conversations.has(conversationId)
+  /**
+   * 这条会话**现在**有没有能收到东西的手机。
+   *
+   * 原来这个方法叫 `hasPeer`、答的是"我手里有没有这条通道的密钥"——两者在手机上线时恰好
+   * 同真，所以错误一直藏着：手机断开后审批仍然"发得出去"（发进一条空会话），
+   * 桌面那一半要等满 180 秒才拿到决定权。名字换成 `hasClient` 是为了让下一次
+   * 想写 `conversations.has()` 的人当场看见这两个概念不是一回事。
+   */
+  hasClient(conversationId: string): boolean {
+    return this.conversations.hasClient(conversationId)
   }
 
   conversationIds(): string[] {
@@ -276,7 +291,15 @@ export class RelayClient {
         return
       case 'peer-joined': {
         // 只有带 pairingToken 的那一条才是"新客户端加入"；重连通知没有 token（客户端的 id 填在 clientId 位）。
-        if (!frame.pairingToken) return
+        if (!frame.pairingToken) {
+          // **重连也要登记成员。** 成员表原来只靠"收到过这台手机的 enc 帧"长出来
+          // （见 onEncrypted），于是手机回前台之后、在它第一次发东西之前，本端以为
+          // "这条会话没人"——任何以"有没有活客户端"为准的判断（要不要广播、
+          // 审批该不该交还桌面、status.json 里那台数）都会错一拍。
+          const conversation = this.conversations.get(frame.sessionId)
+          if (conversation && frame.clientId) conversation.clientIds.add(frame.clientId)
+          return
+        }
         const slot = this.options.lookupPairingSlot(frame.pairingToken)
         if (!slot) {
           this.options.log('peer-joined without a known pairing token', { sessionId: frame.sessionId })
@@ -288,6 +311,9 @@ export class RelayClient {
           generation: this.generation,
           now: this.options.clock.now(),
         })
+        // 新通道同样立刻记成员：这一帧就带着 clientId，等它发第一帧才记会让"刚配好的手机"
+        // 在头几秒里被当成没连着。
+        if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.add(frame.clientId)
         // 这条通道现在又有密钥了：清掉"已声明作废"的记号，否则下次真要作废时发不出去。
         this.voided.delete(frame.sessionId)
         this.raw({ t: 'resync', sessionIds: this.conversations.ids() })

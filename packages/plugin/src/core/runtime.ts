@@ -44,7 +44,7 @@ export interface RuntimeTransport {
   /** 发给所有已配对的会话（会话列表、防休眠状态这类广播）。返回**收到这条广播的会话数**，0 表示没发出去。 */
   broadcast(payload: EvPayload): number
   /** 此刻是否有能收这条会话消息的对端（审批要不要认领的判据）。 */
-  hasPeer(conversationId: string): boolean
+  hasClient(conversationId: string): boolean
   /** 当前活跃的配对会话 id。 */
   conversationIds(): string[]
   /** 把一条会话标为不可用（复核 R1：解不开/没人接时主动作废）。 */
@@ -460,7 +460,7 @@ export class HostRuntime {
     signal?: AbortSignal
   }): Promise<ApprovalDecision> {
     const conversationId = this.pickConversation(info.sessionId)
-    if (!conversationId || !this.transport.hasPeer(conversationId)) return 'decline'
+    if (!conversationId || !this.transport.hasClient(conversationId)) return 'decline'
     const id = `ap_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     const answered = await new Promise<ApprovalDecision>((resolve) => {
@@ -509,7 +509,7 @@ export class HostRuntime {
     signal?: AbortSignal
   }): Promise<AskUserQuestionAnswerValue | null> {
     const conversationId = this.pickConversation(info.sessionId)
-    if (!conversationId || !this.transport.hasPeer(conversationId)) return null
+    if (!conversationId || !this.transport.hasClient(conversationId)) return null
     const id = `q_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     const answer = await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
@@ -590,7 +590,7 @@ export class HostRuntime {
   private pickConversation(_sessionId: string): string | undefined {
     const ids = this.transport.conversationIds()
     if (ids.length === 0) return undefined
-    return ids.find((id) => this.transport.hasPeer(id)) ?? ids[0]
+    return ids.find((id) => this.transport.hasClient(id)) ?? ids[0]
   }
 
   private log(message: string, fields?: Record<string, string | number | boolean | undefined>): void {

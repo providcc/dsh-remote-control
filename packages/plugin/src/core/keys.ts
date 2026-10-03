@@ -94,6 +94,23 @@ export class ConversationBook {
     return this.byId.has(id)
   }
 
+  /**
+   * 这条会话**现在有没有活着的客户端**。
+   *
+   * 与 `has()` 是两件事，而且必须分开：`has()` 是"我手里有这条通道的密钥"，
+   * 手机回前台时要用同一个 `convId` 回来，所以密钥**必须留着**（D3）；
+   * 但"有密钥"不等于"现在有人能收到"。
+   *
+   * 原来只有 `has()` 一个判据，于是 `hasPeer()` 答的是"有密钥"，广播就照着它发——
+   * 真机后果：手机断开之后（会话默认 7 天 TTL）主机每 15 秒仍往这条空会话发
+   * `session_changed` / `model` / `keep_awake_state` 三帧，中继每一帧计一次丢帧，
+   * 实测 45 秒涨 9、`/healthz` 的 `droppedFrames` 因此被这一路噪声主导（5737）。
+   */
+  hasClient(id: string): boolean {
+    const conversation = this.byId.get(id)
+    return conversation !== undefined && conversation.clientIds.size > 0
+  }
+
   close(id: string): boolean {
     return this.byId.delete(id)
   }

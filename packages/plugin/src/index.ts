@@ -213,8 +213,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     broadcast(payload: EvPayload): number {
       return relay ? relay.broadcast(payload) : 0
     },
-    hasPeer(conversationId: string): boolean {
-      return relay?.hasPeer(conversationId) ?? false
+    hasClient(conversationId: string): boolean {
+      return relay?.hasClient(conversationId) ?? false
     },
     conversationIds(): string[] {
       return relay?.conversationIds() ?? []

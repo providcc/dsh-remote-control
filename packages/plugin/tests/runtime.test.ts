@@ -63,7 +63,7 @@ class FakeTransport implements RuntimeTransport {
     return this.peers.size > 0 ? this.peers.size : 0
   }
 
-  hasPeer(conversationId: string): boolean {
+  hasClient(conversationId: string): boolean {
     return this.peers.has(conversationId)
   }
 
