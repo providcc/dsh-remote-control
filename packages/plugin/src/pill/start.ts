@@ -19,7 +19,7 @@
  * 那颗 pill，而 `/drc pair` 已经删掉了，所以主插件必须把它报成一条 `problems`（见 index.ts），
  * 否则表现就是"配不了对且没有任何地方说为什么"。
  */
-import { registerPillRoutes, type PillRouteDeps, type WebServerLike } from './pill-routes.js'
+import { registerPillRoutes, type PillRouteDeps, type WebServerLike } from './routes.js'
 
 /** 只用到 ctx 的几个成员，所以不硬依赖 `@deepseek-ai/cordis` 的类型。 */
 interface LooseContext {

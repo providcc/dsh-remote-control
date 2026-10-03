@@ -10,7 +10,7 @@
  * 二维码横切成条——实测 zxing 在 ≥1.15 行距就解不出来，而宿主固定 1.6，也就是文本码在这个
  * （唯一）宿主上**从来就扫不出来**。它留着只有"看起来是个退路"这一种作用。
  * 2026-10-03 连 `ascii`/`block`/`half` 三种样式与 ANSI 反色一起删掉，配对出口只剩
- * 状态栏那颗 pill（`src/presentation/pair-actions.ts` 的 `GET /pairing.png`）。
+ * 状态栏那颗 pill（`src/pill/routes.ts` 的 `GET /pairing.png`）。
  *
  * `qrMatrix` 仍然导出：它不是渲染层，是**几何与静默区**的判据来源——
  * 伞仓 `scripts/validate-qr.mjs` 拿它对拍"矩阵本身能不能被解出来"，那与用什么像素画无关。

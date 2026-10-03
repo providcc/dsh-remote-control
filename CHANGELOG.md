@@ -32,7 +32,7 @@
   配对入口不可用时必须查得到原因——命令行兜底删了以后，"配不了对"不该是静默失败。
   那条 warn 是**每次写快照时现判**的，不是 `apply()` 里一次性 push：`webServer` 可能由
   `ctx.inject` 的回调晚到，一次性判断会留下 `routes:"registered"` 与 `problems:["warn:pill"]`
-  并存的假警报（2026-10-03 真机重装重启后实测抓到，`presentation-isolation.test.ts` 里
+  并存的假警报（2026-10-03 真机重装重启后实测抓到，`pill-isolation.test.ts` 里
   "webServer 晚到"那条用例钉住它）。
 - 半途失败要回滚：三条路由依次挂，第二条挂不上时第一条**必须被注销掉**，否则它永久留在宿主上、
   `stop()` 再也拿不到注销函数，表现是"重载一次之后那颗 pill 再也不出现"。
@@ -70,7 +70,7 @@
   屏幕上再也没有那颗按钮，而**当时 262 项单测全绿**（假上下文只给同步的 `ctx.get`，演不出"服务
   还没到"）。旧的 `['sidebarRight']` 无意中把激活时机推到了服务齐之后，所以第一版看起来是好的。
   现在三样一起有：`slots` 声明进 `inject`（正路）、软探测与 `ctx.inject(['slots'], …)` 的晚到回调
-  两条退路（回调里只 mount 一次），以及一条能演"晚到"的测试（`presentation-client-bundle.test.ts`
+  两条退路（回调里只 mount 一次），以及一条能演"晚到"的测试（`client-bundle.test.ts`
   的 `lateSlots`/`flushInject`）。`apply` 时没探到的那句 warn 改成"已挂回调等晚到"，不再断言
   "这代宿主没这个服务"。
 - **那颗 pill 在挤不动的那一排里不再逐字断行**。宿主 dock 空间不够时会把每一项自己截断
@@ -94,14 +94,23 @@
   `redact` 这个双名导出（合成一个名字）。
 - **退役配置键的 warn 表删除**（见上面"删除"那节），连带 5 条断言。
 - 顺带清掉 `tsc --noUnusedLocals --noUnusedParameters` 报出的全部未用导入与未用局部。
+- **"presentation" 这个名字全部清掉**（右栏方案删了之后它已经什么都不指了）：
+  `src/presentation/` → **`src/pill/`**（`pill-routes.ts` → `routes.ts`、`pill.ts` → `start.ts`），
+  三张测试改名 `pill-routes.test.ts` / `pill-isolation.test.ts` / `client-bundle.test.ts`，
+  全部 import 与注释引用重接；`scripts/install-to-profile.sh` 里为第二个 cordis 条目
+  （`dsh-remote-control-presentation`，从未发到 npm，只有本机 profile 装过且早已摘掉）
+  留的退役清理也删了——那是一段永远命中不到的迁移代码。
+  **同轮修掉一个真隐患**：那个脚本每次运行都往 profile 里多写一份
+  `package.json.bak-drc-<时间戳>`，本机已经堆到 **83 份带 `hostToken` 的副本**；
+  现在改成单份滚动 `package.json.bak-drc`，并在写入前清掉历史遗留的时间戳副本。
 
 ### 测试
 
 262 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
 `sessionWorkspace`）。删掉 5 个只属于那两条已删路径的测试文件；
-`presentation-pill-routes.test.ts`（22 条）、`presentation-isolation.test.ts`（8 条，含
+`pill-routes.test.ts`（22 条）、`pill-isolation.test.ts`（8 条，含
 "配对入口只有 pill：两种宿主上 hint 都不许再宣传 pair"与"webServer 晚到时 warn:pill 必须自己消失"）、
-`presentation-client-bundle.test.ts`（18 条，在 vm 里真跑打出来的 `client.cjs`，含"`slots` 晚到时那颗 pill 必须补挂"）。
+`client-bundle.test.ts`（18 条，在 vm 里真跑打出来的 `client.cjs`，含"`slots` 晚到时那颗 pill 必须补挂"）。
 伞仓 `e2e/run.mjs` 新增一步：**真中继在线**时点那三条路由——发码、幂等复点同一张、
 出的 PNG 与主机维护的那张码同一个 epoch（单测里发码分支永远是"中继不可达"，那条路此前从没走过）。
 
@@ -115,7 +124,7 @@
 - 配置项 `sidebarQr`（`enabled` / `imageFile` / `refreshMs`）；环境变量 `DRC_SIDEBAR_QR=0` 可整体关掉。
 - `status.json` 多一块 `sidebar`：右栏那一半的软探测结果（`route=registered` / `webServer=none` /
   `disabled` / `register threw: …`）。"二维码没弹"从此有第一现场，而不是只能猜。
-- `tests/presentation-isolation.test.ts`：同一个假上下文跑两遍 `apply()`，只差有没有 `webServer`，
+- `tests/pill-isolation.test.ts`：同一个假上下文跑两遍 `apply()`，只差有没有 `webServer`，
   要求主链路可观察字段**逐个相等**、`/drc` 返回**逐字节相等**。
 
 ### 变更

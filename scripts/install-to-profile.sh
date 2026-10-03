@@ -12,8 +12,8 @@
 #                                  注册那颗 pill——点一下发码、二维码弹在按钮上方。
 #
 # 为什么原来拆两包、现在折一个：拆包是为了"某一代宿主没有 `webServer` 时只有那一行不激活，
-# 配对/中继一行都不受影响"。折成一个包之后这个隔离由代码提供——`src/presentation/pill.ts`
-# 只软探测 `webServer`，拿不到就整半不起；`tests/presentation-isolation.test.ts` 用**逐字段对照**
+# 配对/中继一行都不受影响"。折成一个包之后这个隔离由代码提供——`src/pill/start.ts`
+# 只软探测 `webServer`，拿不到就整半不起；`tests/pill-isolation.test.ts` 用**逐字段对照**
 # 锁住这件事（同一个假上下文跑两遍，差别只许出现在 `state().pill` 与那条 `warn:pill` 上）。
 #
 # ⚠️ 2026-10-03 起**配对入口只有那颗 pill**：右栏自动弹码、终端文本码、以及 `/drc pair`
@@ -36,8 +36,6 @@ ROOT=$(cd "$HERE/.." && pwd)
 PLUGIN="$ROOT/packages/plugin"
 PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/desktop}"
 BUNDLE_ID="dsh-remote-control"
-# 上一个形态遗留的第二条 bundle 名，只在"退役"那一步用到。
-OLD_PRESENTATION_ID="dsh-remote-control-presentation"
 
 if [ ! -d "$PROFILE" ]; then
   echo "install-to-profile: profile not found: $PROFILE" >&2
@@ -108,45 +106,38 @@ JSON
 echo "   已写入 $target"
 echo "     $BUNDLE_ID @ $version（含浏览器面 client.cjs）"
 
-echo "→ 注册 bundle 到 profile 的 bundles 列表（幂等），并清掉旧的 file: 依赖与退役条目…"
+echo "→ 注册 bundle 到 profile 的 bundles 列表（幂等），并清掉旧的 file: 依赖…"
 # 用 heredoc 而不是 `-e "…"`：这段 JS 里出现的任何**英文双引号**都会把双引号字符串提前截断，
 # 而后面的行会变成 node 的位置参数被忽略——表现是"脚本静默跑完、只写了备份、什么都没改"，
 # 退出码还是 0。这个坑真实踩过（折并那次退役就是这么没生效的）。
-# 定界符不加引号，$PROFILE / $BUNDLE_ID / $OLD_PRESENTATION_ID 才会在传进去之前展开。
+# 定界符不加引号，$PROFILE / $BUNDLE_ID 才会在传进去之前展开。
 node --input-type=module <<NODEJS
-import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 const file = '$PROFILE/package.json'
 const id = '$BUNDLE_ID'
-const retired = ['$OLD_PRESENTATION_ID']
 if (!existsSync(file)) { console.error('profile 没有 package.json：' + file); process.exit(1) }
-// 每次改写前都留一份原文：这文件里同时带着 hostToken，改坏了要能一眼回退。
-writeFileSync(file + '.bak-drc-' + Math.floor(Date.now() / 1000), readFileSync(file))
+// 改写前留一份原文：这文件里同时带着 hostToken，改坏了要能一眼回退。
+// 只留**一份**滚动备份。以前每次运行都写一个 `.bak-drc-<时间戳>`，本机跑过 83 次就是
+// 83 份带凭据的副本躺在 profile 里——那不是"能回退"，那是把凭据多复制了 83 遍。
+// 所以先把历史遗留的时间戳副本一起清掉（只清本脚本自己写的那种名字）。
+const dir = file.slice(0, file.lastIndexOf('/'))
+const base = file.slice(dir.length + 1)
+for (const stale of readdirSync(dir).filter((name) => name.startsWith(base + '.bak-drc'))) {
+  rmSync(dir + '/' + stale)
+}
+writeFileSync(file + '.bak-drc', readFileSync(file))
 const pkg = JSON.parse(readFileSync(file, 'utf8'))
 pkg.dsh = pkg.dsh || {}
 pkg.dsh.profile = pkg.dsh.profile || {}
 const list = pkg.dsh.profile.bundles || []
 if (!list.includes(id)) list.push(id)
-// 折并之后右栏那一半不再是独立条目。留着它只会多一条"bundle 在列表里但目录已删"的
-// 加载失败记录，所以从列表里摘掉，并把它的安装目录一起删掉。
-for (const name of retired) {
-  const at = list.indexOf(name)
-  if (at >= 0) {
-    list.splice(at, 1)
-    console.log('   从 bundles 列表摘掉退役条目 ' + name)
-  }
-  const dir = '$PROFILE/node_modules/' + name
-  if (existsSync(dir)) {
-    rmSync(dir, { recursive: true, force: true })
-    console.log('   删除退役目录 ' + dir)
-  }
-}
 pkg.dsh.profile.bundles = list
 // 旧机制退役：'file:' 依赖会让 pnpm 再物化一份插件进 profile，
 // 两个实例同时挂在中继上（两个 hostId、两份会话），手机连到谁全凭运气。
 // 现在的安装方式只有这一条：本目录下的单文件 bundle + bundles 列表里的名字。
 for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
   if (!pkg[field] || typeof pkg[field] !== 'object') continue
-  for (const name of [id, ...retired]) {
+  for (const name of [id]) {
     if (name in pkg[field]) {
       console.log('   删除 ' + field + '.' + name + ' = ' + JSON.stringify(pkg[field][name]))
       delete pkg[field][name]

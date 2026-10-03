@@ -20,9 +20,10 @@
  *                            只能由本脚本的 banner/footer 拼，拼完**逐字节校验**（见下方断言）：
  *                            外壳写错的表现是"整页 web boot 失败"，而那要重启应用才看得见。
  *
- * 2026-10-03：浏览器面原来是独立包 `packages/presentation` 的 `bundle-presentation.mjs` 打的。
+ * 2026-10-03：浏览器面原来由**第二个 cordis 条目**单独打一份 bundle（那个条目已删除）。
  * 折进主插件之后两半由同一个脚本产出——**因为它们必须同源**：宿主侧路由常量
- * (`src/presentation/route.ts`) 与浏览器侧轮询地址 (`client/src/main.ts`) 是同一条链的两端，
+ * （当时宿主侧那条只读路由与浏览器侧的轮询地址是同一条链的两端，现在那条链整个删了，
+ * 剩下的只有 pill 的三条路由 `src/pill/routes.ts` 与 `client/src/pill.ts` 这一对，）
  * 分在两个包里各打一次时，两边改一漏一的表现是"右栏永远不弹而日志全绿"（404 在这条路上被容忍）。
  *
  * 类型检查不在这里做：`pnpm typecheck` / `tsc -p tsconfig.json` 负责，

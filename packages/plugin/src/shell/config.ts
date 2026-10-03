@@ -41,7 +41,7 @@ export interface PluginConfig {
   /**
    * 状态栏那颗 pill（**配对的唯一入口**）。
    *
-   * 2026-10-03 这一半原来是"右栏自动弹码"（独立包 `dsh-remote-control-presentation`，键名
+   * 2026-10-03 这一半原来是"右栏自动弹码"（独立 cordis 条目，键名
    * `sidebarQr`，带 `imageFile`/`refreshMs` 两个落盘参数）。那套删了之后 pill 不需要任何
    * 宿主侧节拍与落盘——它要图的时候自己发请求。剩下的唯一开关就是"挂不挂那三条路由"。
    *

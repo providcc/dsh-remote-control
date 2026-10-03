@@ -1,10 +1,10 @@
 /**
- * presentation-isolation.test — "界面上那一半不许连累配对链路"这条隔离的对照测试。
+ * pill-isolation.test — "界面上那一半不许连累配对链路"这条隔离的对照测试。
  *
  * 2026-10-03 这一半原来是右栏自动弹码 + 一条只读路由；现在它是状态栏那颗 pill 的三条路由。
  * 隔离的形状没变：**它需要宿主的 `webServer` 服务，而主插件刻意不写任何 `inject:` 闸门**，
  * 所以"这代宿主没这个服务"时只有这一旁路不起，配对、中继、命令一行都不受影响。
- * 原来这条隔离是靠"拆成两个 cordis 条目"这个结构提供的，现在由 `src/presentation/pill.ts`
+ * 原来这条隔离是靠"拆成两个 cordis 条目"这个结构提供的，现在由 `src/pill/start.ts`
  * 的软探测提供——所以必须有对照测试钉住，否则"结构"没了，隔离也就没了。
  *
  * 判据的形式是**对照**而不是"没报错就行"：同一个假上下文跑两遍 `apply()`，唯一的差别是
@@ -30,7 +30,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../src/index.js'
-import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/presentation/pill-routes.js'
+import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE } from '../src/pill/routes.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'

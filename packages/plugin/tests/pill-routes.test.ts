@@ -1,7 +1,7 @@
 /**
- * presentation-pill-routes.test — 状态栏那颗 pill 那三条路由的判据。
+ * pill-routes.test — 状态栏那颗 pill 那三条路由的判据。
  *
- * 三条路由分两档安全姿态（动机写在 `src/presentation/pill-routes.ts` 文件头）：
+ * 三条路由分两档安全姿态（动机写在 `src/pill/routes.ts` 文件头）：
  * `POST /pairing/new` 会改状态（向中继申请一张新码），跨站判据是只有同源脚本发得出的
  * 自定义头 `x-drc-pair: 1`——**不是** `Origin`：桌面宿主的转发层会把它删掉，这一条是
  * 2026-10-03 在真屏幕上点出来才发现的。`GET /pairing.png` 与 `GET /status` 只读，
@@ -25,7 +25,7 @@ import {
   registerPillRoutes,
   type LivePairing,
   type PillRouteDeps,
-} from '../src/presentation/pill-routes.js'
+} from '../src/pill/routes.js'
 
 const FAKE_PSK = 'A'.repeat(64)
 const FAKE_TOKEN = '482913'

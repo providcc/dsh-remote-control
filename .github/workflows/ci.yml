@@ -64,7 +64,7 @@ jobs:
         run: |
           set -e
           # 2026-10-03 起本仓只有一个包：右栏那一半折进了 packages/plugin
-          # （原来这里是 packages/plugin + packages/presentation 两个）。
+          # （原来这里是 packages/plugin + 界面上那一半的独立包两个）。
           cd packages/plugin
           n="$(find dist/tests -name '*.test.js' | wc -l)"
           echo "packages/plugin 测试文件数：$n"

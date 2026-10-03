@@ -26,8 +26,8 @@ import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
 import { StatusFile } from './shell/status.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
-import { startPill, type PillHandle } from './presentation/pill.js'
-import { type LivePairing, type PillStatus } from './presentation/pill-routes.js'
+import { startPill, type PillHandle } from './pill/start.js'
+import { type LivePairing, type PillStatus } from './pill/routes.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -824,7 +824,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   // 运行时有 `tests/command-result.test.ts` 走一遍 apply() 注册出来的真 handler。
   //
   // **命令列表里没有 `pair`**（2026-10-03 拍板）：配对唯一入口是状态栏那颗 pill
-  // （`src/presentation/pill-routes.ts` 的 `POST /pairing/new` + `GET /pairing.png`）。
+  // （`src/pill/routes.ts` 的 `POST /pairing/new` + `GET /pairing.png`）。
   // 命令行发码那条路删掉不是嫌它多余，是因为它**发第二张**：`/drc pair` 走的是
   // `createPairing()`，会在 pill 那张之外再挂一个仍然有效的 PSK，而手机扫的是屏幕上那张——
   // 正是当初"多码事故"的形状。入口不可用时的排查走 `problems` 里那条 `warn:pill`。

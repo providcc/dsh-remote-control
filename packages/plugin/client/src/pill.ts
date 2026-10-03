@@ -23,7 +23,7 @@
  * 纪律与主文件同一条：**任何一步抛出都只留一行日志，绝不把异常抛进 loader**。
  */
 
-/** pill 用到的三条路由（宿主侧定义在 `src/presentation/pill-routes.ts`，字符串必须一致）。 */
+/** pill 用到的三条路由（宿主侧定义在 `src/pill/routes.ts`，字符串必须一致）。 */
 export const STATUS_ROUTE = '/plugins/dsh-remote-control/status'
 export const NEW_ROUTE = '/plugins/dsh-remote-control/pairing/new'
 export const IMAGE_ROUTE = '/plugins/dsh-remote-control/pairing.png'

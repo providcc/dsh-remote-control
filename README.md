@@ -15,10 +15,10 @@
 | -------------------------------------- | -------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`packages/plugin`](./packages/plugin) | `dsh-remote-control` | **npm** + bundle | 主插件：配对、中继连接、会话与命令、审批转发、防休眠，**外加**界面上的那一半：状态栏那颗"点一下配对"的 pill（三条同域路由 + 浏览器面 `client.cjs`） |
 
-> 界面上那一半原来是独立的 `packages/presentation`（`dsh-remote-control-presentation`，不发 npm）。
+> 界面上那一半原来是一个独立的 cordis 条目（包名带 `-presentation` 后缀，从未发到 npm）。
 > 拆包只是为了"某一代宿主没有 `webServer` 服务时，只有那一行不激活、配对/中继一行都不受影响"；
-> 折成一个包之后同样的隔离由代码提供——`src/presentation/pill.ts` 只软探测 `webServer`，
-> 拿不到就整半不起，`tests/presentation-isolation.test.ts` 用逐字段对照把这条钉住。
+> 折成一个包之后同样的隔离由代码提供——`src/pill/start.ts` 只软探测 `webServer`，
+> 拿不到就整半不起，`tests/pill-isolation.test.ts` 用逐字段对照把这条钉住。
 > 那一半原来还带着"右栏自动弹码"（宿主按节拍渲染 PNG 落到会话工作区、浏览器面轮询后顶开右栏）；
 > 2026-10-03 连终端文本码一起删了，**配对入口只剩这颗 pill**。
 
@@ -127,14 +127,14 @@ pnpm format:check     # prettier --check
 
 测试就是普通的 `node --test` 文件，没有测试框架，运行期不做转译。动到界面那一半时盯住三组：
 
-- `presentation-pill-routes.test.ts` — 三条路由的判据：发码幂等、写路由的跨站判据是那个
+- `pill-routes.test.ts` — 三条路由的判据：发码幂等、写路由的跨站判据是那个
   **同源才发得出的 `x-drc-pair` 头而不是 `Origin`**（桌面宿主会删 `origin`，真机量过）、
   回答里不许出现 `psk`/完整 URI、图片路由真的渲染出 PNG 字节、半途挂不上要回滚已挂的那几条。
-- `presentation-isolation.test.ts` — 对照：同一份假上下文跑两遍 `apply()`，只差有没有
+- `pill-isolation.test.ts` — 对照：同一份假上下文跑两遍 `apply()`，只差有没有
   `webServer`，主链路可观察字段**逐个相等**、`/drc unpair` 返回**逐字节相等**，
   差别只许出现在 `pill` 探针与那一条 `warn:pill` 上；`hint` 在两种宿主上都不许再有 `pair`。
   含一条 `lateWeb`：`webServer` 由注入回调**晚到**时，挂上之后 `warn:pill` 必须自己消失。
-- `presentation-client-bundle.test.ts` — 在 vm 里真跑**打出来的** `client.cjs`：pill 注册进
+- `client-bundle.test.ts` — 在 vm 里真跑**打出来的** `client.cjs`：pill 注册进
   `conversation.composer.dock`、点击发码、图与 6 位码进面板、倒计时走完自动换码，
   以及拿不到 react / 探不到 slots 时**只许降级成"没有 pill"、绝不抛出 apply**。
   假上下文的 `slots` 既能同步给、也能演"晚到"（`lateSlots` + `flushInject`）——

@@ -31,7 +31,7 @@ import {
   PAIR_MARKER_VALUE,
   PAIR_NEW_ROUTE,
   PAIR_STATUS_ROUTE,
-} from '../src/presentation/pill-routes.js'
+} from '../src/pill/routes.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT = path.resolve(here, '..', 'bundle', 'client.cjs')
