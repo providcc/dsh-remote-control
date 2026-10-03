@@ -22,7 +22,8 @@
     "x25519",
     "xsalsa20-poly1305",
     "qrcode",
-    "sidebar"
+    "pill",
+    "status-bar"
   ],
   "engines": {
     "node": ">=20"

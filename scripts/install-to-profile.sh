@@ -117,7 +117,7 @@ const file = '$PROFILE/package.json'
 const id = '$BUNDLE_ID'
 if (!existsSync(file)) { console.error('profile 没有 package.json：' + file); process.exit(1) }
 // 改写前留一份原文：这文件里同时带着 hostToken，改坏了要能一眼回退。
-// 只留**一份**滚动备份。以前每次运行都写一个 `.bak-drc-<时间戳>`，本机跑过 83 次就是
+// 只留**一份**滚动备份。以前每次运行都写一个「.bak-drc-<时间戳>」，本机跑过 83 次就是
 // 83 份带凭据的副本躺在 profile 里——那不是"能回退"，那是把凭据多复制了 83 遍。
 // 所以先把历史遗留的时间戳副本一起清掉（只清本脚本自己写的那种名字）。
 const dir = file.slice(0, file.lastIndexOf('/'))

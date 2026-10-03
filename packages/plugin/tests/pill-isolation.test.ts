@@ -185,6 +185,8 @@ function boot(
     serverUrl: 'ws://127.0.0.1:1',
     hostToken: FAKE_TOKEN,
     hostId: 'isolation_host',
+    // 连接信息那一栏要把本机名原样带出来，所以这里给一个可断言的值（默认值是 `dsh-host`）。
+    hostLabel: 'linbin-desk',
     statusFile: path.join(statusDir, 'status.json'),
     mockBridge: true,
     pairOnStartSec: 0,
@@ -518,15 +520,20 @@ test('pill 那三条挂上去的就是带守卫的那三条（接线，不是又
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: '127.0.0.1:5173' })).status, 204)
     assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: 'evil.example.com' })).status, 403)
 
-    // 抬头那句状态：只读（Origin 缺席放过），字段集合就那三个。
+    // 抬头那句状态 + 点开那几行连接信息：只读（Origin 缺席放过），字段集合就那四个。
     // `relay` 允许 offline / connecting 两种——保活重连在跑，这里钉死一种就是计时器测试。
     const status = await run(PAIR_STATUS_ROUTE, 'GET', { host: '127.0.0.1:5173' })
     assert.equal(status.status, 200, status.body)
     const shown = JSON.parse(status.body) as Record<string, unknown>
-    assert.deepEqual(Object.keys(shown).sort(), ['hasCode', 'paired', 'relay'], '状态路由多出字段就是要重新审一遍')
+    assert.deepEqual(
+      Object.keys(shown).sort(),
+      ['hostLabel', 'paired', 'relay', 'serverUrl'],
+      '状态路由多出字段就是要重新审一遍（这四个全是非凭据）',
+    )
     assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
     assert.equal(shown.paired, 0)
-    assert.equal(shown.hasCode, false, '中继不可达时发不出码，hasCode 必须跟着说实话')
+    assert.equal(shown.hostLabel, 'linbin-desk', '连接信息里那句本机名要来自配置，不是写死的')
+    assert.equal(shown.serverUrl, 'ws://127.0.0.1:1', '中继地址就是插件连的那个，浏览器面不许自己猜')
 
     // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。
     assert.ok(!ok.body.includes('psk'), `回答里出现了 psk：${ok.body}`)

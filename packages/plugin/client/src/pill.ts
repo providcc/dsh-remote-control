@@ -1,9 +1,10 @@
 /**
- * pill — 状态栏那颗"点一下配对"的 pill（浏览器那一半）。
+ * pill — 状态栏那颗写"未配对 / 已配对"的 pill（浏览器那一半）。
  *
  * 它做三件事：往宿主的 `conversation.composer.dock` 槽位注册一颗 pill，按节拍问
- * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时 `POST /pairing/new`
- * 要一张码、再把 `GET /pairing.png` 显示在弹出的面板里。
+ * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时弹面板——面板顶部那几行
+ * 就是那四个字段读出来的"连接信息"，要配对得再按一次"生成配对码"（`POST /pairing/new`，
+ * 再把 `GET /pairing.png` 画在同一个面板里）。
  *
  * 三条形状上的决定都有据可查，不是随手挑的：
  *
@@ -59,7 +60,8 @@ export type CreateElement = (type: unknown, props: Record<string, unknown>) => u
 interface StatusAnswer {
   relay?: unknown
   paired?: unknown
-  hasCode?: unknown
+  hostLabel?: unknown
+  serverUrl?: unknown
 }
 
 interface NewAnswer {
@@ -107,13 +109,20 @@ export function panelViewFor(answer: NewAnswer | undefined, httpStatus: number):
 }
 
 export type PanelView =
-  | { kind: 'idle' }
+  | { kind: 'info' }
   | { kind: 'loading' }
   | { kind: 'qr'; token: string; expiresInMs: number; imageSrc: string }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'failed'; detail: string }
 
-/** 状态 → pill 上那一句。顺序就是优先级：先说连不上，再说要不要配对。 */
+/**
+ * 状态 → pill 上那一句。顺序就是优先级：先说连不上，再说配没配上。
+ *
+ * 抬头那句只说**结论**，不说数量也不说进度：`已连 N 台` 在那一排被压窄时会竖着断行（真屏幕
+ * 踩过，见 CSS），而"配对中"这种中间态写在抬头上没人看得懂——码是不是还在、还剩几秒，
+ * 点进去那几行连接信息里都有。所以未配上的两种情形（没有效码 / 有码还没人扫）合成一句
+ * `未配对`，灯跟着走灰色：灰色才是"还没配上"的颜色。
+ */
 export function pillLabel(status: StatusAnswer | undefined): { text: string; tone: 'off' | 'wait' | 'on' } {
   const relay = status?.relay
   if (relay === 'idle') return { text: '远程未启动', tone: 'off' }
@@ -121,8 +130,41 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
   if (relay === 'connecting') return { text: '连接中', tone: 'wait' }
   if (relay !== 'online') return { text: '远程控制', tone: 'off' }
   const paired = typeof status?.paired === 'number' ? status.paired : 0
-  if (paired > 0) return { text: `已连 ${paired} 台`, tone: 'on' }
-  return status?.hasCode === true ? { text: '配对中', tone: 'on' } : { text: '点一下配对', tone: 'on' }
+  return paired > 0 ? { text: '已配对', tone: 'on' } : { text: '未配对', tone: 'off' }
+}
+
+/** 中继状态说成人话，用在"连接信息"那一栏（抬头那句是另一套更短的说法）。 */
+const RELAY_TEXT: Record<string, string> = {
+  online: '已连接',
+  connecting: '连接中',
+  offline: '未连接',
+  idle: '未启动',
+}
+
+/**
+ * 中继地址只留 `host:port`：弹窗宽 240px，那条 URL 带着 scheme 和 path 会挤掉别的行，
+ * 而用户排错要认的就是"连的哪一台"。这里**不用 `new URL`**——这段 DOM 也跑在单测那个 vm 里，
+ * 少一个全局依赖就少一类"在 vm 里退化成整条字符串"的假象。
+ */
+export function relayAddress(url: unknown): string {
+  if (typeof url !== 'string' || url.trim() === '') return ''
+  const withoutScheme = url.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+  // authority 就是 scheme 之后、第一个 `/` 或 `?` 之前那一段。
+  const authority = /^[^/?]*/.exec(withoutScheme)?.[0] ?? ''
+  return authority.slice(0, 40)
+}
+
+/** 面板顶部那几行"连接信息"——四个非凭据字段，绝不含 6 位码 / PSK / 配对 URI。 */
+export function infoRows(status: StatusAnswer | undefined): Array<[string, string]> {
+  const rows: Array<[string, string]> = []
+  const label = typeof status?.hostLabel === 'string' ? status.hostLabel.trim() : ''
+  if (label !== '') rows.push(['本机', label])
+  const server = relayAddress(status?.serverUrl)
+  if (server !== '') rows.push(['中继', server])
+  const relay = typeof status?.relay === 'string' ? status.relay : ''
+  rows.push(['状态', RELAY_TEXT[relay] ?? '未知'])
+  rows.push(['已配对', `${typeof status?.paired === 'number' ? status.paired : 0} 台`])
+  return rows
 }
 
 /** 秒数说成人话：62 秒说"1 分 2 秒"——用户扫一张码不该数秒。 */
@@ -150,6 +192,12 @@ const CSS = `
   background: var(--dsw-specific-tip, var(--dsw-alias-bg-layer-1, #ffffff));
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.06);
   color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; }
+/* 连接信息那一栏：键左值右，值被截断时省略号——和那颗 pill 同一套"挤不下就截文字不撑容器"。 */
+.drc-info { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.08)); }
+.drc-row { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+.drc-key { flex: 0 0 auto; color: var(--dsw-alias-label-tertiary); }
+.drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: right; }
 .drc-qr { display: block; width: 200px; height: 200px; margin: 0 auto; image-rendering: pixelated; }
 .drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
 .drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
@@ -269,10 +317,13 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   let panel: HTMLElement | undefined
   let statusTimer: ReturnType<typeof setInterval> | undefined
   let countTimer: ReturnType<typeof setInterval> | undefined
-  let view: PanelView = { kind: 'idle' }
+  let view: PanelView = { kind: 'info' }
   let expiresInMs = 0
   let lastStatus: StatusAnswer | undefined
   let disposed = false
+
+  /** 面板上那颗按钮的文案要跟着抬头那句走，所以这里读的是同一份轮询结果。 */
+  const pairedNow = (): number => (typeof lastStatus?.paired === 'number' ? lastStatus.paired : 0)
 
   const write = (): void => {
     const next = pillLabel(lastStatus)
@@ -298,9 +349,33 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     return node
   }
 
+  /** 面板顶部那几行连接信息；没探到状态（第一次轮询还没回来）时不占地方。 */
+  const infoBlock = (): HTMLElement | undefined => {
+    if (!lastStatus) return undefined
+    const box = doc.createElement('div')
+    box.className = 'drc-info'
+    for (const [key, value] of infoRows(lastStatus)) {
+      const row = doc.createElement('div')
+      row.className = 'drc-row'
+      row.appendChild(text('span', 'drc-key', key))
+      row.appendChild(text('span', 'drc-value', value))
+      box.appendChild(row)
+    }
+    return box
+  }
+
   const paint = (): void => {
     if (!panel) return
     panel.replaceChildren()
+    const info = infoBlock()
+    if (info) panel.appendChild(info)
+    if (view.kind === 'info') {
+      const actions = doc.createElement('div')
+      actions.className = 'drc-actions'
+      actions.appendChild(buttonOf(pairedNow() > 0 ? '再配一台' : '生成配对码', () => void requestPairing()))
+      panel.appendChild(actions)
+      return
+    }
     if (view.kind === 'loading') {
       panel.appendChild(text('p', 'drc-note', '正在生成配对码…'))
       return
@@ -312,31 +387,28 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       image.src = view.imageSrc
       panel.appendChild(image)
       panel.appendChild(text('p', 'drc-code', view.token))
-      // 6 位码必须和 QR 一起在场：QR 在小屏/低对比度下扫不出来时，手输是唯一退路。
-      panel.appendChild(text('p', 'drc-note', `小程序里扫码，或手输这 6 位数字 · ${secondsText(expiresInMs)}后过期`))
+      // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路），但那句话不用说满：
+      // 面板顶部已经有连接信息，这行只负责"什么时候作废"。
+      panel.appendChild(text('p', 'drc-note', `扫码配对 · ${secondsText(expiresInMs)}后过期`))
       const actions = doc.createElement('div')
       actions.className = 'drc-actions'
-      actions.appendChild(buttonOf('换一张', () => void requestPairing(true)))
+      actions.appendChild(buttonOf('换一张', () => void requestPairing()))
       panel.appendChild(actions)
       return
     }
     const note =
       view.kind === 'unavailable'
         ? text('p', 'drc-note', view.reason)
-        : view.kind === 'failed'
-          ? (() => {
-              const node = text('p', 'drc-note', `配对请求没成功：${view.detail}`)
-              node.setAttribute('data-kind', 'failed')
-              return node
-            })()
-          : text('p', 'drc-note', '点一下生成配对二维码。')
+        : (() => {
+            const node = text('p', 'drc-note', `配对请求没成功：${view.detail}`)
+            node.setAttribute('data-kind', 'failed')
+            return node
+          })()
     panel.appendChild(note)
-    if (view.kind !== 'idle') {
-      const actions = doc.createElement('div')
-      actions.className = 'drc-actions'
-      actions.appendChild(buttonOf('再试一次', () => void requestPairing(true)))
-      panel.appendChild(actions)
-    }
+    const actions = doc.createElement('div')
+    actions.className = 'drc-actions'
+    actions.appendChild(buttonOf('再试一次', () => void requestPairing()))
+    panel.appendChild(actions)
   }
 
   const closePanel = (): void => {
@@ -351,13 +423,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     button.setAttribute('aria-expanded', 'false')
   }
 
-  async function requestPairing(force: boolean): Promise<void> {
+  async function requestPairing(): Promise<void> {
     if (disposed || !panel) return
-    // 已经有码时不重画成"正在生成"——那会让屏幕上闪一下白。
-    if (view.kind !== 'qr' || force) {
-      view = { kind: 'loading' }
-      paint()
-    }
+    view = { kind: 'loading' }
+    paint()
     let answer: NewAnswer | undefined
     let httpStatus = 0
     try {
@@ -384,7 +453,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
         countTimer = setInterval(() => {
           expiresInMs -= 1000
           // 到点自动再要一张：此刻宿主那边的 current() 已判过期，幂等入口会真的发新的。
-          if (expiresInMs <= 0) void requestPairing(true)
+          if (expiresInMs <= 0) void requestPairing()
           else paint()
         }, 1000)
       }
@@ -397,12 +466,20 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     panel = doc.createElement('div')
     panel.className = 'drc-panel'
     panel.setAttribute('role', 'dialog')
-    panel.setAttribute('aria-label', 'dsh-remote-control 配对')
+    panel.setAttribute('aria-label', 'dsh-remote-control 连接信息')
     panel.tabIndex = -1
     root.appendChild(panel)
     button.setAttribute('aria-expanded', 'true')
+    /**
+     * 点开**只给连接信息**，发码要人再按一下那颗按钮。
+     *
+     * 原来这里是"点 pill = 发码"，因为那颗 pill 唯一的用途就是配对。现在抬头那句已经是
+     * 状态（`未配对` / `已配对`），点它的第一预期变成"看一眼连得怎么样"，于是发码不再是
+     * 点开的副产品：一张码是有寿命的资源，`ensureFresh` 虽然幂等，把"看一眼"接到它上面
+     * 就等于每次点开都可能向中继申请一张新的挂在 pending 表里。
+     */
+    view = { kind: 'info' }
     paint()
-    void requestPairing(false)
     try {
       panel.focus()
     } catch {

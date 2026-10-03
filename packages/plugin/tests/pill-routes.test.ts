@@ -89,7 +89,12 @@ function deps(over: Partial<PillRouteDeps> = {}): PillRouteDeps & { calls: { ens
       calls.current += 1
       return live
     },
-    status: () => ({ relay: 'online', paired: 1, hasCode: true }),
+    status: () => ({
+      relay: 'online',
+      paired: 1,
+      hostLabel: 'desk-01',
+      serverUrl: 'wss://relay.example.com:443/relay',
+    }),
     log: () => {},
     ...over,
   }
@@ -260,13 +265,18 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
 
-test('状态路由只出三个非凭据字段：relay / paired / hasCode', async () => {
+test('状态路由只出四个非凭据字段：relay / paired / hostLabel / serverUrl', async () => {
   const d = deps()
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
   const got = reply()
   assert.equal(got.status, 200)
-  assert.deepEqual(JSON.parse(got.body), { relay: 'online', paired: 1, hasCode: true })
+  assert.deepEqual(JSON.parse(got.body), {
+    relay: 'online',
+    paired: 1,
+    hostLabel: 'desk-01',
+    serverUrl: 'wss://relay.example.com:443/relay',
+  })
   const raw = got.body
   for (const secret of [FAKE_PSK, FAKE_QR, FAKE_TOKEN, 'dshr:']) {
     assert.ok(!raw.includes(secret), `状态回答里出现了 ${secret}：${raw}`)
@@ -275,10 +285,17 @@ test('状态路由只出三个非凭据字段：relay / paired / hasCode', async
 })
 
 test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的是"没启动"而不是"断了"）', async () => {
-  const d = deps({ status: () => ({ relay: 'idle', paired: 0, hasCode: false }) })
+  const d = deps({
+    status: () => ({ relay: 'idle', paired: 0, hostLabel: 'desk-01', serverUrl: 'wss://relay.example.com:443/relay' }),
+  })
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
-  assert.deepEqual(JSON.parse(reply().body), { relay: 'idle', paired: 0, hasCode: false })
+  assert.deepEqual(JSON.parse(reply().body), {
+    relay: 'idle',
+    paired: 0,
+    hostLabel: 'desk-01',
+    serverUrl: 'wss://relay.example.com:443/relay',
+  })
 })
 
 test('状态路由是只读的：Origin 缺席放过，非环回 Host 仍拒，POST 拒', async () => {

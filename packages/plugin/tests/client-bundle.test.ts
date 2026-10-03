@@ -8,7 +8,7 @@
  *
  *   1. 外壳注册成功、id 与包名一致、导出的是 `{name, inject, apply}`；
  *   2. 状态栏那颗 pill：向装载器拿 react、软探测 `slots`、往 `conversation.composer.dock`
- *      注册、点击发码、把图与 6 位码画进面板；
+ *      注册、点开给连接信息、再按一次才发码并把图与 6 位码画进面板；
  *   3. **任何一条依赖拿不到时只降级成"没有 pill"**：apply 绝不外抛（那会整页起不来），
  *      并且留下一行 warn 说明缺的是哪一样；
  *   4. 发码请求必须带宿主那道守卫要的自定义头（两半的分叉在这里对上）。
@@ -226,9 +226,33 @@ async function flush(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
+/**
+ * 走"点开 → 再按发码那颗"这两步。
+ *
+ * 第二步是**这条用例存在的原因**：点开那颗 pill 只给连接信息，发码必须人再按一次，
+ * 所以任何"看 QR / 看 6 位码 / 看倒计时"的断言都得先按这一下。少按一下就等于在断言
+ * "面板停在信息上"，那条就会假绿。
+ */
+async function openPairing(root: FakeElement): Promise<void> {
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  const button = root.find('drc-btn')
+  assert.ok(button, `面板里必须有一颗能按的按钮：${root.allText()}`)
+  button!.emit('click')
+  await flush()
+}
+
 /** 一颗够用的假 react：这一半只用 createElement。 */
 const FAKE_REACT = {
   createElement: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
+}
+
+/** `/status` 那条的默认回答：在线、一台都没配上。 */
+const DEFAULT_STATUS = {
+  relay: 'online',
+  paired: 0,
+  hostLabel: 'desk-01',
+  serverUrl: 'wss://relay.example.com:443/relay',
 }
 
 function load(options: LoadOptions = {}): Harness {
@@ -275,7 +299,7 @@ function load(options: LoadOptions = {}): Harness {
         return {
           ok: true,
           status: 200,
-          json: async () => options.status ?? { relay: 'online', paired: 0, hasCode: false },
+          json: async () => options.status ?? DEFAULT_STATUS,
         }
       }
       assert.equal(method, 'GET', `${url} 不该收到 ${method}`)
@@ -457,21 +481,35 @@ test('注册进 conversation.composer.dock：槽位名、id、order 都要对', 
 })
 
 test('挂载之后抬头写的是状态路由给的那句', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'online', paired: 2, hasCode: false } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 2 } })
   const root = harness.mountPill()
   await flush()
   const pill = root.find('drc-pill')
   assert.ok(pill, `那颗按钮必须建出来：${root.allText()}`)
   // 抬头那句写在按钮里那个 `drc-label` 上，取它而不是按钮：假 DOM 的 textContent 不聚合后代。
-  assert.equal(root.find('drc-label')!.textContent, '已连 2 台')
-  assert.equal(pill!.getAttribute('aria-label'), '已连 2 台')
+  // 配上了几句台数**不写进抬头**：那排宽度是宿主给的，中文会被逐字断行（见下一条用例），
+  // 而"几台"这件事点进去那栏连接信息里看得见。
+  assert.equal(root.find('drc-label')!.textContent, '已配对')
+  assert.equal(pill!.getAttribute('aria-label'), '已配对')
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'on', '灯的颜色由 tone 决定')
+})
+
+test('在线但一台没配上：抬头是"未配对"，灯必须是灰的', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true })
+  const root = harness.mountPill()
+  await flush()
+  assert.equal(root.find('drc-label')!.textContent, '未配对')
+  assert.equal(
+    root.find('drc-dot')!.getAttribute('data-tone'),
+    'off',
+    '绿色只能给"真的配上了一台"，一张还没人扫的码不算',
+  )
 })
 
 test('那一排挤不下时只许省略号，不许把中文逐字断行（真屏幕截图抓到的形状）', async () => {
   // 现场：宿主 dock 已经挤到 `6 轮 …`、`1.6M to…`，而我们那颗 `已连 1 台` 被压成竖排四个字。
   // flex 项默认可以缩到"中文的最小内容宽度 = 一个字"，所以 nowrap + 省略号必须写死在样式里。
-  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'online', paired: 1, hasCode: false } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
   const root = harness.mountPill()
   await flush()
   const css = harness.fakeDocument().head.children.find((node) => node.tag === 'style')?.textContent ?? ''
@@ -484,12 +522,12 @@ test('那一排挤不下时只许省略号，不许把中文逐字断行（真�
   )
   // 截断之后全文仍然取得到（悬浮与读屏都靠这两条）
   const pill = root.find('drc-pill')!
-  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已连 1 台')
-  assert.equal(pill.getAttribute('aria-label'), '已连 1 台')
+  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已配对')
+  assert.equal(pill.getAttribute('aria-label'), '已配对')
 })
 
 test('中继没连上时说的是"远程未连接"，不许假装有得配', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'offline', paired: 0, hasCode: false } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, relay: 'offline' } })
   const root = harness.mountPill()
   await flush()
   assert.equal(root.find('drc-label')!.textContent, '远程未连接')
@@ -497,7 +535,7 @@ test('中继没连上时说的是"远程未连接"，不许假装有得配', asy
 })
 
 test('runtime 还没起来时说"远程未启动"：idle 与 offline 是两件事', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { relay: 'idle', paired: 0, hasCode: false } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, relay: 'idle' } })
   const root = harness.mountPill()
   await flush()
   assert.equal(root.find('drc-label')!.textContent, '远程未启动')
@@ -514,18 +552,50 @@ test('页面不可见时不轮状态（Electron 里窗口在后台是常态）',
   )
 })
 
-test('点击：POST 发码那条，再把图与 6 位码画进面板；epoch 进图片 URL', async () => {
+test('点开只给连接信息，不许顺手发码：发码是面板里那一次显式的按下', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
   root.find('drc-pill')!.emit('click')
   await flush()
 
+  assert.ok(root.find('drc-panel'), '面板要弹出来')
+  assert.equal(
+    harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '点开就发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
+  )
+  const rows = root.find('drc-info')!
+  assert.ok(rows, `面板顶部要有那几行连接信息：${root.allText()}`)
+  const flat = rows.allText()
+  assert.match(flat, /desk-01/, '本机名')
+  assert.match(flat, /relay\.example\.com:443/, '中继地址只留 host:port——scheme 和 path 会挤掉别的行')
+  assert.ok(!flat.includes('wss://'), `连接信息里不许出现完整 URI：${flat}`)
+  assert.match(flat, /已连接/, '状态')
+  assert.match(flat, /0 台/, '配了几台')
+  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+})
+
+test('已经配上时那颗按钮改叫"再配一台"，抬头那句是"已配对"', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  assert.equal(root.find('drc-btn')!.textContent, '再配一台')
+  assert.match(root.find('drc-info')!.allText(), /1 台/)
+})
+
+test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板；epoch 进图片 URL', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true })
+  const root = harness.mountPill()
+  await openPairing(root)
+
   assert.ok(harness.requests.includes(PAIR_NEW_ROUTE), `必须真的打过发码那条：${harness.requests.join(' | ')}`)
   assert.ok(root.find('drc-panel'), '面板要弹出来')
   assert.equal(root.find('drc-qr')!.src, `${PAIR_IMAGE_ROUTE}?e=e1`, '图片地址要带上这一版码的 epoch')
   assert.equal(root.find('drc-code')!.textContent, '482913', '6 位码必须与 QR 同时在屏上——手输是唯一退路')
-  assert.match(root.find('drc-note')!.textContent, /手输这 6 位数字/)
+  assert.equal(root.find('drc-note')!.textContent, '扫码配对 · 1 分 0 秒后过期')
   assert.equal(root.find('drc-pill')!.getAttribute('aria-expanded'), 'true')
 })
 
@@ -536,9 +606,7 @@ test('200 + state:"unavailable" 不是成功：面板要说明白，不许弹一
     newAnswer: { state: 'unavailable', reason: 'relay-offline' },
   })
   const root = harness.mountPill()
-  await flush()
-  root.find('drc-pill')!.emit('click')
-  await flush()
+  await openPairing(root)
   assert.equal(root.find('drc-qr'), undefined, '没有码就不该有那张图')
   assert.match(root.find('drc-note')!.textContent, /中继还没连上/)
   assert.ok(root.find('drc-btn'), '要给一句"再试一次"，别让人以为插件坏了')
@@ -551,9 +619,7 @@ test('守卫拒了就把是哪一道印在屏幕上：那是浏览器面唯一�
     newAnswer: { error: 'request-not-trusted', guard: 'pair-marker-missing' },
   })
   const root = harness.mountPill()
-  await flush()
-  root.find('drc-pill')!.emit('click')
-  await flush()
+  await openPairing(root)
   assert.match(root.find('drc-note')!.textContent, /request-not-trusted/, '要把宿主说的原因带出来')
   assert.match(root.find('drc-note')!.textContent, /pair-marker-missing/, '更要带出是哪一道守卫')
 })
@@ -561,9 +627,7 @@ test('守卫拒了就把是哪一道印在屏幕上：那是浏览器面唯一�
 test('发码那条直接断（fetch 抛）：面板显示失败原因，不抛出、不白屏', async () => {
   const harness = load({ react: FAKE_REACT, slots: true, newThrows: true })
   const root = harness.mountPill()
-  await flush()
-  root.find('drc-pill')!.emit('click')
-  await flush()
+  await openPairing(root)
   assert.match(root.find('drc-note')!.textContent, /配对请求没成功/)
   assert.equal(harness.errors.length, 0)
 })
@@ -598,9 +662,7 @@ test('码的寿命走完会自动再要一张（幂等入口此刻才会真的�
     newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 1_000 },
   })
   const root = harness.mountPill()
-  await flush()
-  root.find('drc-pill')!.emit('click')
-  await flush()
+  await openPairing(root)
   assert.equal(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length, 1)
   // 节拍次序：0 = pill 状态轮询，1 = 面板倒计时。
   assert.equal(harness.timerCount(), 2, '该有两个节拍')

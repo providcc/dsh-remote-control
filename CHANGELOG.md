@@ -14,13 +14,16 @@
 
 ### 新增
 
-- **状态栏那颗 pill：点一下配对**。宿主侧三条同域路由——`POST /plugins/dsh-remote-control/pairing/new`
-  （幂等发码）、`GET /plugins/dsh-remote-control/pairing.png`（弹窗里那张二维码，按需现渲染，
-  `no-store` + `ETag` 用同一口径的 epoch）、`GET /plugins/dsh-remote-control/status`（pill 抬头那句
-  连接状态：`relay` / `paired` / `hasCode`）。浏览器面把一颗 pill 注册进宿主的
-  `conversation.composer.dock` 槽位：平时显示连接状态（`远程未启动` / `远程未连接` / `连接中` /
-  `配对中` / `已连 N 台`），点一下当场发码并把二维码弹在同一颗按钮上方，6 位数字与 QR 同时在屏上
-  （扫不出来时的唯一退路），寿命走完自动再要一张。
+- **状态栏那颗 pill：抬头是状态，点开是连接信息，发码要再按一次**。宿主侧三条同域路由——
+  `POST /plugins/dsh-remote-control/pairing/new`（幂等发码）、`GET /plugins/dsh-remote-control/pairing.png`
+  （弹窗里那张二维码，按需现渲染，`no-store` + `ETag` 用同一口径的 epoch）、
+  `GET /plugins/dsh-remote-control/status`（四个非凭据字段：`relay` / `paired` / `hostLabel` /
+  `serverUrl`）。浏览器面把一颗 pill 注册进宿主的 `conversation.composer.dock` 槽位：
+  抬头那句是 `远程未启动` / `远程未连接` / `连接中` / `未配对` / `已配对`，灯分别是灰 / 灰 / 黄 / 灰 / 绿
+  （"有码还没人扫"不再单列一句，也不再给绿灯——绿只能表示真配上了一台）。点一下弹面板，顶部那几行
+  就是上面四个字段读出来的**连接信息**（本机名、中继 `host:port`、状态、配了几台），发码是面板里那颗
+  **生成配对码**（已配上时改叫**再配一台**）——点开不再顺手向中继申请码，"看一眼"不该消耗 pending 表。
+  按下去之后二维码与 6 位数字同时在场（扫不出来时的唯一退路），寿命走完自动再要一张。
 - 三条回答里**都不含 `psk`，也不含完整配对 URI**。发码那条是**会改状态**的路由，跨站判据是一个
   只有同源脚本发得出的自定义头 `x-drc-pair: 1`（跨站要带它必然触发 CORS 预检，而这条服务不答应
   预检）；`Origin` 存在时仍要判（环回 http(s) 或宿主自己的 `dsh-app:` 这类自定义 scheme），

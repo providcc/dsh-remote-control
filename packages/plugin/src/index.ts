@@ -413,14 +413,16 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
 
   /**
-   * pill 抬头那句"连接状态"：三个非凭据字段，取值口径与 `status.json` 完全一致
+   * pill 抬头那句"连接状态"与点开那几行"连接信息"：取值口径与 `status.json` 完全一致
    * （同一个 `relayState()`、同一个 `conversationCount`），免得两处说两种话。
+   * 这里出去的四个字段都不是凭据——6 位码、PSK、配对 URI 一个都不带。
    */
   function pillStatus(): PillStatus {
     return {
       relay: relay ? relayState() : 'idle',
       paired: relay?.conversationCount ?? 0,
-      hasCode: currentPairing() !== null,
+      hostLabel: config.hostLabel,
+      serverUrl: config.serverUrl,
     }
   }
 

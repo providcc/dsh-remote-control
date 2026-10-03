@@ -3,7 +3,7 @@
  *
  *   `POST /plugins/dsh-remote-control/pairing/new`  点一下要一张能用的码（幂等）
  *   `GET  /plugins/dsh-remote-control/pairing.png`  弹窗里那张二维码图
- *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句"连接状态"
+ *   `GET  /plugins/dsh-remote-control/status`       pill 抬头那句状态 + 点开那几行连接信息
  *
  * 三条都是**按需**的：宿主侧不再有"按节拍渲染并落盘"那一半（右栏自动弹码方案 2026-10-03 删除），
  * 图在有人要的时候现渲染，状态在 pill 问的时候现读。
@@ -49,14 +49,22 @@ export interface LivePairing {
   expiresAt: number
 }
 
-/** pill 上要显示的那句"连接状态"：三个非凭据字段，别的一律不出。 */
+/**
+ * pill 上那句"连接状态"与点开看到的那几行"连接信息"：四个非凭据字段，别的一律不出。
+ *
+ * `hostLabel` 与 `serverUrl` 是**已经印在手机上看到的东西**（配对 URI 里就带着这两条，
+ * `status.json` 也有），不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，
+ * 也没有那条 URI 的任何片段。
+ */
 export interface PillStatus {
   /** 与 `status.json` 的 `relay` 同一取值集合：`idle` 是"runtime 还没起来"，不是"断了"。 */
   relay: 'online' | 'connecting' | 'offline' | 'idle'
-  /** 当前配对着的手机数量。 */
+  /** 当前配对着的手机数量；pill 抬头那句"已配对"与点开那句"已配对 N 台"都读它。 */
   paired: number
-  /** 现在有没有一张仍然有效的码（决定 pill 显示"点一下配对"还是"配对中"）。 */
-  hasCode: boolean
+  /** 本机在那台手机上显示的名字（`hostLabel`）。 */
+  hostLabel: string
+  /** 中继地址（原样），连接信息那一栏要说清连的是哪台。 */
+  serverUrl: string
 }
 
 export interface PillRouteDeps {
@@ -242,7 +250,12 @@ export function pillStatusHandler(deps: PillRouteDeps) {
     }
     try {
       const status = deps.status()
-      json(response, 200, { relay: status.relay, paired: status.paired, hasCode: status.hasCode })
+      json(response, 200, {
+        relay: status.relay,
+        paired: status.paired,
+        hostLabel: status.hostLabel,
+        serverUrl: status.serverUrl,
+      })
     } catch (error) {
       json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
     }
