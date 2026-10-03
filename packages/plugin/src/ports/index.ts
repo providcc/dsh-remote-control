@@ -18,7 +18,7 @@
  *    平台对象一律在适配器里折叠完再出来。这样协议层的 `SessionSummary` 与内核
  *    代际变化之间有一层可测的翻译，而不是满屏 `as any`。
  */
-import type { QuestionItem, SessionSummary } from 'dsh-remote-wire'
+import type { ModelOption, QuestionItem, SessionSummary } from 'dsh-remote-wire'
 
 /** 内核报告的一条会话在插件内部的形状（还没变成线格式）。 */
 export interface KernelSession {
@@ -170,6 +170,17 @@ export interface KernelPort {
   ensureRunnable?(sessionId: string): Promise<{ ok: boolean; message?: string }>
   /** 当前模型选择，仅用于展示与"没模型就拒绝"的前置判断。 */
   modelSelection?(): { provider: string; model: string } | undefined
+  /**
+   * 可切换的模型清单与**能不能切**这件事的答案。
+   *
+   * 为什么单独一个端口而不是让 `modelSelection` 一起返回：读当前值几乎每个代际都有，
+   * 而「能不能列候选、能不能写」是代际差异最大的部分（实测 `agentDefaultModel`
+   * 上只有 `currentSelection`）。合成一个返回值会让调用方分不清
+   * 「拿不到清单」与「主机根本不能切」——手机上这两种必须表现不同。
+   *
+   * 缺这个方法 = 只读（core 会下发 `canSwitch: false` 并给出理由）。
+   */
+  modelOptions?(): { canSwitch: boolean; options?: ModelOption[]; reason?: string }
   /** 诊断：内核服务实际暴露了哪些成员，出错时打出来。 */
   describe(): Record<string, string | number | boolean>
 }

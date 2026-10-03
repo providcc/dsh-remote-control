@@ -84,6 +84,34 @@ const HISTORY_TIMEOUT_DEFAULT = 15_000
 const CREATE_TIMEOUT_DEFAULT = 8000
 const LIST_LIMIT_DEFAULT = 100
 
+/**
+ * 猜「模型面」可能叫什么。**这是探测清单，不是接口声明** —— 内核各代际命名不同，
+ * 猜不中就报 `none`，而不能猜中一个就不报（那样「有这项能力」会被误当成「没有」）。
+ *
+ * 代价很低：每个名字只做一次 `typeof` 检查，不真的调用。
+ */
+const MODEL_FACE_METHODS = [
+  'currentSelection',
+  'list',
+  'listModels',
+  'available',
+  'availableModels',
+  'selections',
+  'options',
+  'get',
+  'set',
+  'select',
+  'setSelection',
+  'setDefault',
+  'update',
+] as const
+
+/** 命中这些名字之一才算「能列可选模型」。 */
+const MODEL_LIST_METHODS = new Set(['list', 'listModels', 'available', 'availableModels', 'selections', 'options'])
+/** 命中这些名字之一才算「能切换模型」。 */
+const MODEL_SET_METHODS = new Set(['set', 'select', 'setSelection', 'setDefault', 'update'])
+
+
 /** 折叠后的插件内部形状。 */
 interface ListedSession {
   id: string
@@ -133,6 +161,15 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   let approvalFace = 'not-attached'
   let questionsFace = 'pending'
 
+  /**
+   * 模型面的登记结果，进 status.json。
+   *
+   * 为什么要单独记一份而不在读的时候现探：手机上「模型下拉是空的」有两种完全不同的原因
+   * —— 宿主根本不能换（那下拉就该置灰并说明），或者能换但我们没读到清单。
+   * 不把`agentDefaultModel` 的实际成员报出来，这两者就只能靠猜。
+   */
+  const modelMethods: string[] = []
+
   /** 软探测一个成员是不是函数。返回类型用 unknown 参数表，调用点各自窄化。 */
   const fn = (owner: unknown, name: string): ((...args: any[]) => unknown) | undefined => {
     if (!owner) return undefined
@@ -162,6 +199,20 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     } catch {
       return undefined
     }
+  }
+
+  /** 任意一个活着的 agent（只用于能力探测，不参与业务）。没有活 agent 时报no-live-agent。 */
+  function firstLiveAgent(): LooseObject | undefined {
+    const list = fn(services.agents, 'list')
+    if (list) {
+      try {
+        const all = list.call(services.agents) as unknown
+        if (Array.isArray(all) && all.length) return all[0] as LooseObject
+      } catch {
+        /* 退回逐个get */
+      }
+    }
+    return undefined
   }
 
   function agentStatus(sessionId: string): string {
@@ -370,6 +421,41 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * 模型面探测：**逐名试调用**，不用 `Object.keys`。
+   *
+   * 踩过的坑：cordis 服务对象的成员挂在原型链上（服务本身是 accessor/proxy），
+   * `Object.keys(agentDefaultModel)` 返回**空数组**——而 `sessionController.commands`
+   * 这种 own-property 形态就能列出来。同一个 `shapeOf` 在两个服务上一个有用一个没���，
+   * 照抄形状会得出"内核不能换模型"的**假结论**。
+   *
+   * 所以这里改成问"这些名字里有没有能用的"，并把命中的名字报出来。
+   * 判据只回答两个问题：能不能列可选、能不能写。
+   */
+  function probeModelFace(): { hits: string[]; canList: boolean; canSet: boolean } {
+    const owner = services.agentDefaultModel as LooseObject | undefined
+    if (!owner) return { hits: [], canList: false, canSet: false }
+    const hits: string[] = []
+    for (const name of MODEL_FACE_METHODS) {
+      if (fn(owner, name)) hits.push(name)
+    }
+    modelMethods.length = 0
+    modelMethods.push(...hits)
+    return {
+      hits,
+      canList: hits.some((n) => MODEL_LIST_METHODS.has(n)),
+      canSet: hits.some((n) => MODEL_SET_METHODS.has(n)),
+    }
+  }
+
+  /** 探测结果的一句话摘要，进 status.json。 */
+  function modelFaceSummary(): string {
+    if (!services.agentDefaultModel) return 'absent'
+    const { hits, canList, canSet } = probeModelFace()
+    if (!hits.length) return `none (tried=${MODEL_FACE_METHODS.length})`
+    return `${canList ? 'list' : 'no-list'}+${canSet ? 'set' : 'no-set'} via=${hits.join(',')}`.slice(0, 180)
   }
 
   async function sendPrompt(sessionId: string, text: string): Promise<{ ok: boolean; message?: string }> {
@@ -726,7 +812,22 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     // 与发指令/续跑走同一条读取路径：这里原来还有一份实现，而且是 `current()` 裸调用
     // （不带 receiver；真要用 this 的服务方法会当场抛），两份迟早分叉。
     modelSelection: currentSelection,
-    describe() {
+    /**
+     * 可切换模型清单。**这一代内核给不出清单也换不了**（`agentDefaultModel` 上只有
+     * `currentSelection`），所以这里报 `canSwitch: false` 并附一句人话。
+     *
+     * 报false 而不是省略这个方法：省略会被 core 当成"只读"但**说不出原因**，
+     * 手机上就只剩一个置灰的模型名，用户不知道是主机不支持还是自己哪里做错了。
+     */
+    modelOptions() {
+      const { hits, canList, canSet } = probeModelFace()
+      return {
+        // 两个都要有才算能切：只有 list 没有 set 时手机上会列出候选却点了没反应，
+        // 那比"换不了"更糟。
+        canSwitch: canList && canSet,
+        reason: canList && canSet ? undefined : `主机内核只提供读取（命中：${hits.join(',') || '无'}）`,
+      }
+    },    describe() {
       return {
         carrier: 'services',
         sessions: typeof services.sessions === 'object',
@@ -743,8 +844,22 @@ export function createServicesKernel(services: ServicesBundle, options: Services
           typeof fn(services.sessionController?.commands, 'create') === 'function'
             ? 'commands.create'
             : `absent (keys=${shapeOf(services.sessionController)})`.slice(0, 120),
+        // 第二条换模型的可能路径：命令控制器上自带的方法（`setModel` / `switchModel`…），
+        // 以及活agent 自己暴露的模型字段。前者能列出来就说明这条路通不通。
+        commandsFace: shapeOf(services.sessionController?.commands),
+        agentModelFields: (() => {
+          const first = firstLiveAgent()
+          if (!first) return 'no-live-agent'
+          return Object.keys(first)
+            .filter((k) => /model|provider|preset/i.test(k))
+            .slice(0, 8)
+            .join(',') || 'none'
+        })(),
         agents: typeof services.agents === 'object',
         agentDefaultModel: typeof services.agentDefaultModel === 'object',
+        // 模型面到底有没有"写"的能力（能列可选、能切换）。手机上模型下拉该不该置灰，
+        // 取决于这个而不是取决于"读得到当前值" —— 读得到只够显示一行文字。
+        modelFace: modelFaceSummary(),
         workspaceRegistry: typeof services.workspaceRegistry === 'object',
         userQuestions: typeof services.userQuestions === 'object',
         takeOverQuestions: options.takeOverQuestions === true,

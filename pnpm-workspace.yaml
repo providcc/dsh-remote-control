@@ -14,6 +14,7 @@ allowBuilds:
 # 通配等于对整个生态的新发布关掉这道供应链防线。
 minimumReleaseAgeExclude:
   - dsh-remote-wire@1.0.0
+  - dsh-remote-wire@1.1.0
 
 onlyBuiltDependencies:
   - esbuild

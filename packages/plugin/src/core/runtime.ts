@@ -23,6 +23,7 @@ import type { AnswerItem, CmdPayload, EvPayload, HistoryItem, QuestionItem, Sess
 import {
   keepAwakeState,
   messageDelta,
+  model,
   permissionRequest,
   questionRequest,
   result as resultOf,
@@ -371,7 +372,41 @@ export class HostRuntime {
     }
     this.broadcast(sessionChanged(this.sessions, reason))
     this.broadcast(keepAwakeState(this.sleep.snapshot()))
+    this.broadcastModel()
     return this.sessions
+  }
+
+  /**
+   * 广播当前模型。
+   *
+   * 跟着 `pushSessions` 一起发而不是单独起一条：模型与防休眠都是**全局状态**，
+   * 而 `pushSessions` 已经是"状态变了就推一次"的唯一入口，另开一条推送路径
+   * 必然出现「会话更新了但模型没更新」这种半同步状态。
+   *
+   * **读不到就不发**（而不是发一个 `model: ''`）：`ev.model` 的 `model` 是必填的
+   * 非空串，硬塞空串会让手机把「不知道用什么模型」显示成「模型名为空」——
+   * 后者看起来像 bug，前者只是没显示。内核缺 `currentSelection` 时真机上是常态
+   * （见 carrier 的 modelFace 探测）。
+   */
+  private broadcastModel(): void {
+    let selection: { provider: string; model: string } | undefined
+    try {
+      selection = this.kernel.modelSelection?.()
+    } catch {
+      return
+    }
+    if (!selection?.model) return
+    // 能不能切由端口回答（它才看得见内核服务对象），core 不猜。
+    const face = this.kernel.modelOptions?.()
+    this.broadcast(
+      model({
+        model: selection.model,
+        provider: selection.provider,
+        canSwitch: Boolean(face?.canSwitch),
+        options: face?.options,
+        reason: face?.canSwitch ? undefined : (face?.reason ?? '主机内核未提供切换模型的能力'),
+      }),
+    )
   }
 
   private refreshLoop(): void {
@@ -420,6 +455,7 @@ export class HostRuntime {
           action: info.action,
           ...(info.reason === undefined ? {} : { reason: info.reason }),
           options: APPROVAL_OPTIONS,
+          expiresAt: new Date(Date.now() + this.options.approvalTimeoutMs).toISOString(),
         }),
       )
     })
