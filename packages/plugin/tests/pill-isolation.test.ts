@@ -499,15 +499,15 @@ test('pill 那四条挂上去的就是带守卫的那四条（接线，不是又
     assert.equal((await run(PAIR_UNPAIR_ROUTE, 'GET', { host: '127.0.0.1:5173', 'x-drc-pair': '1' })).status, 405)
     assert.equal((await run(PAIR_UNPAIR_ROUTE, 'POST', { host: '127.0.0.1:5173' })).status, 403)
 
-    // 抬头那句状态 + 点开那三行（中继 / 状态 / 版本）：只读（Origin 缺席放过），字段集合就那四个。
+    // 抬头那句状态 + 点开那几行（待处理 / 中继 / 状态 / 版本）：只读（Origin 缺席放过），字段集合就那六个。
     // `relay` 允许 offline / connecting 两种——保活重连在跑，这里钉死一种就是计时器测试。
     const status = await run(PAIR_STATUS_ROUTE, 'GET', { host: '127.0.0.1:5173' })
     assert.equal(status.status, 200, status.body)
     const shown = JSON.parse(status.body) as Record<string, unknown>
     assert.deepEqual(
       Object.keys(shown).sort(),
-      ['paired', 'relay', 'serverUrl', 'version'],
-      '状态路由多出字段就是要重新审一遍（这四个全是非凭据；本机名 2026-10-03 撤了）',
+      ['paired', 'relay', 'serverUrl', 'version', 'waiting', 'waitingOldestSec'],
+      '状态路由多出字段就是要重新审一遍（这六个全是非凭据；本机名 2026-10-03 撤了）',
     )
     assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
     assert.equal(shown.paired, 0)

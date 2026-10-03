@@ -72,6 +72,8 @@ interface StatusAnswer {
   paired?: unknown
   serverUrl?: unknown
   version?: unknown
+  waiting?: unknown
+  waitingOldestSec?: unknown
 }
 
 interface NewAnswer {
@@ -144,7 +146,43 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
   if (relay === 'connecting') return { text: '连接中', tone: 'wait' }
   if (relay !== 'online') return { text: '远程控制', tone: 'off' }
   const paired = typeof status?.paired === 'number' ? status.paired : 0
-  return paired > 0 ? { text: '已配对', tone: 'on' } : { text: '未配对', tone: 'off' }
+  if (paired > 0) {
+    // 有东西挂在手机上等回答时，`已配对` 这句话等于没说——那条回合正停在这台机器上，
+    // 而这颗 pill 是它在桌面上唯一可能被看见的地方（判据见伞仓 docs/PRODUCT.md §3）。
+    // 只在**确实配着**的时候抢这一格：手机中途掉线、挂起还没超时时，
+    // 用户能做的第一件事是重新配对，那才是该说的那句。
+    const waiting = waitingCount(status)
+    if (waiting > 0) return { text: `等 ${waiting} 件事`, tone: 'wait' }
+    return { text: '已配对', tone: 'on' }
+  }
+  return { text: '未配对', tone: 'off' }
+}
+
+/** 挂在手机上等回答的件数。老版路由没给这个字段时算 0（那一行自己不占地方）。 */
+export function waitingCount(status: StatusAnswer | undefined): number {
+  const count = status?.waiting
+  return typeof count === 'number' && count > 0 ? Math.min(Math.floor(count), 99) : 0
+}
+
+/** `37 秒` / `4 分 12 秒` / `12 分`。十分钟以上不再报秒——这行是扫一眼的，不是秒表。 */
+export function humanDuration(sec: unknown): string {
+  const total = typeof sec === 'number' && sec > 0 ? Math.floor(sec) : 0
+  if (total < 60) return `${total} 秒`
+  const minutes = Math.floor(total / 60)
+  return minutes >= 10 ? `${minutes} 分` : `${minutes} 分 ${total % 60} 秒`
+}
+
+/**
+ * 正文那一行"待处理"的值：`2 件 · 最久 4 分 12 秒`。没有事在等时返回空串（那一行不建）。
+ *
+ * 手机上看的是"还剩多久"（那颗倒计时），这里看的是"已经等了多久"——
+ * 同一段时间，两端要回答的是两个不同的问题。
+ */
+export function waitingRow(status: StatusAnswer | undefined): string {
+  const count = waitingCount(status)
+  if (count === 0) return ''
+  const oldest = typeof status?.waitingOldestSec === 'number' ? status.waitingOldestSec : 0
+  return `${count} 件${oldest > 0 ? ` · 最久 ${humanDuration(oldest)}` : ''}`.slice(0, 40)
 }
 
 /**
@@ -429,10 +467,12 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     return head
   }
 
-  /** 正文那三行（中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
+  /** 正文那几行（待处理 / 中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
   const infoRows = (): HTMLElement[] => {
     if (!lastStatus) return []
     const rows: Array<[string, string]> = [
+      // 排第一：它是唯一一条"看完要做点什么"的，其余三条都是"知道就行"。
+      ['待处理', waitingRow(lastStatus)],
       ['中继', relayRow(lastStatus)],
       ['状态', relayStateRow(lastStatus)],
       ['版本', versionRow(lastStatus)],

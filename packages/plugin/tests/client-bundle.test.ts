@@ -269,6 +269,8 @@ const DEFAULT_STATUS = {
   paired: 0,
   serverUrl: 'wss://relay.example.com:443/relay',
   version: '0.0.0-test',
+  waiting: 0,
+  waitingOldestSec: 0,
 }
 
 function load(options: LoadOptions = {}): Harness {
@@ -619,6 +621,132 @@ test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文�
     assert.ok(!flat.includes(gone), `这一轮删掉的说法不该再出现：「${gone}」在 ${flat}`)
   }
   assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+})
+
+/**
+ * 这一组是"30 秒原则"落进界面的那一条（伞仓 docs/PRODUCT.md §3、§5 G3/G4）。
+ *
+ * 原来"已配对 + 有一条审批挂在手机上"时，那颗 pill 仍然只说 `已配对`——而那条回合正停在这台
+ * 机器上等人点，且这颗 pill 是它在桌面上唯一可能被看见的地方。所以：**有得等就说等几件**。
+ */
+test('有东西在等时抬头说"等 N 件事"，面板第一行是"待处理 · 最久多久"', async () => {
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, paired: 1, waiting: 2, waitingOldestSec: 252 },
+  })
+  const root = harness.mountPill()
+  await flush()
+  assert.equal(root.find('drc-label')!.textContent, '等 2 件事', `回合停着等人点，抬头不许还说"已配对"`)
+  assert.equal(
+    root.find('drc-dot')!.getAttribute('data-tone'),
+    'wait',
+    '要 amber 那一档：这是"该你动手"，不是"一切正常"的绿',
+  )
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  const rows = root
+    .findAll('drc-info')
+    .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
+  assert.deepEqual(
+    rows[0],
+    ['待处理', '2 件 · 最久 4 分 12 秒'],
+    `待处理必须排第一（其余三条都是"知道就行"）：${JSON.stringify(rows)}`,
+  )
+  assert.deepEqual(
+    rows.slice(1).map(([key]) => key),
+    ['中继', '状态', '版本'],
+  )
+})
+
+test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也不抢那一格', async () => {
+  // ① 链都断了，"等几件"是没意义的——用户要修的是连接，那才是故障优先。
+  const offline = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, paired: 1, relay: 'offline', waiting: 3, waitingOldestSec: 10 },
+  })
+  const offlineRoot = offline.mountPill()
+  await flush()
+  assert.equal(offlineRoot.find('drc-label')!.textContent, '已断开连接')
+  assert.equal(offlineRoot.find('drc-dot')!.getAttribute('data-tone'), 'error')
+
+  // ② 手机中途掉线、挂起还没超时：这时能做的第一件事是重新配对，抬头就该说那个。
+  const unpaired = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, paired: 0, waiting: 1, waitingOldestSec: 40 },
+  })
+  const unpairedRoot = unpaired.mountPill()
+  await flush()
+  assert.equal(unpairedRoot.find('drc-label')!.textContent, '未配对', '没配上却说"等 1 件事"是让人去找一台不存在的手机')
+  // 但面板里那一行仍然要说——它回答的是"这台机器上有没有回合被卡住"。
+  unpairedRoot.find('drc-pill')!.emit('click')
+  await flush()
+  const first = unpairedRoot.findAll('drc-info')[0]!
+  assert.deepEqual(
+    [first.find('drc-key')!.textContent, first.find('drc-value')!.textContent],
+    ['待处理', '1 件 · 最久 40 秒'],
+    '抬头不抢，不代表面板可以不说',
+  )
+})
+
+/**
+ * 时长写法走**打出来的 bundle**，不直接 import 那个纯函数——这个文件的立足点就是
+ * "在 vm 里真跑 client.cjs"，绕过去就等于这条判据没测过 bundle 里那份。
+ */
+test('等待时长的写法：<60 秒只说秒、十分钟以上不再带秒（这行是扫一眼的，不是秒表）', async () => {
+  const cases: Array<[number, string]> = [
+    [37, '1 件 · 最久 37 秒'],
+    [60, '1 件 · 最久 1 分 0 秒'],
+    [252, '1 件 · 最久 4 分 12 秒'],
+    [600, '1 件 · 最久 10 分'],
+    [7265, '1 件 · 最久 121 分'],
+  ]
+  for (const [seconds, expected] of cases) {
+    const harness = load({
+      react: FAKE_REACT,
+      slots: true,
+      status: { ...DEFAULT_STATUS, paired: 1, waiting: 1, waitingOldestSec: seconds },
+    })
+    const root = harness.mountPill()
+    await flush()
+    root.find('drc-pill')!.emit('click')
+    await flush()
+    const value = root.findAll('drc-info')[0]!.find('drc-value')!.textContent
+    assert.equal(value, expected, `${seconds}s 那一档写成了「${value}」，期望「${expected}」`)
+  }
+})
+
+test('waitingOldestSec 是怪值（老版宿主 / NaN）时那一行只说件数，不许印出 NaN', async () => {
+  for (const junk of ['不是数', -7, undefined]) {
+    const harness = load({
+      react: FAKE_REACT,
+      slots: true,
+      status: { ...DEFAULT_STATUS, paired: 1, waiting: 2, waitingOldestSec: junk },
+    })
+    const root = harness.mountPill()
+    await flush()
+    root.find('drc-pill')!.emit('click')
+    await flush()
+    const value = root.findAll('drc-info')[0]!.find('drc-value')!.textContent
+    assert.equal(value, '2 件', `怪值 ${JSON.stringify(junk)} 应该退化成只说件数，实际「${value}」`)
+  }
+})
+
+test('waiting 字段缺失（老版宿主）时那一行不建、抬头退回"已配对"', async () => {
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { relay: 'online', paired: 1, serverUrl: 'wss://relay.example.com:443/relay', version: '1.2.0' },
+  })
+  const root = harness.mountPill()
+  await flush()
+  assert.equal(root.find('drc-label')!.textContent, '已配对')
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  const keys = root.findAll('drc-info').map((row) => row.find('drc-key')!.textContent)
+  assert.deepEqual(keys, ['中继', '状态', '版本'], `没有 waiting 就不该凭空出现一行"待处理"：${JSON.stringify(keys)}`)
 })
 
 test('正文那三行各自拿不到值时不占地方：老版路由没给 version、中继字段不认识', async () => {

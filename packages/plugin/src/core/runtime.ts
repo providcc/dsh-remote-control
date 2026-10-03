@@ -71,6 +71,10 @@ interface PendingInteraction {
   timer: unknown
   /** 审批/提问各自的选项表，用于把手机回传的 id 翻回平台要的词汇。 */
   options?: QuestionItem[]
+  /** 哪一类等待。桌面那颗 pill 的抬头要说"等 N 件事"，两类都算。 */
+  kind: 'approval' | 'question'
+  /** 发出去的时刻（`clock.now()`），用来算"最久的那件已经等了多久"。 */
+  askedAt: number
 }
 
 const APPROVAL_OPTIONS = [
@@ -278,6 +282,26 @@ export class HostRuntime {
     return { ...this.outboundCount }
   }
 
+  /**
+   * 有几件事正挂在手机上等回答，以及**最久的那件已经等了多久**（秒）。
+   *
+   * 为什么这条要出到界面上（而不只是内部状态）：一张挂起的审批阻塞着远端一条正在跑的回合，
+   * 而回合阻塞着用户的下班时间。桌面那颗 pill 原来在"已配对 + 有东西在等"时仍然只说
+   * `已配对`——那是这整条链上唯一看得见它的地方，等于没有。判据见伞仓 docs/PRODUCT.md §3。
+   *
+   * `oldestSec` 用 `clock.now()` 而不是 `Date.now()`： FakeClock 要能演"等了 4 分钟"，
+   * 否则这条时长在测试里永远是 0，也就永远不会红。
+   */
+  get waiting(): { count: number; oldestSec: number } {
+    const now = this.clock.now()
+    let oldest = 0
+    for (const item of this.pending.values()) {
+      const age = Math.max(0, Math.floor((now - item.askedAt) / 1000))
+      if (age > oldest) oldest = age
+    }
+    return { count: this.pending.size, oldestSec: oldest }
+  }
+
   private countOutbound(payload: EvPayload, sent?: boolean): void {
     const key = payload.t.replace(/^ev\./, '')
     this.outboundCount[key] = (this.outboundCount[key] ?? 0) + 1
@@ -445,6 +469,8 @@ export class HostRuntime {
         sessionId: info.sessionId,
         resolve: (value) => resolve(value === undefined ? 'decline' : (value as ApprovalDecision)),
         timer,
+        kind: 'approval',
+        askedAt: this.clock.now(),
       })
       info.signal?.addEventListener('abort', () => this.settle(id, 'cancelled'), { once: true })
       this.replyTo(
@@ -485,6 +511,8 @@ export class HostRuntime {
         resolve: (value) => resolve((value as AskUserQuestionAnswerValue | undefined) ?? null),
         timer,
         options: info.questions,
+        kind: 'question',
+        askedAt: this.clock.now(),
       })
       info.signal?.addEventListener('abort', () => this.settle(id, null), { once: true })
       this.replyTo(

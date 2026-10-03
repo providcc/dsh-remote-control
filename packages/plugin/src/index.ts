@@ -458,11 +458,16 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 那帧到达时成员表就补齐了，pill 最多差一个轮询周期（3 秒）不会一直空着。
    */
   function pillStatus(): PillStatus {
+    // runtime 还没起来（没有对端时它根本不 start）时按"没有事在等"说，
+    // 而不是让那颗 pill 因为读不到字段而退回 `已配对`。
+    const waiting = runtime?.waiting ?? { count: 0, oldestSec: 0 }
     return {
       relay: relay ? relayState() : 'idle',
       paired: relay?.clientCount ?? 0,
       serverUrl: config.serverUrl,
       version: PLUGIN_VERSION,
+      waiting: waiting.count,
+      waitingOldestSec: waiting.oldestSec,
     }
   }
 

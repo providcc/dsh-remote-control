@@ -100,6 +100,8 @@ function deps(
       paired: 1,
       serverUrl: 'wss://relay.example.com:443/relay',
       version: FAKE_VERSION,
+      waiting: 0,
+      waitingOldestSec: 0,
     }),
     unpair: () => {
       calls.unpair += 1
@@ -275,7 +277,7 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
 
-test('状态路由只出四个非凭据字段：relay / paired / serverUrl / version', async () => {
+test('状态路由只出六个非凭据字段：relay / paired / serverUrl / version / waiting / waitingOldestSec', async () => {
   const d = deps()
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -286,6 +288,8 @@ test('状态路由只出四个非凭据字段：relay / paired / serverUrl / ver
     paired: 1,
     serverUrl: 'wss://relay.example.com:443/relay',
     version: FAKE_VERSION,
+    waiting: 0,
+    waitingOldestSec: 0,
   })
   const raw = got.body
   for (const secret of [FAKE_PSK, FAKE_QR, FAKE_TOKEN, 'dshr:']) {
@@ -298,7 +302,14 @@ test('状态路由只出四个非凭据字段：relay / paired / serverUrl / ver
 
 test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的是"没启动"而不是"断了"）', async () => {
   const d = deps({
-    status: () => ({ relay: 'idle', paired: 0, serverUrl: 'wss://relay.example.com:443/relay', version: FAKE_VERSION }),
+    status: () => ({
+      relay: 'idle',
+      paired: 0,
+      serverUrl: 'wss://relay.example.com:443/relay',
+      version: FAKE_VERSION,
+      waiting: 0,
+      waitingOldestSec: 0,
+    }),
   })
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -307,6 +318,10 @@ test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的�
     paired: 0,
     serverUrl: 'wss://relay.example.com:443/relay',
     version: FAKE_VERSION,
+    // runtime 还没起来时"没有事在等"必须是**读出来的 0**，不是字段缺席——
+    // 缺席会让浏览器面那侧退回 `已配对`，而那一刻真正该说的是"远程未启动"。
+    waiting: 0,
+    waitingOldestSec: 0,
   })
 })
 

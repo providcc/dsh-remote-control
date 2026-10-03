@@ -52,7 +52,7 @@ export interface LivePairing {
 }
 
 /**
- * pill 上那句"连接状态"与点开看到的那三行（中继 / 状态 / 版本）：四个非凭据字段，别的一律不出。
+ * pill 上那句"连接状态"与点开看到的那几行（中继 / 状态 / 版本 / 等你处理）：六个非凭据字段，别的一律不出。
  *
  * `serverUrl` 是**已经印在手机上看到的东西**（配对 URI 里就带着它，`status.json` 也有），
  * `version` 是本机装的这一版号，都不是凭据；红线仍然成立——这里没有 `psk`，没有 6 位码，
@@ -72,6 +72,16 @@ export interface PillStatus {
   serverUrl: string
   /** 本机装的这一版号（打包时注入，源码直跑时是 `dev`）。 */
   version: string
+  /**
+   * 挂在手机上等回答的审批/提问**件数**（0 = 没有）。
+   *
+   * 这条为什么值得占一个字段：一张挂起的审批阻塞着远端一条正在跑的回合，
+   * 而"已配对"这个状态原来把这件事完全遮住——桌面那颗 pill 是它唯一可能被看见的地方。
+   * 判据见伞仓 `docs/PRODUCT.md` §3（30 秒原则第 1、2 条）。
+   */
+  waiting: number
+  /** 最久的那一件已经等了多久（秒）。与 `waiting` 成对出现，`waiting=0` 时它是 0。 */
+  waitingOldestSec: number
 }
 
 export interface PillRouteDeps {
@@ -264,6 +274,8 @@ export function pillStatusHandler(deps: PillRouteDeps) {
         paired: status.paired,
         serverUrl: status.serverUrl,
         version: status.version,
+        waiting: status.waiting,
+        waitingOldestSec: status.waitingOldestSec,
       })
     } catch (error) {
       json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
