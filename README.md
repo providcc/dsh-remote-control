@@ -109,8 +109,8 @@ sh scripts/install-to-profile.sh
 [`packages/plugin/src/shell/config.ts`](./packages/plugin/src/shell/config.ts)（`DRC_SERVER_URL`、
 `DRC_HOST_LABEL`、`DRC_PILL`、`DRC_MOCK_BRIDGE` 等）。**留下的那些键名刻意继承旧名**：它们写在
 用户的 profile 里，改名等于让线上配置静默失效。已经删掉的键（`qrImage`/`qrOpen`/`qrAnsi`/
-`qrStyle`/`sidebarQr`）**不会静默失效**——留在 patch 里会在 `problems` 里各报一条 warn 并说清
-现在叫什么或为什么没了。
+`qrStyle`/`sidebarQr`）就是删了：留在 patch 里不产生任何效果，也不会有 warn——那套路不会再回来
+（取证在 `src/platform/qr.ts` 文件头与 CHANGELOG 的 1.2.0）。
 
 排错入口是状态快照 `~/.dsh/dsh-remote-control/status.json`（0600）；关键字段 `carrier`
 （`services` = 真内核 / `mock` = 内存替身 / `none`）、`relay`、`relayProblem`。

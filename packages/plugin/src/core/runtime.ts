@@ -154,7 +154,7 @@ export class HostRuntime {
       this.clock.clearTimeout(this.mergeTimer)
       this.mergeTimer = undefined
     }
-    for (const [id, item] of [...this.pending]) this.settle(id, undefined)
+    for (const [id] of [...this.pending]) this.settle(id, undefined)
   }
 
   /** 手机发来的命令。`conversationId` 是配对通道 id，与载荷里的 sessionId 不是一回事（F3）。 */

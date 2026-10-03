@@ -50,9 +50,10 @@
   会在 pill 那张之外再多挂一个仍然有效的 PSK，而手机扫的是屏幕上那张——正是当初"多码事故"的形状。
   打字习惯还留在 `/drc pair` 上的人拿到的是状态快照，不是错误。
 - 配置键删除：`qrImage`、`qrOpen`、`qrAnsi`、`qrStyle`、`sidebarQr`（含 `imageFile`/`refreshMs`）。
-  **留在 profile 里不会静默失效**：每个都会在 `problems` 里各报一条 warn，`sidebarQr` 那条会指明
-  "现在叫 `pill`"。环境变量 `DRC_QR_IMAGE`/`DRC_QR_OPEN`/`DRC_QR_ANSI`/`DRC_QR_STYLE`/
-  `DRC_SIDEBAR_QR` 同样删除，新增 `DRC_PILL=0/1`。
+  留在 patch 里**不产生任何效果**，也不会有 warn（当天先做过一张"退役键各报一条 warn"的表，
+  随后按"删了就不会回来，用到再重写"撤掉——见下面"清理"那节）。环境变量
+  `DRC_QR_IMAGE`/`DRC_QR_OPEN`/`DRC_QR_ANSI`/`DRC_QR_STYLE`/`DRC_SIDEBAR_QR` 同样删除，
+  新增 `DRC_PILL=0/1`。
 - **为右栏而开的内核口一起删除**：`provide('dshRemoteControl').sessionWorkspace`（"会话 → 工作区目录"
   那个口原来是给右栏那张图算落点的）、内核侧实现 `kernel.sessionWorkspace`，以及只为它存在的诊断字段
   `kernel.workspaceFace`。pill 的二维码是路由**当场渲染、当场回字节**的，不再往磁盘写，所以这条路上
@@ -75,9 +76,23 @@
 - 配对二维码的编码/解码防回归（伞仓 `scripts/validate-qr.mjs`）从"三条产物"降到两条：
   PNG 与裸矩阵。
 
+### 清理（同一轮，按"没用的就删，用到再重写"）
+
+- **`apiProxy` 那条载体探都不探了**：这一版从一开始就不接它（桌面态没注册过这个服务，旧实现的
+  调用信封整个是错的），却仍然 `ctx.get` + `ctx.inject` 各探一次、把结果收进 `collected` 里等一个
+  永远不会来的调用方。现在这两块连同 `apiProxyOf()` 一起删掉，注释里写清"真要用再写"。
+- **没人读的口与写盘遗物**：`writePrivateFile`（右栏那张 PNG 落盘时代的工具，现在只有测试调它）、
+  `StatusFile.refreshing` 与 `StatusFile.path` 两个 getter（注释声称"测试读它"，实际零调用方）。
+- **零消费者的导出**：`HISTORY_LIMIT_DEFAULT`（与 `runtime.ts` 里那份是同一个常量的两份）、
+  `ports` 的 `PeerSink`/`PendingQuestion`/`TransportPort`/`AnswerItem`、`guard` 的
+  `SubscribableEvent`/`WaterfallParticipant`、`qr.ts` 的 `qrModuleCount`，以及 `redactSecret` 与
+  `redact` 这个双名导出（合成一个名字）。
+- **退役配置键的 warn 表删除**（见上面"删除"那节），连带 5 条断言。
+- 顺带清掉 `tsc --noUnusedLocals --noUnusedParameters` 报出的全部未用导入与未用局部。
+
 ### 测试
 
-263 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
+261 项（1.1.0 是 280 —— 那 280 里含 72 项属于这次删掉的两条路，另 3 项属于现在没人调的
 `sessionWorkspace`）。删掉 5 个只属于那两条已删路径的测试文件；
 `presentation-pill-routes.test.ts`（22 条）、`presentation-isolation.test.ts`（8 条，含
 "配对入口只有 pill：两种宿主上 hint 都不许再宣传 pair"与"webServer 晚到时 warn:pill 必须自己消失"）、

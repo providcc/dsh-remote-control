@@ -53,8 +53,3 @@ export async function qrPng(
     type: 'png',
   })
 }
-
-/** 二维码的模块数（测试用来断言静默区与几何，不依赖肉眼）。 */
-export async function qrModuleCount(text: string, ecc: 'L' | 'M' | 'Q' | 'H' = 'M'): Promise<number> {
-  return QRCode.create(text, { errorCorrectionLevel: ecc }).modules.size
-}

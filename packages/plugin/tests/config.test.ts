@@ -211,25 +211,6 @@ test('pill.enabled 默认开；关掉它不是错误，但配对入口的代价�
   )
 })
 
-test('已经删掉的键必须报出来，不许静默失效：这些键写在用户的 profile 里', () => {
-  // 2026-10-03 随"右栏自动弹码"与"终端文本码"两案删除的键。
-  const injected = {
-    sidebarQr: { enabled: false },
-    qrImage: false,
-    qrOpen: true,
-    qrAnsi: true,
-    qrStyle: 'half',
-  } as unknown as Partial<PluginConfig>
-  const problems = validateConfig(readConfig(injected, {}))
-  const reported = problems.filter((problem) => problem.level === 'warn').map((problem) => problem.field)
-  for (const key of ['sidebarQr', 'qrImage', 'qrOpen', 'qrAnsi', 'qrStyle']) {
-    assert.ok(reported.includes(key), `${key} 还留在 patch 里却没人说话：${JSON.stringify(reported)}`)
-  }
-  // 改名那条要说清现在叫什么，否则用户会去翻一个不存在的键。
-  const renamed = problems.find((problem) => problem.field === 'sidebarQr')
-  assert.match(String(renamed?.message), /pill/, 'sidebarQr 的提示必须指向 pill')
-})
-
 test('布尔型环境变量只认显式的 1/0：拼错的值不许把功能打开或关掉', () => {
   assert.equal(readConfig(undefined, { DRC_MOCK_BRIDGE: '1' }).mockBridge, true, 'DRC_MOCK_BRIDGE=1 必须打开内存替身')
   assert.equal(
@@ -347,7 +328,7 @@ test('一份典型配置在合法输入下不该有任何 error：否则插件�
  *
  * 顺带钉住"为什么不再有 qrImage/qrOpen/qrAnsi/qrStyle"：配对二维码只剩 pill 那一条出口
  * （`GET /pairing.png` 现渲染），文本码在唯一宿主上扫不出来的取证写在 `src/platform/qr.ts`
- * 文件头——那套键删了就不会回来，这里只保证**残留的旧键会 warn**（见上面那条）。
+ * 文件头——那套键删了就不会回来，留在 patch 里也只是没人读的几个键，不再为它们留警告表。
  */
 test('DRC_PILL 只认 1/0/true/false：拼错的值不许把配对入口悄悄关掉', () => {
   assert.equal(readConfig(undefined, { DRC_PILL: '0' }).pill.enabled, false, '=0 要能关掉（默认是开）')

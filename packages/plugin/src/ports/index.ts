@@ -18,15 +18,7 @@
  *    平台对象一律在适配器里折叠完再出来。这样协议层的 `SessionSummary` 与内核
  *    代际变化之间有一层可测的翻译，而不是满屏 `as any`。
  */
-import type { AnswerItem, QuestionItem, SessionSummary } from 'dsh-remote-wire'
-
-/** 插件端口只需要四个方法形状的 socket，方便用内存替身测试。 */
-export interface PeerSink {
-  /** 向某个会话的所有在线客户端发一条已加密载荷；返回是否有活客户端。 */
-  broadcast(payload: unknown): boolean
-  /** 单播到某个客户端（用于只回给发起者）。 */
-  toClient(clientId: string, payload: unknown): boolean
-}
+import type { QuestionItem, SessionSummary } from 'dsh-remote-wire'
 
 /** 内核报告的一条会话在插件内部的形状（还没变成线格式）。 */
 export interface KernelSession {
@@ -93,15 +85,6 @@ export interface PendingApproval {
 
 /** 平台词汇（`@deepseek-ai/dsh-user-approval` 的 `ApprovalOutcome`）。 */
 export type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
-
-/** 一次待答提问。选项用 label 与平台交换，`id` 只在插件与手机之间使用。 */
-export interface PendingQuestion {
-  id: string
-  sessionId: string
-  questions: QuestionItem[]
-  settle(answer: AskUserQuestionAnswerValue): void
-  cancel(): void
-}
 
 /** 平台侧的答案形状（`selected` 装的是**选项 label**，不是我们的 id）。 */
 export interface AskUserQuestionAnswerValue {
@@ -189,13 +172,6 @@ export interface KernelPort {
   modelSelection?(): { provider: string; model: string } | undefined
   /** 诊断：内核服务实际暴露了哪些成员，出错时打出来。 */
   describe(): Record<string, string | number | boolean>
-}
-
-/** 传输端口：core 通过它发消息，不关心 socket。 */
-export interface TransportPort {
-  /** 有没有能收这条会话消息的对端（决定审批要不要自己认领）。 */
-  hasPeer(sessionId: string): boolean
-  broadcast(payload: unknown, sessionId?: string): void
 }
 
 /** 防休眠后端端口。 */

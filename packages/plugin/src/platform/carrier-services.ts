@@ -26,10 +26,8 @@
  *    但这里不假装是逐 token 流。
  */
 import type { QuestionItem, SessionSummary } from 'dsh-remote-wire'
-import { canParticipate, canSubscribe, guardedSubscribe } from './guard.js'
+import { canParticipate, guardedSubscribe } from './guard.js'
 import type {
-  ApprovalDecision,
-  AskUserQuestionAnswerValue,
   Clock,
   InteractionSink,
   KernelEvent,
@@ -941,8 +939,6 @@ function eventContent(data: LooseObject): unknown {
 
 // ── 历史：内核日志 → 一页线格式条目 ───────────────────────────────────
 
-/** 一页历史默认给多少条线格式条目（够看几轮，又不会顶满中继的帧预算）。 */
-export const HISTORY_LIMIT_DEFAULT = 40
 /** 单张页面的正文总预算（字符）。超了就少给几条，剩下的由游标继续翻。 */
 const HISTORY_CHAR_BUDGET = 100_000
 /** 单条正文的硬上限。小程序侧的正文块上限是 20000，这里留出余量。 */

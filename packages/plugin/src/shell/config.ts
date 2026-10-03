@@ -216,37 +216,11 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
         '提问接管会**取代桌面 UI 的提问能力**（ctx.userQuestions 只允许一个活跃 provider）；手机端不在线时提问会直接失败',
     })
   }
-  // 已经删掉的键**必须报出来**，不能静默失效：这些键写在用户的 profile 里，
-  // 一句"没这个键了"比"它看起来还在、但什么都不做"诚实得多。
-  // 之所以能在合并后的对象上看到它们，是因为 readConfig 用 `...injected` 原样摊开——
-  // 类型里没有的键在运行期仍然在。
-  const leftovers = config as unknown as Record<string, unknown>
-  for (const gone of RETIRED_KEYS) {
-    if (leftovers[gone.key] === undefined) continue
-    problems.push({
-      level: 'warn',
-      field: gone.key,
-      message:
-        `${gone.key} 这个键已经不存在了${gone.now ? `（现在叫 ${gone.now}）` : '（随那条路一起删了）'}，` +
-        '它留在 patch 里不会产生任何效果，请删掉',
-    })
-  }
   return problems
 }
 
-/** 2026-10-03 随"右栏自动弹码"与"终端文本码"两案删除的键。 */
-const RETIRED_KEYS: Array<{ key: string; now?: string }> = [
-  { key: 'sidebarQr', now: 'pill' },
-  { key: 'qrImage' },
-  { key: 'qrOpen' },
-  { key: 'qrAnsi' },
-  { key: 'qrStyle' },
-]
-
 /** 令牌脱敏：日志与 status.json 里都只允许出现这个形态。 */
-export function redactSecret(value: string): string {
+export function redact(value: string): string {
   if (value.length <= 8) return '****'
   return `${value.slice(0, 4)}…${value.slice(-2)}(${value.length})`
 }
-
-export { redactSecret as redact }

@@ -34,8 +34,6 @@ export const SUBSCRIBABLE_EVENTS = [
   'agent/error',
 ] as const
 
-export type SubscribableEvent = (typeof SUBSCRIBABLE_EVENTS)[number]
-
 /**
  * 已知为 waterfall 的事件名。
  *
@@ -82,8 +80,6 @@ export const WATERFALL_EVENTS: readonly string[] = [
  * 绝不能返回 undefined —— 那正是把内核每个 turn 都搞崩的形状。
  */
 export const WATERFALL_PARTICIPANTS = ['approval/request'] as const
-
-export type WaterfallParticipant = (typeof WATERFALL_PARTICIPANTS)[number]
 
 const allowed = new Set<string>(SUBSCRIBABLE_EVENTS)
 const participants = new Set<string>(WATERFALL_PARTICIPANTS)

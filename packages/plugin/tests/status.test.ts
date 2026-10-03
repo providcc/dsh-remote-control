@@ -14,9 +14,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { StatusFile, writePrivateFile } from '../src/shell/status.js'
+import { StatusFile } from '../src/shell/status.js'
 import { DEFAULT_SYSTEM_CLOCK, FakeClock } from '../src/core/clock.js'
 import { redact } from '../src/shell/config.js'
 
@@ -102,7 +102,6 @@ test('statusFile 为空字符串就是关闭整个功能：不建文件、不装
   try {
     const clock = new FakeClock()
     const status = new StatusFile('', clock, 1_000)
-    assert.equal(status.path, '', 'path 就是那个空串：调用方用它判断功能是否开启')
     assert.doesNotThrow(
       () => status.write({ carrier: 'services' }),
       '关闭状态下 write 抛了出去 → 主流程被一个可选项带崩',
@@ -244,34 +243,6 @@ test('嵌套字段（pairing / keepAwake / kernel）必须原样落地：那是�
     )
     assert.deepEqual(parsed.problems, ['warn:pairOnStartSec'], '配置问题列表要在，否则"为什么什么都没发生"没有答案')
     assert.equal('nothingHere' in parsed, true, 'null 字段必须保留（undefined 会被 JSON 丢掉，这是调用方的选择）')
-  } finally {
-    cleanup()
-  }
-})
-
-test('writePrivateFile 也是 0600：status.json 里可能躺着一张仍然有效的配对码', () => {
-  const { dir, cleanup } = tempDir()
-  try {
-    const png = path.join(dir, 'sub', 'pairing-qr.png')
-    assert.equal(
-      writePrivateFile(png, Buffer.from([0x89, 0x50, 0x4e, 0x47])),
-      true,
-      'writePrivateFile 声称写成功但返回 false',
-    )
-    assert.equal(modeOf(png), '600', `PNG 实际权限 ${modeOf(png)}：QR 里含 PSK，谁读到谁就能配对`)
-    assert.equal(readFileSync(png).subarray(0, 4).toString('hex'), '89504e47', '写入内容必须逐字节一致')
-    assert.equal(
-      writePrivateFile('', Buffer.from('x')),
-      false,
-      '空路径要返回 false 而不是抛：调用方靠它决定要不要退回文本二维码',
-    )
-    const notADir = path.join(dir, 'afile')
-    writeFileSync(notADir, 'x')
-    assert.equal(
-      writePrivateFile(path.join(notADir, 'qr.png'), 'data'),
-      false,
-      '写失败必须折成 false：不许抛出去打断 /drc pair',
-    )
   } finally {
     cleanup()
   }

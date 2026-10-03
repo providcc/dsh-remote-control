@@ -14,7 +14,6 @@
  * 3. **`provide()` 无条件执行**：外部（测试、其它插件）拿到的永远是同一个句柄，
  *    runtime 还没起来时 `createPairing()` 返回 null，而不是"这个插件不存在"。
  */
-import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { type CmdPayload, type EvPayload, buildPairingUri } from 'dsh-remote-wire'
 import { HostRuntime, type RuntimeTransport } from './core/runtime.js'
@@ -25,10 +24,10 @@ import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
-import { StatusFile, writePrivateFile } from './shell/status.js'
+import { StatusFile } from './shell/status.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { startPill, type PillHandle } from './presentation/pill.js'
-import { renderPairingPng, type LivePairing, type PillStatus } from './presentation/pill-routes.js'
+import { type LivePairing, type PillStatus } from './presentation/pill-routes.js'
 import type { KernelPort, Clock } from './ports/index.js'
 
 /** 我们只用到 ctx 的几个成员，所以不硬依赖 @deepseek-ai/cordis 的类型。 */
@@ -444,10 +443,9 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     config.pairOnStartSec,
   )
 
-  // ── 载体探测：services > apiproxy > (mock) ─────────────────────────
+  // ── 载体探测：services > (mock) ────────────────────────────────────
   const collected: Record<string, unknown> = {}
   const hasServices = (): boolean => typeof collected.sessions === 'object' && collected.sessions !== null
-  const apiProxyOf = (): unknown => collected.apiProxy
 
   const probe: Record<string, string> = {}
   const injectFired: string[] = []
@@ -469,13 +467,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       start(createServicesKernel(collected as never, { log, takeOverQuestions: config.takeOverQuestions, clock }))
       return
     }
-    // 没有 services 载体就不启动，也不再退回 apiProxy/typert：
-    // 桌面态从未注册 apiProxy 服务，而它的调用信封在旧实现里整个是错的、无法验证；
-    // typert 只有 invoke()，既不能列会话也不能发指令，接上去只是一台"永远空列表"的机器。
+    // 没有 services 载体就不启动，也不退回 apiProxy/typert：桌面态从未注册 apiProxy 服务，
+    // 而它的调用信封在旧实现里整个是错的、无法验证；typert 只有 invoke()，既不能列会话
+    // 也不能发指令，接上去只是一台"永远空列表"的机器。这两条**探都不探**：真要用再写，
+    // 留着只是让"下一版会不会接上"变成读代码的人去猜。
     // （取证 docs/legacy-spec/host-plugin-cordis.md §2.4 表与 §3 表第 14-19 行）
-    if (typeof ctx.get?.('apiProxy', true) === 'object') {
-      log('apiProxy present but unsupported by this build', { hint: '只做诊断记录，不接这条载体' })
-    }
   }
 
   /** 关键成员先验：收下不合法的对象比不收更糟（旧实现踩过的坑）。 */
@@ -771,27 +767,6 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       /* 时钟不可用就少一次复查，不影响主流程 */
     }
   }
-  try {
-    const proxy = ctx.get?.('apiProxy', true)
-    if (proxy) collected.apiProxy = proxy
-  } catch {
-    /* desktop 态通常没注册 apiProxy */
-  }
-  try {
-    ctx.inject?.(['apiProxy'], ((scoped: LooseContext) => {
-      const value = scoped?.get?.('apiProxy', true)
-      if (!value) return
-      collected.apiProxy = value
-      if (!decided) {
-        // 先不抢跑：等宽限期，让 services 有机会先到。这发也 unref——它只是"再看一眼"，
-        // 进程若已无别的事可做就不该为它多活一个宽限期。
-        oneShot.schedule(tryStart, config.carrierGraceMs)
-      }
-      tryStart()
-    }) as never)
-  } catch {
-    /* 同上 */
-  }
   tryStart()
   if (!runtime && config.mockBridge) {
     decided = true
@@ -803,7 +778,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
   if (!runtime) {
     status.write({ ...state(), carrier: 'none', reason: 'no-carrier', probe })
-    log('no kernel carrier available', { hint: '需要 sessions/apiProxy 服务，或把 mockBridge 打开做开发' })
+    log('no kernel carrier available', { hint: '需要 sessions 服务，或把 mockBridge 打开做开发' })
   }
 
   // ── 配对入口：状态栏那颗 pill 的三条路由 ────────────────────────────

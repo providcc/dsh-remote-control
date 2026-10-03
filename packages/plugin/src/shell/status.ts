@@ -15,15 +15,11 @@
  *    "年龄 < 25s 且本轮未用过"的配对码（取证 HANDOFF.md §4.5 第 3 条）。
  */
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Clock, StatusSink } from '../ports/index.js'
 
-type StatusValue = unknown
-
 export class StatusFile implements StatusSink {
   private timer: unknown
-  private lastWritten = 0
 
   constructor(
     private readonly file: string,
@@ -45,7 +41,6 @@ export class StatusFile implements StatusSink {
         },
       )
       renameSync(tmp, this.file)
-      this.lastWritten = this.clock.now()
     } catch {
       // 快照写失败绝不能影响主流程；排错入口没了是遗憾，插件崩了是事故。
     }
@@ -79,26 +74,5 @@ export class StatusFile implements StatusSink {
       this.clock.clearTimeout(this.timer)
       this.timer = undefined
     }
-  }
-
-  /** 此刻是否在按节拍刷新（测试与 status 自身的 `refreshing` 字段读它）。 */
-  get refreshing(): boolean {
-    return this.timer !== undefined
-  }
-
-  get path(): string {
-    return this.file
-  }
-}
-
-/** 写一份 0600 的文件（status.json 与它）。 */
-export function writePrivateFile(file: string, data: Buffer | string): boolean {
-  if (!file) return false
-  try {
-    mkdirSync(path.dirname(file), { recursive: true })
-    writeFileSync(file, data, { mode: 0o600 })
-    return true
-  } catch {
-    return false
   }
 }
