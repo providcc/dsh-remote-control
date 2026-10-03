@@ -118,6 +118,18 @@ export class PairingPresenter {
   }
 }
 
+/**
+ * 一版码的标识：**码文本的 sha256 前 16 位**。
+ *
+ * 为什么不用 token 本身：这条 epoch 会出现在浏览器可达的路由响应与图片 URL 里，
+ * 而码里带着一次性 token 与 PSK。哈希足以判断"换没换"，且泄不出任何可用的东西。
+ * 只此一处定义——`presentation` 的快照与 `pair-actions` 的图片/发码路由必须同一个口径，
+ * 否则弹窗会以为每次都是新码而反复重画。
+ */
+export function pairingEpoch(qr: string): string {
+  return createHash('sha256').update(qr).digest('hex').slice(0, 16)
+}
+
 /** 生产环境的依赖实现（测试注入假的 render/now）。 */
 export function liveDeps(
   log: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void,
@@ -125,7 +137,7 @@ export function liveDeps(
   return {
     now: () => Date.now(),
     render: (qr) => QRCode.toBuffer(qr, { errorCorrectionLevel: 'M', margin: 4, scale: 8, type: 'png' }),
-    digest: (qr) => createHash('sha256').update(qr).digest('hex').slice(0, 16),
+    digest: pairingEpoch,
     log,
   }
 }

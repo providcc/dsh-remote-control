@@ -24,6 +24,7 @@
  * 每个候选都"先 get 再直接读属性"两条路各自包 try。
  */
 import path from 'node:path'
+import { registerPairActionRoutes, type LivePairing } from './pair-actions.js'
 import { liveDeps, PairingPresenter, writePrivatePng, type ActivePairing, type PairingArtifact } from './presenter.js'
 import { registerPairingRoute, type PairingRouteTarget, type WebServerLike } from './route.js'
 
@@ -53,12 +54,27 @@ export interface SidebarDeps {
   /** 某条会话的工作区目录；解析不出来是 undefined（图退回兜底落点）。 */
   workspaceOf(sessionId: string): string | undefined
   log(message: string, fields?: Record<string, string | number | boolean | undefined>): void
+  /**
+   * 幂等地保证"有一张能用的码"（状态栏 pill 点一下走这条）。
+   * 中继不在线 / runtime 没起来时返回 null。
+   */
+  ensureFresh(): LivePairing | null
+  /** 只读地看当前有没有仍然有效的码（`pairing.png` 用）。 */
+  current(): LivePairing | null
+  /** 把码渲染成 PNG 字节（`pairing.png` 用）。 */
+  renderPng(qr: string): Promise<Buffer>
 }
 
 export interface SidebarHandle {
   stop(): void
   /** 排错入口：为什么没起 / 服务是从哪条路拿到的 / 路由挂上没。 */
   readonly probe: Record<string, string>
+  /**
+   * 右栏与状态栏那两条路由**是否真的挂上了**。
+   * 主插件用它决定 `/drc pair` 要不要作为兜底注册回来：没 webServer 的宿主上
+   * 点不了 pill，命令行是唯一退路。
+   */
+  readonly available: boolean
 }
 
 /** 起 sidebar。返回句柄；`stop()` 幂等。 */
@@ -69,6 +85,7 @@ export function startSidebarQr(ctx: LooseContext, deps: SidebarDeps): SidebarHan
   let web: WebServerLike | undefined
   let timer: ReturnType<typeof setInterval> | undefined
   let unregister: (() => void) | undefined
+  let unregisterActions: (() => void) | undefined
   let started = false
   let stopped = false
   /** 已经落过盘的那一版（epoch + 落点）：轮询是 2 秒一次，不记住就会反复写同一个文件。 */
@@ -136,6 +153,23 @@ export function startSidebarQr(ctx: LooseContext, deps: SidebarDeps): SidebarHan
       log('route registration failed', { message: String((error as Error)?.message ?? error).slice(0, 200) })
       started = false
       return
+    }
+    // 状态栏那两条（点一下发码 + 弹窗的图）**单独 try**：它们挂了不该把右栏自动弹码一起拖死，
+    // 那是 1.1.0 已经在跑的既有行为。但 `available` 取"两条都上"——pill 点不开就是没成，
+    // 主插件据此把 `/drc pair` 作为兜底注册回来。
+    try {
+      unregisterActions = registerPairActionRoutes(web, {
+        ensureFresh: () => deps.ensureFresh(),
+        current: () => deps.current(),
+        renderPng: (qr: string) => deps.renderPng(qr),
+        log,
+      })
+      probe.actions = 'registered'
+    } catch (error) {
+      probe.actions = `register threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
+      log('状态栏路由注册失败（右栏自动弹码不受影响）', {
+        message: String((error as Error)?.message ?? error).slice(0, 200),
+      })
     }
     timer = setInterval(() => void tick(), config.refreshMs)
     // 不 unref 的话，任何一次性跑法（headless/CLI/e2e）都会被这个节拍钉住不退出。
@@ -213,14 +247,24 @@ export function startSidebarQr(ctx: LooseContext, deps: SidebarDeps): SidebarHan
       clearInterval(timer)
       timer = undefined
     }
-    try {
-      unregister?.()
-    } catch {
-      /* 宿主可能已经先一步把 webServer 拆了 */
+    for (const off of [() => unregister?.(), () => unregisterActions?.()]) {
+      try {
+        off()
+      } catch {
+        /* 宿主可能已经先一步把 webServer 拆了 */
+      }
     }
     unregister = undefined
+    unregisterActions = undefined
     if (started) log('sidebar stopped')
   }
 
-  return { stop, probe }
+  return {
+    stop,
+    probe,
+    // pill 点得开 = 发码与图片两条都挂上了；右栏那条单独挂上不算"能点一下配对"。
+    get available() {
+      return started && probe.route === 'registered' && probe.actions === 'registered'
+    },
+  }
 }

@@ -26,7 +26,7 @@ import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
 import { pairingImagePath, StatusFile, writePrivateFile } from './shell/status.js'
-import { pairingPairText, PAIR_UNAVAILABLE_TEXT } from './shell/pairing-text.js'
+import { pairingPairText, PAIR_UNAVAILABLE_TEXT, PAIR_VIA_PILL_TEXT } from './shell/pairing-text.js'
 import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
 import { renderTerminalQr, qrPng } from './platform/qr.js'
 import { startSidebarQr, type SidebarHandle } from './presentation/sidebar.js'
@@ -382,6 +382,31 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
 
   const createPairing = (): ReturnType<typeof wrappedPublish> => wrappedPublish()
+
+  /**
+   * 当前**仍然有效**的那张码，只读——不发新的。
+   *
+   * 用 `active.pairing` 而不是 `describeActivePairing()`：后者带着 `psk`，而它的返回值会被
+   * 状态栏那条图片路由间接消费；这里要的只是"屏幕上现在该显示哪张"。
+   * `slots.resolveFor` 顺手把已过期的剔掉，所以 `pairing.png` 在没有效码时拿到 null → 204。
+   */
+  function currentPairing(): { qr: string; token: string; expiresAt: number } | null {
+    const shown = active.pairing
+    if (!shown) return null
+    if (!slots.resolveFor(shown.token)) return null
+    return { qr: shown.qr, token: shown.token, expiresAt: shown.expiresAt }
+  }
+
+  /**
+   * 幂等版发码：已经有一张能用的就给那张，没有才向中继申请新的。
+   *
+   * 为什么必须幂等：状态栏那颗 pill 是可以连点的，而每点一次发一张的话，
+   * 中继的 pending 表里会同时挂着三个 PSK，屏幕上显示的却是其中一张——
+   * 手机扫到没被显示的那张就全线解不开。那正是当初"多码事故"的形状。
+   */
+  function ensureFreshPairing(): { qr: string; token: string; expiresAt: number } | null {
+    return currentPairing() ?? createPairing()
+  }
 
   /**
    * "让屏幕上永远有一张能用的码"这条策略（四条 stale 判据 + online 闸门，
@@ -785,6 +810,39 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     }
   }
 
+  // ── 右栏自动弹码 + 状态栏 pill 的路由（2026-10-03 折进来的那一半）──────
+  //
+  // 放在 `/drc` 命令**之前**：命令的说明文字要按"pill 到底点不点得开"来写，而那个答案
+  // 只有 `startSidebarQr` 跑过才知道（软探测与路由注册都在它里面同步完成）。
+  // 主链路仍然先成立：这一半起不来时，上面接好的那些一行都不许被回滚。
+  //
+  // 整段再包一层 try 不是冗余：`startSidebarQr` 内部已经层层兜住，但"层层兜住"是设计不是证明。
+  // 它一旦抛出，宿主会把我们这条 fiber 标 FAILED 并 dispose 掉那几个 inject 子 fiber——
+  // 那就等于用一个可选的外观功能砸了配对链路（真机取证见 `apply()` 里那条纪律）。
+  try {
+    sidebar = startSidebarQr(ctx, {
+      config: config.sidebarQr,
+      pairing: () => describeActivePairing(),
+      workspaceOf(sessionId: string): string | undefined {
+        try {
+          return kernel?.sessionWorkspace?.(sessionId)
+        } catch {
+          return undefined
+        }
+      },
+      // 状态栏那两条路由要的三件事：幂等发码、只读看当前码、现渲染 PNG。
+      ensureFresh: () => ensureFreshPairing(),
+      current: () => currentPairing(),
+      renderPng: (qr: string) => qrPng(qr),
+      log,
+    })
+  } catch (error) {
+    sidebar = undefined
+    log('sidebar start threw（配对链路不受影响）', {
+      message: String((error as Error)?.message ?? error).slice(0, 200),
+    })
+  }
+
   // ── /drc 命令 ──────────────────────────────────────────────────────
   // 拿 commands 的方式和拿内核服务完全一样：`ctx.commands` 这种"直接点属性"的读法在
   // 真 cordis 上下文上是**抛错**的（属性名不在本 fiber 的 inject 集合里，见 reflect.ts
@@ -797,15 +855,26 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   // 于是 `/drc pair` 报 `unknown result kind "text"`。
   // 现在**两道锁**：类型上 `CommandResult` 让写错 kind 编译就红（`pnpm -r typecheck`），
   // 运行时有 `tests/command-result.test.ts` 走一遍 apply() 注册出来的真 handler。
+  // 常态下**配对是点状态栏那颗 pill**（`src/presentation/pair-actions.ts` 的
+  // `POST /pairing/new` + `GET /pairing.png`）。`pair` 子命令只作为兜底存在：
+  // 宿主没有 `webServer`、或那两条路由没挂上时，pill 点不动，这时命令行必须是唯一退路——
+  // 否则那台主机根本配不了对（`pairOnStartSec` 是配置级逃生口，不该指望普通用户去改）。
+  const pairViaPill = sidebar?.available === true
   const commandDefinition = {
     name: 'drc',
-    description: 'DSH 远程控制：发布配对二维码、查看中继与内核接合状态',
-    input: { hint: 'pair | status | unpair' },
+    description: pairViaPill
+      ? 'DSH 远程控制：配对请点状态栏的 dsh-remote-control；/drc status 看连接与问题，/drc unpair 解配'
+      : 'DSH 远程控制：发布配对二维码、查看中继与内核接合状态',
+    input: { hint: pairViaPill ? 'status | unpair' : 'pair | status | unpair' },
     handler: async (invocation: { commandId: string; rawInput: string; agent?: unknown }): Promise<CommandResult> => {
       const argument = String(invocation.rawInput ?? '')
         .trim()
         .toLowerCase()
       if (argument.startsWith('pair')) {
+        if (sidebar?.available === true) {
+          // 不顺手发码：那会绕开 pill 的幂等语义，让"屏幕上永远只有一张有效码"这条断言失效。
+          return { kind: 'success', text: PAIR_VIA_PILL_TEXT }
+        }
         const pairing = createPairing()
         if (!pairing) return { kind: 'success', text: PAIR_UNAVAILABLE_TEXT }
         // **默认走图片**：DSH 命令卡按 `line-height:1.6` 渲染等宽输出，行间留白会把半块
@@ -869,34 +938,6 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     if (child !== undefined) injectChildren.push(['commands', child])
   } catch {
     /* 没有 commands 服务的代际：静默跳过，配对仍可由 pairOnStartSec 自动发布 */
-  }
-
-  // ── 右栏自动弹码（2026-10-03 折进来的 presentation 那一半）────────────
-  //
-  // 放最后：它只依赖 `describeActivePairing` / `kernel.sessionWorkspace` / config / log，
-  // 而那几样在它之前都已经接好了——**主链路必须先成立**，这一半起不来时上面一行都不许被回滚。
-  //
-  // 整段再包一层 try 不是冗余：`startSidebarQr` 内部已经层层兜住，但"层层兜住"是设计不是证明。
-  // 它一旦抛出，宿主会把我们这条 fiber 标 FAILED 并 dispose 掉六个 inject 子 fiber——
-  // 那就等于用一个可选的外观功能砸了配对链路（真机取证见 `apply()` 里那条纪律）。
-  try {
-    sidebar = startSidebarQr(ctx, {
-      config: config.sidebarQr,
-      pairing: () => describeActivePairing(),
-      workspaceOf(sessionId: string): string | undefined {
-        try {
-          return kernel?.sessionWorkspace?.(sessionId)
-        } catch {
-          return undefined
-        }
-      },
-      log,
-    })
-  } catch (error) {
-    sidebar = undefined
-    log('sidebar start threw（配对链路不受影响）', {
-      message: String((error as Error)?.message ?? error).slice(0, 200),
-    })
   }
 
   return {

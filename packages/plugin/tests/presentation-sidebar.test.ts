@@ -20,6 +20,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startSidebarQr, type SidebarQrSettings } from '../src/presentation/sidebar.js'
+import { PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE } from '../src/presentation/pair-actions.js'
 import { PAIRING_ROUTE } from '../src/presentation/route.js'
 
 const HOST_HEADERS = { host: '127.0.0.1:5173' }
@@ -133,9 +134,33 @@ async function askRoute(route: Route, url: string): Promise<{ status: number; bo
   return { status, body: JSON.parse(payload) as Record<string, unknown> }
 }
 
+/**
+ * 一次启动会挂上**三条**路由（只读状态那条 + 状态栏那颗 pill 的两条），所以取路由要按路径取，
+ * 不能靠下标——找不到就直接红，别让它静默退回 `routes[0]` 而测到另一条上去。
+ */
+function routeAt(routes: Route[], wanted: string): Route {
+  const found = routes.find((route) => route.path === wanted)
+  assert.ok(
+    found,
+    `路由 ${wanted} 没挂上，实际挂的是：${routes.map((route) => route.path).join(', ') || '（一条都没有）'}`,
+  )
+  return found as Route
+}
+
 function tempImageFile(): { file: string; cleanup: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), 'drc-sidebar-'))
   return { file: path.join(dir, 'sidebar-qr.png'), cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+}
+
+/**
+ * 状态栏那两条路由要的三条依赖，在这个文件里只是占位——本文件测的是**右栏接线**
+ * （软探测、节拍、落盘、注销）。发码的幂等、守卫、204 这些判据单独钉在
+ * `presentation-pair-actions.test.ts`，因为那是另一档安全姿态（会改状态）。
+ */
+const ACTION_DEPS = {
+  ensureFresh: () => null,
+  current: () => null,
+  renderPng: async () => Buffer.from('fake-png'),
 }
 
 const LOGS = () => {
@@ -158,15 +183,21 @@ test('webServer 到位：起节拍、挂路由，节拍跑出来的图真的在�
         pairing: () => pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000),
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
-      assert.equal(setupResult.routes.length, 1, '路由必须挂上')
-      assert.equal(setupResult.routes[0]?.path, PAIRING_ROUTE)
+      assert.deepEqual(
+        setupResult.routes.map((route) => route.path),
+        [PAIRING_ROUTE, PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE],
+        '三条路由都要挂上：只读状态那条 + pill 的发码 + pill 的图',
+      )
       assert.equal(captured.ticks.length, 1, '节拍必须起起来')
       assert.equal(handle.probe.webServer, 'via get')
       assert.equal(handle.probe.route, 'registered')
+      assert.equal(handle.probe.actions, 'registered')
+      assert.equal(handle.available, true, '三条都挂上了，pill 就该是能点的')
 
       const answer = await waitFor(async () => {
-        const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+        const got = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
         return got.status === 200 && got.body.state === 'ready' ? got : undefined
       })
       assert.equal(typeof answer.body.epoch, 'string')
@@ -197,9 +228,10 @@ test('会话工作区解析得出来：图落在 <工作区>/.dsh/sidebar-qr.png
         pairing: () => pairingWith('dsh-rc://pair?server=ws://x&psk=fake-psk&token=fake-token', Date.now() + 60_000),
         workspaceOf: (sessionId) => (sessionId === 'sess-1' ? workspace : undefined),
         log: logs.log,
+        ...ACTION_DEPS,
       })
       const answer = await waitFor(async () => {
-        const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+        const got = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
         return got.status === 200 && got.body.state === 'ready' ? got : undefined
       })
       const address = String(answer.body.address)
@@ -229,9 +261,10 @@ test('工作区解析抛错（内核还没起来）：退回配置里的 imageFi
           throw new Error('kernel 还没接上')
         },
         log: logs.log,
+        ...ACTION_DEPS,
       })
       const answer = await waitFor(async () => {
-        const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+        const got = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
         return got.status === 200 && got.body.state === 'ready' ? got : undefined
       })
       assert.ok(String(answer.body.address).endsWith(encodeURIComponent(path.basename(fallback))))
@@ -268,12 +301,13 @@ test('落盘写不进去 → 200 + none，绝不交出指向不存在文件的�
           return notADir
         },
         log: logs.log,
+        ...ACTION_DEPS,
       })
       await waitFor(async () => {
-        const got = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+        const got = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
         return asked > 0 ? got : undefined
       })
-      const answer = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+      const answer = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
       assert.deepEqual(answer.body, { state: 'none' })
       assert.equal(existsSync(fallback), false, '兜底位置也不该被写：写不成就不该交地址')
       handle.stop()
@@ -295,9 +329,10 @@ test('过期的码：路由一直答 none，且绝不落盘', async () => {
         pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() - 1),
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       await new Promise((resolve) => setTimeout(resolve, 120))
-      const answer = await askRoute(setupResult.routes[0]!, '/?session=sess-1')
+      const answer = await askRoute(routeAt(setupResult.routes, PAIRING_ROUTE), '/?session=sess-1')
       assert.deepEqual(answer, { status: 200, body: { state: 'none' } })
       assert.equal(existsSync(file), false, '过期的码不该写出任何文件')
       handle.stop()
@@ -318,6 +353,7 @@ test('没有 webServer：什么都不做（图落了盘也没人知道地址）�
         pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000),
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       assert.equal(setupResult.routes.length, 0)
       assert.equal(captured.ticks.length, 0)
@@ -342,8 +378,9 @@ test('服务改从 inject 回调（作用域上下文）里拿：同样能起', 
         pairing: () => null,
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
-      assert.equal(setupResult.routes.length, 1)
+      assert.equal(setupResult.routes.length, 3, '三条路由一起挂上')
       assert.equal(captured.ticks.length, 1)
       assert.equal(handle.probe.webServer, 'via inject')
       handle.stop()
@@ -364,6 +401,7 @@ test('探到的对象没有 register()：不收，probe 写明形状不对', asy
         pairing: () => null,
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       assert.equal(captured.ticks.length, 0, '形状不对就不要起节拍')
       assert.equal(handle.probe.webServer, 'object without register()')
@@ -390,6 +428,7 @@ test('探测本身抛错（宿主 ctx 是 Proxy，读不存在的属性会抛）
       pairing: () => null,
       workspaceOf: () => undefined,
       log: logs.log,
+      ...ACTION_DEPS,
     })
     // 抛过也要留下痕迹：'get threw: …' 是唯一能区分"这代宿主没这服务"和"我们读错了"的证据。
     assert.ok(String(handle.probe.webServer).startsWith('get threw:'))
@@ -410,6 +449,7 @@ test('取码那句抛错：节拍继续、不外抛，只记一行', async () =>
         },
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       assert.equal(captured.ticks.length, 1)
       await captured.ticks[0]!()
@@ -433,6 +473,7 @@ test('disabled：直接不做事，probe 写明原因', async () => {
       pairing: () => null,
       workspaceOf: () => undefined,
       log: logs.log,
+      ...ACTION_DEPS,
     })
     assert.equal(setupResult.routes.length, 0)
     assert.equal(captured.ticks.length, 0)
@@ -452,14 +493,15 @@ test('stop()：路由与节拍一起收回，且幂等', async () => {
         pairing: () => null,
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       assert.equal(setupResult.unregistered(), 0)
       handle.stop()
-      assert.equal(setupResult.unregistered(), 1, '路由要注销')
+      assert.equal(setupResult.unregistered(), 3, '三条路由都要注销')
       assert.equal(captured.cleared, 1, '节拍要清掉')
       // 重复调用是幂等的（宿主可能既 dispose fiber 又走停机路径）。
       handle.stop()
-      assert.equal(setupResult.unregistered(), 1)
+      assert.equal(setupResult.unregistered(), 3)
       assert.equal(captured.cleared, 1)
     })
   } finally {
@@ -484,10 +526,53 @@ test('register() 自己抛错：不起节拍、probe 留痕、不外抛', async 
         pairing: () => null,
         workspaceOf: () => undefined,
         log: logs.log,
+        ...ACTION_DEPS,
       })
       assert.equal(captured.ticks.length, 0, '路由没挂上就不该起节拍')
       assert.ok(String(handle.probe.route).startsWith('register threw'))
       handle.stop()
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('pill 那两条挂不上：右栏自动弹码照旧起（不能被新特性拖死），但 available 为 false', async () => {
+  const { file, cleanup } = tempImageFile()
+  try {
+    const routes: Route[] = []
+    let unregistered = 0
+    const ctx: Record<string, unknown> = {
+      get: () => ({
+        register: (route: Route) => {
+          if (route.path !== PAIRING_ROUTE) throw new Error('这两条路径宿主不给挂')
+          routes.push(route)
+          return () => {
+            unregistered += 1
+          }
+        },
+      }),
+    }
+    const logs = LOGS()
+    await withTimers(async (captured) => {
+      const handle = startSidebarQr(ctx, {
+        config: settings(file),
+        pairing: () => pairingWith('dsh-rc://pair?psk=fake-psk', Date.now() + 60_000),
+        workspaceOf: () => undefined,
+        log: logs.log,
+        ...ACTION_DEPS,
+      })
+      assert.equal(routes.length, 1, '只读状态那条仍要挂着')
+      assert.equal(handle.probe.route, 'registered')
+      assert.ok(String(handle.probe.actions).startsWith('register threw'))
+      assert.equal(captured.ticks.length, 1, '右栏那半该继续跑节拍')
+      // 这条就是主插件据此把 `/drc pair` 注册回来的信号：pill 点不开就是"点一下配对"没成。
+      assert.equal(handle.available, false)
+      await captured.ticks[0]!()
+      const answer = await askRoute(routeAt(routes, PAIRING_ROUTE), '/?session=sess-1')
+      assert.equal(answer.status, 200, '右栏那条路由仍是活的：' + JSON.stringify(answer))
+      handle.stop()
+      assert.equal(unregistered, 1, '挂上的那条要收回；没挂上的不该留下半个注销')
     })
   } finally {
     cleanup()

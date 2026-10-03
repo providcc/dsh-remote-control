@@ -24,9 +24,14 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../src/index.js'
+import { PAIR_VIA_PILL_TEXT } from '../src/shell/pairing-text.js'
+import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE } from '../src/presentation/pair-actions.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
+
+/** 宿主自己的 webServer 监听形状（环回）+ 同源页面的 Origin——pill 的两条路由要这两个都过。 */
+const LOOPBACK_HEADERS = { host: '127.0.0.1:5173', origin: 'http://127.0.0.1:5173' }
 
 /** 主链路上可比对的稳定字段。`sidebar` 单独断言，`relay`/`probe` 有时序所以另做形状断言。 */
 const MAIN_LINK_KEYS = [
@@ -44,6 +49,23 @@ const MAIN_LINK_KEYS = [
 interface RegisterCall {
   path: string
   kind: string
+  /** 挂上去的真实 handler——下面的接线测试就是打它，不是再自己拼一遍 deps。 */
+  handler?: (request: unknown, response: unknown) => unknown
+}
+
+/** `/drc` 注册出来的对外形状，只取"用户看得见的那几项"。 */
+interface CommandShape {
+  name: string
+  description?: string
+  input?: { hint?: string }
+}
+
+/** hint 是 `pair | status | unpair` 这种串：按竖线切开再判，`unpair` 里含着 `pair` 这个子串。 */
+function hintWords(hint: string | undefined): string[] {
+  return String(hint ?? '')
+    .split('|')
+    .map((word) => word.trim())
+    .filter(Boolean)
 }
 
 /**
@@ -58,6 +80,8 @@ function fakeGet(byName: Record<string, unknown>): <T>(name: string, optional?: 
 interface Booted {
   state(): Record<string, unknown>
   commandRegistered: boolean
+  /** 注册出来的 `/drc` 对外形状（说明文字与提示行）——pill 可用时这里要少掉 `pair`。 */
+  commandShape(): CommandShape | undefined
   providedKeys: string[]
   registerCalls: RegisterCall[]
   unregistered: () => number
@@ -67,10 +91,20 @@ interface Booted {
   dispose(): void
 }
 
-function boot(options: { webServer?: unknown; registerThrows?: boolean; sidebarEnabled?: boolean } = {}): Booted {
+function boot(
+  options: {
+    webServer?: unknown
+    registerThrows?: boolean
+    /** 只有 pill 那两条挂不上（右栏那条照旧成功）——新特性不许把既有特性一起拖死。 */
+    actionsThrows?: boolean
+    sidebarEnabled?: boolean
+  } = {},
+): Booted {
   /** 注册形状照 `LooseContext.commands.register` 的入参（handler 是可选的，这里不替它收紧）。 */
   interface Definition {
     name: string
+    description?: string
+    input?: { hint?: string }
     handler?: (invocation: { commandId: string; rawInput: string; agent?: unknown }) => unknown
   }
   const registered: Record<string, Definition> = {}
@@ -81,24 +115,20 @@ function boot(options: { webServer?: unknown; registerThrows?: boolean; sidebarE
   let disposed = false
   const statusDir = mkdtempSync(path.join(tmpdir(), 'drc-isolation-'))
 
-  const web =
-    options.webServer === undefined && options.registerThrows === undefined
-      ? undefined
-      : options.registerThrows
-        ? {
-            register: (route: RegisterCall) => {
-              registerCalls.push(route)
-              throw new Error('这个路由名已经被占了')
-            },
+  const wantsWeb = options.webServer !== undefined || options.registerThrows !== undefined || options.actionsThrows
+  const web = wantsWeb
+    ? {
+        register: (route: RegisterCall) => {
+          registerCalls.push(route)
+          if (options.registerThrows) throw new Error('这个路由名已经被占了')
+          if (options.actionsThrows && route.path !== '/plugins/dsh-remote-control/pairing')
+            throw new Error('这两条路径宿主不给挂')
+          return () => {
+            unregistered += 1
           }
-        : {
-            register: (route: RegisterCall) => {
-              registerCalls.push(route)
-              return () => {
-                unregistered += 1
-              }
-            },
-          }
+        },
+      }
+    : undefined
 
   const context = {
     // 假的/非 cordis 上下文：命令直接挂 ctx.commands（真 cordis 上这一读会抛，走 get/inject）。
@@ -146,6 +176,7 @@ function boot(options: { webServer?: unknown; registerThrows?: boolean; sidebarE
   return {
     state: () => service?.state ?? { relay: 'not-provided' },
     commandRegistered: definition !== undefined,
+    commandShape: () => definition,
     providedKeys: Object.keys(provided),
     registerCalls,
     unregistered: () => unregistered,
@@ -237,24 +268,66 @@ test('对照：主链路字段逐个相等、`/drc` 返回逐字节相等，差�
     )
 
     // 命令这一路才是用户真正走得通的那条：返回必须逐字节相同。
-    const textA = await without.runDrc('pair')
-    const textB = await withWeb.runDrc('pair')
-    assert.deepEqual(textB, textA, '/drc pair 的返回因为 webServer 有无而不同，说明右栏那一半连累了命令分支')
+    // 用 `unpair`（以及不带参数时的错误分支）而不是 `pair`——`pair` 的返回**有意**随 pill
+    // 能不能点而变，那是 2026-10-03 那条"点一下配对"的拍板，下面单独钉。
+    const textA = await without.runDrc('unpair')
+    const textB = await withWeb.runDrc('unpair')
+    assert.deepEqual(textB, textA, '/drc unpair 的返回因为 webServer 有无而不同，说明右栏那一半连累了命令分支')
     assert.equal((textA as { kind?: string }).kind, 'success', `宿主契约只认 success/error：${JSON.stringify(textA)}`)
 
     // 唯一允许的差别。
     assert.equal((a.sidebar as Record<string, string>).webServer, 'none')
     assert.equal((b.sidebar as Record<string, string>).route, 'registered')
+    assert.equal((b.sidebar as Record<string, string>).actions, 'registered', 'pill 那两条路由也要挂上')
     assert.equal((b.sidebar as Record<string, string>).webServer, 'via get')
-    assert.equal(withWeb.registerCalls[0]?.path, '/plugins/dsh-remote-control/pairing')
+    assert.deepEqual(
+      withWeb.registerCalls.map((call) => call.path),
+      ['/plugins/dsh-remote-control/pairing', PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE],
+      '三条路由一起挂：只读状态 + pill 发码 + pill 的图',
+    )
     assert.equal(without.unregistered(), 0)
     // 停机要连着把路由注销掉：漏了的话换一代宿主会撞上"路由名已占用"，
     // 而表现是"重载一次之后右栏再也不弹"。这里在断言之后 dispose，两个 finally 里的
     // dispose 是同一次（helper 内部有 once 守卫）。
     withWeb.dispose()
-    assert.equal(withWeb.unregistered(), 1, '停机要把路由一起注销')
+    assert.equal(withWeb.unregistered(), 3, '三条路由都要注销')
   } finally {
     without.dispose()
+    withWeb.dispose()
+  }
+})
+
+test('配对入口的兵分：pill 点得开时 /drc pair 只指路，点不开时命令行仍发得出码', async () => {
+  const noWeb = boot({})
+  const withWeb = boot({ webServer: true })
+  try {
+    await noWeb.waitForCarrier()
+    await withWeb.waitForCarrier()
+
+    // 说明文字：pill 在的时候不能再把 pair 当主入口宣传，否则用户按提示打一遍、
+    // 拿到的却是一句"去点状态栏"。
+    assert.ok(
+      hintWords(noWeb.commandShape()?.input?.hint).includes('pair'),
+      `pill 不可用时 hint 必须还带 pair：${String(noWeb.commandShape()?.input?.hint)}`,
+    )
+    assert.ok(
+      !hintWords(withWeb.commandShape()?.input?.hint).includes('pair'),
+      `pill 可用时 hint 里的 pair 要去掉：${String(withWeb.commandShape()?.input?.hint)}`,
+    )
+    assert.match(String(withWeb.commandShape()?.description), /状态栏/)
+
+    const viaPill = await withWeb.runDrc('pair')
+    assert.deepEqual(
+      viaPill,
+      { kind: 'success', text: PAIR_VIA_PILL_TEXT },
+      'pill 点得开时命令行不许顺手发码——那会绕开 pill 的幂等语义',
+    )
+    // 反证：上面那条不是"两边都返回同一句所以相等"。
+    const viaCli = await noWeb.runDrc('pair')
+    assert.notDeepEqual(viaCli, viaPill, 'pill 不可用时命令行必须走真正发码那一条分支')
+    assert.equal((viaCli as { kind?: string }).kind, 'success')
+  } finally {
+    noWeb.dispose()
     withWeb.dispose()
   }
 })
@@ -272,11 +345,102 @@ test('register() 抛错（路由名被占）：只废掉右栏那一半，注册
       String((state.sidebar as Record<string, string>).route ?? '').startsWith('register threw'),
       '路由注册抛错必须在 probe 里留痕，不然排查时会以为是"没有码"：' + JSON.stringify(state.sidebar),
     )
-    assert.equal(hostile.registerCalls.length, 1, '确实走到过注册那一步')
-    assert.deepEqual(await hostile.runDrc('pair'), await control.runDrc('pair'), '/drc pair 必须不受影响')
+    // 第一条注册就抛 → 整个 sidebar 不起，`available` 是 false，命令行必须把 pair 留回来。
+    // 这条是"兵分"的另一半：pill 挂不上不等于配对没了。
+    assert.ok(
+      hintWords(hostile.commandShape()?.input?.hint).includes('pair'),
+      `路由挂不上时 pair 必须留在 hint 里：${String(hostile.commandShape()?.input?.hint)}`,
+    )
+    assert.equal(hostile.registerCalls.length, 1, '第一条注册就抛了，后两条不该再试')
+    assert.equal(
+      (state.sidebar as Record<string, string>).actions,
+      undefined,
+      '第一条就抛时不该有 actions 的痕迹（早退要真的早退）：' + JSON.stringify(state.sidebar),
+    )
+    assert.deepEqual(await hostile.runDrc('unpair'), await control.runDrc('unpair'), '/drc unpair 必须不受影响')
   } finally {
     hostile.dispose()
     control.dispose()
+  }
+})
+
+test('只挂上右栏那条、pill 那两条挂不上：右栏照旧活，命令行把 pair 留回 hint', async () => {
+  const partial = boot({ actionsThrows: true })
+  try {
+    const state = await partial.waitForCarrier()
+    const sidebarState = state.sidebar as Record<string, string>
+    // 新特性失败不能把 1.1.0 已在跑的右栏一起拖死——那是这条 try 分开的唯一理由。
+    assert.equal(sidebarState.route, 'registered', '右栏那条要挂上：' + JSON.stringify(sidebarState))
+    assert.ok(
+      String(sidebarState.actions).startsWith('register threw'),
+      'actions 留痕：' + JSON.stringify(sidebarState),
+    )
+    assert.equal(partial.registerCalls.length, 2, '第一条成功、第二条抛了就该停在第二次尝试')
+    assert.ok(
+      hintWords(partial.commandShape()?.input?.hint).includes('pair'),
+      `pill 点不开时 pair 必须回来：${String(partial.commandShape()?.input?.hint)}`,
+    )
+    assert.notDeepEqual(
+      await partial.runDrc('pair'),
+      { kind: 'success', text: PAIR_VIA_PILL_TEXT },
+      '命令行必须真的走发码分支，而不是指路给一颗点不开的 pill',
+    )
+    partial.dispose()
+    assert.equal(partial.unregistered(), 1, '挂上的那条收回；没挂上的不该留下半个注销')
+  } finally {
+    partial.dispose()
+  }
+})
+
+test('pill 那两条挂上去的就是带守卫的那两条（接线，不是又拼一遍 deps）', async () => {
+  const withWeb = boot({ webServer: true })
+  try {
+    const state = await withWeb.waitForCarrier()
+    assert.equal(state.relay, 'offline', '这条 fixture 的中继是故意不可达的')
+
+    const handlerFor = (p: string) => {
+      const found = withWeb.registerCalls.find((call) => call.path === p)
+      assert.ok(found?.handler, `${p} 没挂上或没带 handler：${JSON.stringify(withWeb.registerCalls)}`)
+      return found!.handler as (request: unknown, response: unknown) => unknown
+    }
+    const run = async (p: string, method: string, headers: Record<string, string>) => {
+      let status = 0
+      let body = ''
+      const res = {
+        writeHead: (code: number) => {
+          status = code
+        },
+        end: (chunk?: unknown) => {
+          body = typeof chunk === 'string' ? chunk : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : ''
+        },
+      }
+      await handlerFor(p)({ method, url: '/', headers }, res)
+      return { status, body }
+    }
+
+    // 发码：完整守卫（Host + Origin 都在且环回）走通，落到"现在发不出码"这个确定分支。
+    const ok = await run(PAIR_NEW_ROUTE, 'POST', LOOPBACK_HEADERS)
+    assert.equal(ok.status, 200, ok.body)
+    assert.deepEqual(JSON.parse(ok.body), { state: 'unavailable', reason: 'relay-offline' })
+
+    // 三种被拒的形状都要在**挂上去的那条**上生效，而不是只在我的单元测试里生效。
+    assert.equal((await run(PAIR_NEW_ROUTE, 'POST', { host: '127.0.0.1:5173' })).status, 403, 'Origin 缺席')
+    assert.equal(
+      (await run(PAIR_NEW_ROUTE, 'POST', { host: '127.0.0.1:5173', origin: 'https://evil.example.com' })).status,
+      403,
+      '跨站 Origin',
+    )
+    assert.equal((await run(PAIR_NEW_ROUTE, 'GET', LOOPBACK_HEADERS)).status, 405, '发码那条只接受 POST')
+
+    // 图片：没有效码 → 204；非环回 Host → 403。
+    assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: '127.0.0.1:5173' })).status, 204)
+    assert.equal((await run(PAIR_IMAGE_ROUTE, 'GET', { host: 'evil.example.com' })).status, 403)
+
+    // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。
+    assert.ok(!ok.body.includes('psk'), `回答里出现了 psk：${ok.body}`)
+    assert.ok(!ok.body.includes('dshr:'), `回答里出现了配对 URI：${ok.body}`)
+  } finally {
+    withWeb.dispose()
   }
 })
 

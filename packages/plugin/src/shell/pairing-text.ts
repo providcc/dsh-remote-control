@@ -37,13 +37,25 @@ export interface PairingTextView {
 /** 中继没连上时的说法：必须指出去哪看原因，而不是"失败了"。 */
 export const PAIR_UNAVAILABLE_TEXT = '中继还没连上，暂时无法配对。看 status.json 的 relayProblem。'
 
+/**
+ * 常态下配对走状态栏那颗 pill，所以 `/drc pair` 不再顺手发码，只把人指过去。
+ *
+ * 为什么不在这里也发一张：pill 的发码是**幂等**的（屏幕上永远只留一张有效码），
+ * 命令行再发一张就绕过那条语义了——中继会同时认两个 PSK，而手机扫的是屏幕上那张，
+ * 取错密钥就全线解不开（当初"多码事故"的原样）。
+ * 只有 pill 挂不上（宿主没 `webServer` / 路由名被占）时，`pair` 才回到发码那条路。
+ */
+export const PAIR_VIA_PILL_TEXT =
+  '配对请点状态栏的 dsh-remote-control：它会当场生成一张一次性码并弹出二维码。\n' +
+  '（`/drc` 现在只剩 status 与 unpair；只有状态栏那条路不可用时，pair 才会回来发码。）'
+
 export function pairingPairText(view: PairingTextView): string {
   const ttlSec = Math.max(0, Math.round((view.expiresAt - view.now) / 1000))
   const lines = [`配对码 ${view.token} · ${ttlSec} 秒内有效 · 一次性`, '小程序里扫码，或手输这 6 位数字。']
   if (view.qrImage && view.imageFile) {
     // 图片是默认路径：正文只说"扫这张图"，不再塞那段在 DSH 里扫不出来的文本码。
-    // "打开这张 PNG"只能当兜底：`/drc pair` 之后右栏会**自己弹出**二维码
-    // （`packages/presentation`，装了那一行才成立），把开图写成主路径等于让用户
+    // "打开这张 PNG"只能当兜底：pill 或 `/drc pair` 发码之后右栏会**自己弹出**二维码
+    // （`src/presentation/`，宿主有 `webServer` 才成立），把开图写成主路径等于让用户
     // 白跑一趟去找文件——而这正是本命令当初被要求别做的事。
     lines.push('', `二维码会自动弹出到右栏；没弹出就打开这张 PNG 再扫：${view.imageFile}`)
   } else if (view.terminalQr) {

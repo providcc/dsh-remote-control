@@ -51,7 +51,7 @@ function hostnameOf(host: string): string {
   return trimmed
 }
 
-function hostIsLoopback(host: string | undefined): boolean {
+export function hostIsLoopback(host: string | undefined): boolean {
   if (host === undefined || host.trim() === '') return false
   return LOOPBACK_HOSTS.has(hostnameOf(host))
 }
@@ -59,6 +59,20 @@ function hostIsLoopback(host: string | undefined): boolean {
 /** Origin 缺席是合法的：同源 GET 上浏览器本来就可能不带它。 */
 function originIsLoopback(origin: string | undefined): boolean {
   if (origin === undefined) return true
+  return originHostIsLoopback(origin)
+}
+
+/**
+ * 写路由用的严版本：**Origin 缺席也拒**。
+ * 只读那条允许缺席是因为同源 GET 常常不带它，而"读一张马上过期的码"本身不构成权限；
+ * 会改状态的动作不能靠"没带就当作同源"这种推断。
+ */
+export function originMustBeLoopback(origin: string | undefined): boolean {
+  if (origin === undefined || origin.trim() === '') return false
+  return originHostIsLoopback(origin)
+}
+
+function originHostIsLoopback(origin: string): boolean {
   try {
     const { hostname } = new URL(origin)
     return LOOPBACK_HOSTS.has(hostname) || hostname === '::1'
@@ -67,7 +81,7 @@ function originIsLoopback(origin: string | undefined): boolean {
   }
 }
 
-function json(response: ServerResponse, status: number, body: unknown): void {
+export function json(response: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
   response.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) })
   response.end(payload)
