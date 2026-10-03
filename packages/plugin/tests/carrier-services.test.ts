@@ -250,6 +250,35 @@ test('人工交互两面的登记结果必须能从 status.json 读出来（审�
 })
 
 /**
+ * 真机上"审批卡没弹"有两种根因，现场长得一模一样，只有审计面能把它们分开：
+ * 整条 waterfall 没人答（我们没被派发）vs 别人抢先答了（我们排在后面）。
+ * 所以内核报的 `approval/asked` / `approval/decided` 必须原样进 status.json。
+ */
+test('审批审计面的两个落点要进 status.json：asked 计次、decided 记 outcome', () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.subscribe(() => {})
+  const fire = listeners['session/event']
+  assert.ok(fire, 'session/event 没订阅上')
+  const described0 = kernel.describe() as Record<string, unknown>
+  assert.equal(described0.approvalAsked, 0, '一次都没问过，计数就该是 0')
+  assert.equal(described0.approvalDecided, 'not-seen', '没收到 decided 时要说 not-seen，不能空着让人以为答过了')
+  fire({ id: 'ses_live' }, { type: 'approval/asked', data: { id: 'ap_1', toolName: 'write_file' } })
+  fire({ id: 'ses_live' }, { type: 'approval/decided', data: { id: 'ap_1', outcome: 'unavailable' } })
+  fire({ id: 'ses_live' }, { type: 'approval/asked', data: { id: 'ap_2', toolName: 'bash' } })
+  fire({ id: 'ses_live' }, { type: 'approval/decided', data: { id: 'ap_2', outcome: 'rejected' } })
+  const described = kernel.describe() as Record<string, unknown>
+  assert.equal(described.approvalAsked, 2, `问过两次却报 ${String(described.approvalAsked)}`)
+  assert.equal(described.approvalDecided, 'rejected', 'decided 要记**最后一次**的 outcome：它就是"谁答的"的证据')
+})
+
+/**
  * `approvalFace='registered'` 只说明"挂上去了"，不说明"收得到"。
  * 这两条把"收到之后走到哪一步"也钉成字段：真机上再出现审批卡没弹，
  * 看 `approvalCalls` 是 0 还是 >0 就能一句话分掉两半。

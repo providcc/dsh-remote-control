@@ -196,6 +196,18 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    */
   let approvalCalls = 0
   let approvalLast = 'not-called'
+  /**
+   * 内核自己报出来的审批审计：**问过几次**与**最后一次是怎么收的场**（进 status.json）。
+   *
+   * 这两条是用来分"审批卡没弹"的两种根因的，它们在现场长得一模一样：
+   * - `approvalAsked>0` 而 `approvalCalls=0`、`approvalDecided=unavailable`
+   *   → 整条链没人答，说明**我们的监听器压根没被派发**（作用域过滤那一类）；
+   * - `approvalAsked>0` 而 `approvalCalls=0`、`approvalDecided=rejected|allowed-once`
+   *   → **别人抢先答了**：waterfall 是"外层不 next() 就没人能答"，我们排在桌面那一位后面。
+   * 少了 `approvalDecided` 这两者分不开，只能靠猜（2026-10-03 深夜就这么猜错了一次）。
+   */
+  let approvalAsked = 0
+  let approvalDecided = 'not-seen'
 
   /**
    * 模型面的登记结果，进 status.json。
@@ -674,6 +686,10 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     if (!sessionId || !type) return
     seenEventTypes.add(type)
     const data = (event?.data ?? {}) as LooseObject
+    // 审批的审计面对象：`asked` 带 toolName，`decided` 带 outcome。这里只记账不翻译——
+    // 卡片本身走 `approval/request` 那条 waterfall，见 attachInteractionSink。
+    if (type === 'approval/asked') approvalAsked += 1
+    if (type === 'approval/decided') approvalDecided = String(data.outcome ?? '?')
     for (const mapped of sessionEventKernelEvents({ sessionId, type, seq: event?.seq, data })) {
       // 标题缓存留在闭包这一侧：纯函数只负责"这条事件翻成什么"，不负责记账。
       if (mapped.kind === 'title') titleCache.set(sessionId, { title: mapped.title, at: options.clock.now() })
@@ -923,6 +939,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         approvalFace,
         approvalCalls,
         approvalLast,
+        approvalAsked,
+        approvalDecided,
         questionsFace,
         listenerErrors:
           [...listenerErrors]
