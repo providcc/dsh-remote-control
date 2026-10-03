@@ -115,6 +115,16 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   /** 取证用：内核实际发过来的会话事件类型，以及我们**没有映射**的那些（进 status.json）。 */
   const seenEventTypes = new Set<string>()
   const unmappedEventTypes = new Set<string>()
+  /**
+   * 被判成"宿主注入"而**故意没出站**的 user/message，按 `source.kind` 计数。
+   *
+   * 为什么单独留这一份：注入内容（time-context / skill-catalog / runtime-context …）
+   * 在手机上是不能显示的——它们顶着「你的指令」那颗蓝气泡，内容是
+   * 「Time sampled while preparing turn 3 …」，用户没发过这句话（真机截图实证）。
+   * 但"我们丢掉"这件事必须能被别人看见，否则「手机上看不到 X」这个问题就分不清
+   * 是宿主没发、我们丢了、还是路上丢了。
+   */
+  const injectedUserMessages = new Map<string, number>()
   /** 事件回调里抛过的错（按类型计数）。没有这一条，"回合跑到一半没声音"就只能靠猜。 */
   const listenerErrors = new Map<string, number>()
   /**
@@ -581,6 +591,13 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         log('unmapped session event type', { type, keys: shapeOf(data) })
       }
     }
+    // 被判成"宿主注入"而没出站的 user/message：同样要留痕。
+    // 不留痕的话「手机上看不到某条注入」与「内核根本没发」在 status.json 里长得一模一样，
+    // 而这两件事的下一步完全不同（改映射 vs 查宿主）。
+    if (type === 'user/message' && !isHumanUserMessage(data)) {
+      const kind = String((data.source as LooseObject | undefined)?.kind ?? '?')
+      injectedUserMessages.set(kind, (injectedUserMessages.get(kind) ?? 0) + 1)
+    }
   }
 
   function translateAgentStatus(onEvent: (event: KernelEvent) => void, args: unknown[]): void {
@@ -769,6 +786,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         // 真机排错的第一现场：内核到底发了哪些事件类型、其中哪些我们没认。
         eventTypes: [...seenEventTypes].slice(-24).join('|'),
         unmappedEventTypes: [...unmappedEventTypes].join('|'),
+        injectedUserMessages: [...injectedUserMessages].map(([kind, count]) => `${count}×${kind}`).join('|') || 'none',
         approvalFace,
         questionsFace,
         listenerErrors:
@@ -809,17 +827,43 @@ export function sessionEventKernelEvents(input: {
     case 'turn/start':
       return [{ kind: 'run-state', sessionId, state: 'running' }]
     case 'assistant/message':
-    case 'user/message':
       return [
         {
           kind: 'delta',
           sessionId,
           messageId: messageIdOf(data, input.seq),
           text: textOf(data),
-          role: type === 'assistant/message' ? 'assistant' : 'user',
+          role: 'assistant',
           done: true,
         },
       ]
+    case 'user/message': {
+      // **只有真人输入才算"用户消息"**。宿主往会话里塞的东西一律走 `user/message`
+      // 这个事件类型，但它们的 `source.kind` 分别是 time-context / runtime-context /
+      // skill-catalog / agent-instructions / model-selection / tool-jobs / subagent-settled /
+      // compact-checkpoint / schedule / team-message ……
+      //
+      // 第一版在这里不看 `source`，于是一条 `time-context` 快照在手机上顶着
+      // 「你的指令」那颗蓝色气泡，内容是
+      // 「Time sampled while preparing turn 3, step 1: 2026-10-02T23:04:02+08:00 …」——
+      // 用户没发过这句话，却显示成他发的，这是**假事实**，比不显示坏得多。
+      //
+      // 所以判据只有一条：`source.kind === 'user'`。其余一律不出站。
+      // 「静默丢掉」不成立：调用方（`translateSessionEvent`）会把这个计数写进
+      // status.json 的 `injectedUserMessages`，真机问「为什么手机上看不到 X」时，
+      // 第一步就能分清是宿主没发、我们丢了、还是路上丢了（与 outbound 计数同一套纪律）。
+      if (!isHumanUserMessage(data)) return []
+      return [
+        {
+          kind: 'delta',
+          sessionId,
+          messageId: messageIdOf(data, input.seq),
+          text: textOf(data),
+          role: 'user',
+          done: true,
+        },
+      ]
+    }
     case 'tool/call': {
       // 字段名要按真机形状读：内核给的是 `arguments`（一个 JSON 串），不是 `args`；
       // 读错了这一帧永远停在 'started'，手机上看不到参数、也看不出工具在跑什么。
@@ -1047,6 +1091,28 @@ function charCountOf(event: KernelEvent): number {
   if (event.kind === 'delta') return event.text.length
   if (event.kind === 'tool') return (event.resultPreview ?? '').length + (event.argsPreview ?? '').length
   return 0
+}
+
+/**
+ * 这条 `user/message` 是不是**真人敲的那一句**。
+ *
+ * 取证（`~/.dsh/sessions/**\/session.v4.jsonl.zstd`，把全部会话按 `source.kind` 统计）：
+ * 宿主把注入内容也写成 `user/message`，靠 `source.kind` 区分，实测见过
+ * `user`（真人的话）、`time-context`、`runtime-context`、`skill-catalog`、
+ * `agent-instructions`、`model-selection`、`tool-jobs`、`subagent-settled`、
+ * `compact-checkpoint`、`schedule`、`team-message`、`agent-message`、`user-approval`、
+ * `ptc-mode`。判据必须是 `source`，不是事件类型 —— 事件类型它们全都一样。
+ *
+ * **缺 `source` 时按真人处理**：宿主若真的发了不带 `source` 的一条，那是旧一代的形状，
+ * 而把真人指令误判成注入 = 用户发的话凭空消失，代价比多显示一条注入大得多。
+ */
+function isHumanUserMessage(data: LooseObject): boolean {
+  const source = data?.source
+  if (source === undefined || source === null) return true
+  if (typeof source !== 'object') return true
+  const kind = (source as LooseObject).kind
+  if (typeof kind !== 'string' || !kind) return true
+  return kind === 'user'
 }
 
 function textOf(data: LooseObject): string {

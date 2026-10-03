@@ -1,3 +1,4 @@
+import type { KernelEvent } from '../src/ports/index.js'
 /**
  * carrier-services.test — `platform/carrier-services.ts` 的内核调用形状。
  *
@@ -663,4 +664,52 @@ test('sessions.get 抛错（cordis Proxy 读不到成员就是抛）：折成 un
   const kernel = f.kernel(services)
   assert.doesNotThrow(() => kernel.sessionWorkspace?.('ses_boom'))
   assert.equal(kernel.sessionWorkspace?.('ses_boom'), undefined)
+})
+
+test('被判定为宿主注入的 user/message：不发出站，但要在 kernel.injectedUserMessages 里留痕', () => {
+  // 注入内容（time-context 之类）不能出站：它在手机上会顶着「你的指令」那颗蓝气泡，
+  // 而用户没发过那句话。但"我们丢掉"必须看得见，否则「手机上看不到 X」这个问题
+  // 分不清是宿主没发、我们丢了、还是路上丢了。
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  const seen: KernelEvent[] = []
+  kernel.subscribe((event) => seen.push(event))
+  const fire = listeners['session/event']
+  assert.ok(fire, 'session/event 没订阅上')
+
+  fire(
+    { id: 'ses_live' },
+    {
+      type: 'user/message',
+      seq: 1,
+      data: {
+        content: [{ type: 'text', text: 'Time sampled while preparing turn 3' }],
+        source: { kind: 'time-context' },
+        id: 'm-1',
+      },
+    },
+  )
+  fire(
+    { id: 'ses_live' },
+    {
+      type: 'user/message',
+      seq: 2,
+      data: { content: [{ type: 'text', text: '真的指令' }], source: { kind: 'user' }, id: 'm-2' },
+    },
+  )
+
+  assert.deepEqual(
+    seen.map((event) => event.kind),
+    ['delta'],
+    '只该有真人那一条的 delta：注入的那条出站就是让用户背一句他没说过的话',
+  )
+  const traced = String((kernel.describe() as Record<string, unknown>).injectedUserMessages)
+  assert.match(traced, /time-context/, '丢掉的那条必须留痕，否则真机排错又要从头猜')
+  assert.doesNotMatch(traced, /(?<!×)\buser\b(?!-)/, '真人消息不许被算进"注入"计数：那个计数是"我们丢了多少"的账')
 })
