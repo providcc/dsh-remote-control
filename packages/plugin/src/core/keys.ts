@@ -8,10 +8,18 @@
  * 主机挂着多张配对码时，**必须按手机实际使用的那张码取 PSK**，
  * 取错的结果是"配对显示成功、每一帧都解不开、会话列表空白"——极难定位。
  * 因此这里不提供"取最近一个"的接口，只有 `resolveFor(token)`。
+ *
+ * ## 跨进程存活（2026-10-04）
+ *
+ * 本书现在可以被快照/恢复（`snapshot()` / `restore()`），落盘由 `shell/pair-store.ts` 负责。
+ * 起因是"主机重启 → 丢掉全部会话 → 手机必须重新扫码"，而这让自举迭代每次都要人回到机器前。
+ * **落盘的是 `psk` 而不是两把派生密钥**：派生是纯函数（`derivePskKey`），
+ * 存派生结果等于多一份要保持一致的第二真相，而它必须与 psk 永远相等。
  */
 import { generatePsk, randomPairingToken } from 'dsh-remote-wire'
 import type { Direction } from 'dsh-remote-wire'
 import { derivePskKey } from 'dsh-remote-wire'
+import type { StoredConversation } from '../shell/pair-store.js'
 
 const C2H: Direction = 'c2h'
 const H2C: Direction = 'h2c'
@@ -24,16 +32,25 @@ export interface Conversation {
   psk: string
   /** host→client 方向的本地序号（中继也会编号，本端这一个是给"顺序可核对"用的）。 */
   seqHost: number
-  generation: number
   createdAt: number
   /** 最近一次有实际收发的时刻；剪枝只看这个，不看 `createdAt`。 */
   lastActivityAt: number
+  /**
+   * 这条会话是不是从盘上恢复的。
+   *
+   * 只被剪枝读：**恢复出来的会话不能按"一天没收发就剪"处理**。那个 TTL 是给
+   * "新配对但用户从此不再打开手机"设计的，而恢复出来的那条恰恰是"用户本来配好了、
+   * 只是主机重启了"——按 24 小时剪掉它，等于把"免扫码重连"这个目的在长假的场景下又取消了。
+   * 它该由中继自己的空闲 TTL（中继侧默认 7 天）来决定，因为**中继忘掉它的那一天
+   * 本来就是手机必须重扫的那一天**（中继表一空，主机留着密钥也没人能路由）。
+   */
+  restored?: boolean
 }
 
 /**
  * 一本有界的密钥簿。
  *
- * 为什么必须有界（复核 🟡8）：D3 之后配对通道跨断连长存，而**中继侧的空闲 TTL 是 7 天**
+ * 为什么必须有界（复核🟡 8）：D3 之后配对通道跨断连长存，而**中继侧的空闲 TTL 是 7 天**
  * （`apps/server/src/config.ts` 的 `DRC_CONV_IDLE_TTL_MS`）。也就是说"中继先把它忘掉"
  * 这件事几乎不会发生，长期跑的主机会把每一条曾经配对过的通道连同一份 PSK 永远留在内存里，
  * 并且每次广播都还对它们逐个密封一遍（白做功且随天数线性增长）。
@@ -41,8 +58,10 @@ export interface Conversation {
  * 否则手机会对着一条主机已经不认得的通道说话。
  */
 export interface PrunePolicy {
-  /** 距今超过这么久而没有任何收发的通道可以剪掉。 */
+  /** 距今超过这么久而没有任何收发的通道可以剪掉。**不作用于恢复出来的会话**（见 `Conversation.restored`）。 */
   idleTtlMs: number
+  /** 恢复出来的会话用这一条 TTL；语义是"与中继的空闲 TTL 对齐"。 */
+  restoredIdleTtlMs?: number
   /** 通道数硬上界：超了就从最不活跃的开始剪（剪枝不看创建时刻，看最后活动）。 */
   maxConversations: number
 }
@@ -51,6 +70,10 @@ export const DEFAULT_PRUNE_POLICY: PrunePolicy = {
   // 一天没有任何收发就认为这条通道不会再被用（手机真回来时会重新扫码，
   // 而且它会先撞上 `unknown_session` → 中文提示，而不是"永远转圈"）。
   idleTtlMs: 24 * 3600 * 1000,
+  // 恢复出来的会话不按上面那条剪：默认给 7 天，与中继的 `DRC_CONV_IDLE_TTL_MS`
+  // （`config.ts` 的 7×24h）逐字对齐 —— 中继忘掉它的那天本来就得重扫，
+  // 主机提前剪只是把同一次重扫提前到用户还没察觉的时间点，反而更难解释。
+  restoredIdleTtlMs: 7 * 24 * 3600 * 1000,
   maxConversations: 64,
 }
 
@@ -62,7 +85,7 @@ export class ConversationBook {
    *
    * @param psk 必须来自 `PairingSlots.resolveFor(token)`——**不允许**"取最新的一个"。
    */
-  open(args: { id: string; psk: string; generation: number; now: number }): Conversation {
+  open(args: { id: string; psk: string; now: number }): Conversation {
     const conversation: Conversation = {
       id: args.id,
       clientIds: new Set<string>(),
@@ -70,12 +93,49 @@ export class ConversationBook {
       kH2C: derivePskKey(args.psk, H2C, args.id),
       psk: args.psk,
       seqHost: 0,
-      generation: args.generation,
       createdAt: args.now,
       lastActivityAt: args.now,
     }
     this.byId.set(args.id, conversation)
     return conversation
+  }
+
+  /**
+   * 从落盘记录恢复会话（跨进程续用，见 `shell/pair-store.ts`）。
+   *
+   * 两条刻意的选择：
+   *
+   * - **`clientIds` 一律置空**：那是"此刻谁连着"的瞬时态，进程刚起来时没有人连着主机。
+   *   填了旧值会让主机一启动就往每条会话广播，而手机端还没重连 ——
+   *   那些帧全被中继计成丢帧（`relay.ts` 的 `broadcast` 闸门当初就是为这个加的）。
+   *   手机回来发的第一帧会经 `RelayClient.onEncrypted` 把它重新登记进来。
+   * - **`restored: true`**：让剪枝对这条会话用另一条 TTL，理由见该字段的注释。
+   *
+   * 返回真正恢复出来的会话 id：**同一条 id 重复出现时后者覆盖前者**，
+   * 而一条形状不合的记录整条丢弃（宁可少一条通道，也不要一条解不开的）。
+   */
+  restore(records: readonly StoredConversation[], now: number): string[] {
+    const restored: string[] = []
+    for (const record of records) {
+      const conversation = this.open({ id: record.id, psk: record.psk, now })
+      conversation.seqHost = record.seqHost
+      conversation.createdAt = record.createdAt
+      conversation.lastActivityAt = record.lastActivityAt
+      conversation.restored = true
+      restored.push(record.id)
+    }
+    return restored
+  }
+
+  /** 导出可落盘的记录（**不含 clientIds**，理由见 `restore`）。 */
+  snapshot(): StoredConversation[] {
+    return [...this.byId.values()].map((conversation) => ({
+      id: conversation.id,
+      psk: conversation.psk,
+      seqHost: conversation.seqHost,
+      createdAt: conversation.createdAt,
+      lastActivityAt: conversation.lastActivityAt,
+    }))
   }
 
   /** 有实际收发就记一笔活跃（剪枝只看这个时刻）。未知通道返回 false，不顺手建条目。 */
@@ -115,31 +175,24 @@ export class ConversationBook {
     return this.byId.delete(id)
   }
 
-  /** 中继重启（generation 变化）时把旧会话全部丢掉：它们再也解不开了。 */
-  closeBefore(generation: number): string[] {
-    const dropped: string[] = []
-    for (const [id, conversation] of [...this.byId]) {
-      if (conversation.generation < generation) {
-        this.byId.delete(id)
-        dropped.push(id)
-      }
-    }
-    return dropped
-  }
-
   /**
    * 按策略剪枝，返回被剪掉的 id（调用方负责通知中继与上层，见
    * `RelayClient.pruneConversations`）。
    *
-   * 两条规则都做，因为它们是两种不同的失控：
+   * 三条规则，因为它们是三种不同的失控：
    * - 空闲超 TTL：一条通道一天没有任何收发，就不会再有人用它了；
+   * - **恢复出来的会话走另一条 TTL**（`restoredIdleTtlMs`）：见 `Conversation.restored`
+   *   与 `DEFAULT_PRUNE_POLICY.restoredIdleTtlMs` 的理由 —— 它不该按"新配对却没人用"的
+   *   标准剪掉，否则长假之后主机一启动就把唯一那条通道清了，免扫码重连白做；
    * - 超出硬上界：从**最不活跃**的开始剪。没有这条，一个每天配一次对的用户
    *   会在两周内攒下 260 条密钥，并且每次广播都对它们逐个密封一遍。
    */
   pruneStale(now: number, policy: PrunePolicy = DEFAULT_PRUNE_POLICY): string[] {
     const dropped: string[] = []
+    const restoredTtl = policy.restoredIdleTtlMs ?? policy.idleTtlMs
     for (const [id, conversation] of [...this.byId]) {
-      if (now - conversation.lastActivityAt > policy.idleTtlMs) {
+      const ttl = conversation.restored ? restoredTtl : policy.idleTtlMs
+      if (now - conversation.lastActivityAt > ttl) {
         this.byId.delete(id)
         dropped.push(id)
       }

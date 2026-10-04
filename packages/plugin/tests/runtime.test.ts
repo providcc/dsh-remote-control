@@ -10,6 +10,9 @@
  * 判据编号对应 docs/DESIGN.md §2.2：F7（updatedAt 只能是 ISO 字符串）、
  * F8（列表推送义务）、F9（done 帧不可丢）、F10（decision 逐字）、F11（两个无会话归属的载荷）。
  */
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { CmdPayload, EvPayload, SessionSummary } from 'dsh-remote-wire'
@@ -674,6 +677,154 @@ test('提问被撤回或超时时也要补同一帧（同一处结算点管两�
   await settle()
   const beats = transport.ofType(PAYLOAD_TYPES.evRunState) as Extract<EvPayload, { t: 'ev.run_state' }>[]
   assert.equal(beats.length, 2, `提问的超时也要补帧，实际一共 ${beats.length} 帧`)
+})
+
+/** 最近一条**回给某个对端**的帧（作废帧是 reply 不是 broadcast，它按 requestId 收单）。 */
+function lastReplyOf(transport: FakeTransport, type: string): Record<string, unknown> | undefined {
+  const hits = transport.replies.map((item) => item.payload).filter((payload) => payload.t === type)
+  return hits[hits.length - 1] as Record<string, unknown> | undefined
+}
+
+/**
+ * 精确作废帧这一组：`ev.permission_resolved` / `ev.question_resolved` 按 `requestId` 收单，
+ * 而 `ev.run_state` 是"这一会话的卡片全收"。两条一起发：精确帧是正路（mp 1.0.1 起认），
+ * run_state 只为兜住 1.0.1 以前的存量安装（那一档的分发是 `if (p.t === …)`，认不出静默忽略）。
+ */
+test('桌面先答时两条都要发：按 requestId 的精确作废帧，加上老版手机认的 ev.run_state', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1a')
+  const controller = new AbortController()
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  controller.abort('desktop')
+  assert.equal(await kernelSide, 'cancelled')
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)
+  assert.ok(resolved !== undefined, '只发了粗收单那一帧：新版手机收不到"是哪一张卡作废"')
+  assert.equal(resolved?.requestId, card.requestId, '作废帧必须对得上那张卡的 requestId')
+  assert.equal(resolved?.sessionId, 'ses_live', '缺了 sessionId，手机无从判断该不该在这条会话的页面上收卡')
+  assert.equal(resolved?.by, 'desktop', '桌面先答要说成 desktop，手机端才有得显示')
+  assert.ok(lastRunState(transport) !== undefined, '老版手机只认 ev.run_state，这一帧不能省')
+})
+
+test('超时与平台撤回都发 by=cancelled：by 说的是"谁收的场"，不是答案', async () => {
+  const { runtime, kernel, transport, clock } = fixture({ approvalTimeoutMs: 1_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1b')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await clock.advance(1_001)
+  assert.equal(await kernelSide, 'decline')
+  await settle()
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by,
+    'cancelled',
+    '主机自己不等了就要说 cancelled：写成 desktop 会让人以为有人在桌面上答过',
+  )
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.requestId, card.requestId)
+
+  const controller = new AbortController()
+  const withdrawn = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  controller.abort('platform')
+  assert.equal(await withdrawn, 'cancelled')
+  await settle()
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by, 'cancelled', '平台撤回同样是 cancelled')
+})
+
+test('手机自己答完不许发作废帧：那张卡是手机自己收的，再发一次等于告诉它"你没答"', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1c')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, { sessionId: 'ses_live', requestId: card.requestId, decision: 'approve' }),
+    'c_h1c',
+  )
+  assert.equal(await kernelSide, 'allowed-once')
+  await settle()
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evPermissionResolved).length,
+    0,
+    '手机答完还发作废帧：手机上刚收起的卡会被再收一次，而第二次收的是别的请求',
+  )
+})
+
+test('ev.question_request 必须带 expiresAt：那张卡以前没有任何倒计时，而主机 300 秒就判没答上', async () => {
+  const { runtime, kernel, transport } = fixture({ questionTimeoutMs: 60_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1d')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(card !== undefined, '没推出提问卡')
+  assert.equal(typeof card.expiresAt, 'string', '缺了 expiresAt，手机上那张卡就是"看不见什么时候作废"')
+  const left = Date.parse(card.expiresAt ?? '') - Date.now()
+  assert.ok(left > 50_000 && left <= 60_000, `到期时刻要落在配置的超时窗口里，实际还剩 ${Math.round(left / 1000)} 秒`)
+})
+
+test('提问收场发 ev.question_resolved：审批那两条不能顺手把提问卡也标成已答', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1e')
+  const controller = new AbortController()
+  const asked = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+    signal: controller.signal,
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved),
+    undefined,
+    '提问挂着一张卡却发的是审批那两条帧：手机会收错那张',
+  )
+  controller.abort('desktop')
+  assert.equal(await asked, null)
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evQuestionResolved)
+  assert.ok(resolved !== undefined, '提问卡没人收：手机上它会一直亮着，而主机早判没答上')
+  assert.equal(resolved?.requestId, card.requestId)
+  assert.equal(resolved?.by, 'desktop')
 })
 
 test('stop() 结算所有挂起交互：返回 decline 并释放每一次挂锁', async () => {
@@ -1460,4 +1611,104 @@ test('cmd.new_session：创建炸了也回执失败，且不推列表（手机�
     0,
     '没造出会话却推列表 = 让手机去刷新一个没变的东西',
   )
+})
+
+/* ── 图片附件：落盘 + 正文增补（wire 1.3.0 的 cmd.send_prompt.images）────────── */
+
+/** 回给手机的那条 ev.result 串成字符串，断言拒绝原因时用。 */
+const lastReplyText = (transport: FakeTransport): string => JSON.stringify(transport.replies.at(-1)?.payload ?? {})
+
+test('send_prompt 带图片：落盘后把路径写进正文，kernel 收到的是纯文本', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff20')
+  // 一张真 jpeg 的头（SOI + APP0 + 一点内容），落盘模块验的就是这个魔数
+  const jpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x02, 0x03, 0x04, 0xff, 0xd9,
+  ])
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张报错',
+      images: [{ name: 'shot.jpg', mediaType: 'image/jpeg', data: jpeg.toString('base64'), width: 1170, height: 800 }],
+    }),
+    'c_ffffffff20',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 1, '落盘成功就必须把指令送进去')
+  const sent = f.kernel.calls.sendPrompt[0]!
+  assert.equal(sent.sessionId, 'ses_img')
+  assert.match(sent.text, /^看这张报错/, '用户打的字在前')
+  assert.match(sent.text, /\[图片附件 1 张，已存到本机\]/, '正文要说明有几张、存在哪')
+  assert.match(
+    sent.text,
+    new RegExp(path.join(dir, 'ses_img', 'shot.jpg').replace(/[.]/g, '\\.') + '$'),
+    '路径要写进正文，且是绝对路径',
+  )
+  const saved = fs.readdirSync(path.join(dir, 'ses_img'))
+  assert.deepEqual(saved, ['shot.jpg'], '文件名按手机给的收敛后落盘')
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'ses_img', 'shot.jpg')), jpeg, '落盘内容与收到的逐字节相同')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('send_prompt 带图片但主机没配 uploadDir：拒收且不发给内核', async () => {
+  const f = fixture() // 默认 uploadDir 空 = 不收
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff21')
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张',
+      images: [
+        { name: 'a.jpg', mediaType: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0x00]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff21',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '没收图的许可就不该把这条指令发进去')
+  assert.match(lastReplyText(f.transport), /uploadDir/, '拒绝原因要原样回到手机上：用户得知道改哪')
+})
+
+test('send_prompt 带假 jpeg / 超上限：协议层之外主机再拒一道，kernel 不收到半截消息', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir, maxImageBytes: 16 })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff22')
+  // 内容其实是 png（魔数对不上）：mediaType 说谎也要拒
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        { name: 'a.png', mediaType: 'image/jpeg', data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '文件头对不上的 jpeg 必须被拒')
+  // 真 jpeg 但超过字节上限
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        {
+          name: 'b.jpg',
+          mediaType: 'image/jpeg',
+          data: Buffer.from([0xff, 0xd8, 0xff, ...Array.from({ length: 20 }, (_, i) => i)]).toString('base64'),
+        },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '超上限同样拒')
+  const left = fs.readdirSync(dir)
+  assert.ok(
+    left.every((d) => fs.readdirSync(path.join(dir, d)).length === 0),
+    '被拒的批次不许在磁盘上留下任何文件',
+  )
+  fs.rmSync(dir, { recursive: true, force: true })
 })

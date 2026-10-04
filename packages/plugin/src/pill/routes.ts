@@ -59,7 +59,7 @@ export interface LivePairing {
  * 也没有那条 URI 的任何片段。
  *
  * 本机名（`hostLabel`）2026-10-03 从面板上撤了：它是配置里那个名字，配对时手机上已经看到，
- * 留在弹窗里只是占一行。抬头那句"已配对/未配对"由 `paired` 一个字段决定就够了。
+ * 留在弹窗里只是占一行。抬头那句"已配对/未配对"由 `paired`（几台手机连着）与 `pairings`（密钥簿几条会话）两个字段一起决定。
  * 同一轮里 `version` 是**后补的**：面板收成"只有中继一行"之后用户嫌单薄，要凑够三行，
  * 而"跑的是哪一版"在这项目尤其值钱（profile 里可能就是没发布的字节）。
  */
@@ -68,6 +68,12 @@ export interface PillStatus {
   relay: 'online' | 'connecting' | 'offline' | 'idle'
   /** 当前配对着的手机数量。只允许配一台，所以它是 0 或 1；抬头那句与右上角那颗按钮都读它。 */
   paired: number
+  /**
+   * 密钥簿里还有几条会话 = 配对还在不在。与 paired（此刻有几台手机连着）是两件事：
+   * 手机关了小程序只是 socket 断，簿还在、回前台自动重连（pair-store，D3）。
+   * 抬头那句 未配对 / 手机离线 / 已配对 三态与右上角那颗按钮都靠这两个字段分。
+   */
+  pairings: number
   /** 中继地址（原样），弹窗里那一行要说清连的是哪台。 */
   serverUrl: string
   /** 本机装的这一版号（打包时注入，源码直跑时是 `dev`）。 */
@@ -272,6 +278,7 @@ export function pillStatusHandler(deps: PillRouteDeps) {
       json(response, 200, {
         relay: status.relay,
         paired: status.paired,
+        pairings: status.pairings,
         serverUrl: status.serverUrl,
         version: status.version,
         waiting: status.waiting,

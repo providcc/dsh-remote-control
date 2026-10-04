@@ -19,17 +19,29 @@
  *   由 `outbound.ts` 的构造器产出，参数表里就没有 sessionId。
  */
 import { randomUUID } from 'node:crypto'
-import type { AnswerItem, CmdPayload, EvPayload, HistoryItem, QuestionItem, SessionSummary } from 'dsh-remote-wire'
+import type {
+  AnswerItem,
+  CmdPayload,
+  EvPayload,
+  HistoryItem,
+  ImageAttachment,
+  QuestionItem,
+  SessionSummary,
+} from 'dsh-remote-wire'
+import { appendImageNote, saveImageAttachments } from '../shell/uploads.js'
 import {
   keepAwakeState,
   messageDelta,
   model,
   permissionRequest,
+  permissionResolved,
   questionRequest,
+  questionResolved,
   result as resultOf,
   runState,
   sessionChanged,
   sessionHistory,
+  todoList,
   toolEvent,
 } from 'dsh-remote-wire/outbound'
 import type { ApprovalDecision, AskUserQuestionAnswerValue, KernelEvent, KernelPort } from '../ports/index.js'
@@ -61,6 +73,10 @@ export interface RuntimeOptions {
   questionTimeoutMs: number
   /** 发指令前自动恢复归档会话。关掉它就要接受"归档会话被宿主 gate 直接拒掉"。 */
   unarchiveOnPrompt: boolean
+  /** 图片附件落盘目录（`shell/uploads.ts`）；空串时该模块自己退化成"不落盘、拒收图片"。 */
+  uploadDir: string
+  /** 单张图片字节上限（协议层只校张数与类型，校不了字节）。 */
+  maxImageBytes: number
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
 }
 
@@ -94,6 +110,10 @@ const DEFAULTS: RuntimeOptions = {
   approvalTimeoutMs: 180_000,
   questionTimeoutMs: 300_000,
   unarchiveOnPrompt: true,
+  // 图片附件：默认**不收**（uploadDir 空 = 拒收）。要放开必须在插件配置里显式
+  // 给一个目录——落盘是往用户磁盘写文件，不该由库默认值悄悄代劳。
+  uploadDir: '',
+  maxImageBytes: 4 * 1024 * 1024,
 }
 
 /** 一次列表最多给手机多少条会话（与中继侧的会话上限同源，取证 §5.3）。 */
@@ -188,7 +208,35 @@ export class HostRuntime {
               return
             }
           }
-          const sent = await this.kernel.sendPrompt(cmd.sessionId, cmd.text)
+          // 图片附件：内核端口只收文本，所以主机先把图落盘、把路径写进正文
+          // （为什么必须落盘、三条纪律见 shell/uploads.ts 头注）。落盘失败 =
+          // 整条 prompt 失败：用户的意图包含这些图，少发几张比明确失败更难查。
+          let text = cmd.text
+          const images: ImageAttachment[] = Array.isArray(cmd.images) ? cmd.images : []
+          if (images.length > 0) {
+            if (!this.options.uploadDir) {
+              reply(false, { message: '这台主机没配图片落盘目录（uploadDir），收不了图片附件' })
+              return
+            }
+            const saved = saveImageAttachments({
+              images,
+              dir: this.options.uploadDir,
+              sessionId: cmd.sessionId,
+              maxBytesPerImage: this.options.maxImageBytes,
+            })
+            if (!saved.ok) {
+              reply(false, { message: saved.message })
+              return
+            }
+            this.options.log?.('图片附件落盘', {
+              sessionId: cmd.sessionId,
+              images: saved.saved.length,
+              bytes: saved.saved.reduce((sum, img) => sum + img.bytes, 0),
+              dir: saved.dir,
+            })
+            text = appendImageNote(text, saved.saved)
+          }
+          const sent = await this.kernel.sendPrompt(cmd.sessionId, text)
           reply(sent.ok, sent.message ? { message: sent.message } : {})
           if (sent.ok) {
             this.sleep.markActive()
@@ -349,6 +397,14 @@ export class HostRuntime {
         this.broadcast(runState(event))
         if (event.state === 'running') this.sleep.markActive()
         void this.pushSessions('run-state')
+        return
+      case 'todo':
+        // 与 tool 同一纪律：先 flush 同会话的文本缓冲，再广播整份快照。
+        // 不做合并窗口——一轮 todo 也就十几条，逐条发手机也渲染得动；合并反而会让
+        // "最后那份清单"晚到，而顶部那颗条子要的就是此刻。
+        this.window.flushSession(event.sessionId)
+        this.broadcast(todoList({ todos: event.todos, sessionId: event.sessionId }))
+        this.sleep.markActive()
         return
       case 'title':
         void this.pushSessions('title')
@@ -532,13 +588,21 @@ export class HostRuntime {
         kind: 'question',
         askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, null, 'withdrawn'), { once: true })
+      // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
+      info.signal?.addEventListener(
+        'abort',
+        () => this.settle(id, null, info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+        { once: true },
+      )
       this.replyTo(
         conversationId,
         questionRequest({
           requestId: id,
           sessionId: info.sessionId,
           questions: info.questions,
+          // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
+          // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
+          expiresAt: new Date(Date.now() + this.options.questionTimeoutMs).toISOString(),
         }),
       )
     })
@@ -583,34 +647,47 @@ export class HostRuntime {
     this.pending.delete(id)
     this.clock.clearTimeout(item.timer)
     // 只有"不是手机自己点的"才需要作废：那种情况下手机上那张卡还亮着，而它已经没用了。
-    if (voidAs) this.voidStaleCard(id, item.sessionId, voidAs)
+    if (voidAs) this.voidStaleCard(id, item, voidAs)
     item.resolve(value)
   }
 
   /**
-   * 让手机上那张已经作废的卡片**当场**收掉。
+   * 让手机上那张已经作废的卡片**当场**收掉：先按 `requestId` 发一条精确帧，
+   * 再补一帧 `ev.run_state` 兜住"手机上装的是老版小程序"这一档。
    *
-   * 为什么用 `ev.run_state` 而不是新加一帧：这条帧就是小程序认定的"挂着的审批/提问卡作废"
-   * 信号（`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
-   * 并且停掉那条还在走的本地倒数），而**用户手机上现在装的这一版就认它**——不必等重新上传小程序。
-   * 协议里那条按 requestId 精确收单的 `ev.permission_resolved` 仍是要走的终点，
-   * 但它得先有一版带它的 wire 发布（伞仓 HANDOFF §3.10）。
+   * 为什么要两条而不是一条：`ev.permission_resolved` / `ev.question_resolved` 是按
+   * `requestId` 收单的（一次答完不会误收别的会话、别的请求那张卡），这是**正路**——
+   * mp 1.0.1 起就认这两帧（`pages/chat/chat.js` 的 `_onPermissionResolved` /
+   * `_onQuestionResolved`）。而 `ev.run_state` 是它从第一版就认的粗粒度信号
+   * （整会话两张卡一起收），发它只为兜住 **1.0.1 以前**的安装存量——那一档小程序
+   * 的分发是一串 `if (p.t === …)`，认不出来的 `t` 静默忽略。
+   * （`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
+   * 并停掉那条还在走的本地倒数）。所以两条都发：新版手机收到精确帧就精收一张，
+   * 老版手机靠 `run_state` 也能当场收卡，不用等用户重新上传小程序。
    *
-   * 内核**不会**为"审批被别人答掉了"发状态跳变（这一回合自始至终是 running），
-   * 所以这一帧只能由我们补发；补发的是**当前真相**而不是硬编码 `running`——
+   * 内核**不会**为"审批/提问被别人答掉了"发状态跳变（这一回合自始至终是 running），
+   * 所以这一帧只能由我们补发；补的是**当前真相**而不是硬编码 `running`——
    * 手机上那个"思考中"跟着这一帧走，发错方向会一直错到下一次真实跳变。
    * 读不到真相时退回缓存快照，再退 `idle`：宁可少一个转圈，不能凭空多一个转圈。
    */
-  private voidStaleCard(requestId: string, sessionId: string, reason: VoidReason): void {
+  private voidStaleCard(requestId: string, item: PendingInteraction, reason: VoidReason): void {
+    // `by` 说的是"谁收的场"，不是答案本身：手机只按"要不要收掉这张卡"读它。
+    const by = reason === 'desktop' ? 'desktop' : 'cancelled'
+    this.replyTo(
+      item.conversationId,
+      item.kind === 'approval'
+        ? permissionResolved({ requestId, sessionId: item.sessionId, by })
+        : questionResolved({ requestId, sessionId: item.sessionId, by }),
+    )
     const emit = (running: boolean): void => {
-      this.broadcast(runState({ sessionId, state: running ? 'running' : 'idle' }))
-      this.log('pending card voided', { requestId, reason, state: running ? 'running' : 'idle' })
+      this.broadcast(runState({ sessionId: item.sessionId, state: running ? 'running' : 'idle' }))
+      this.log('pending card voided', { requestId, reason, kind: item.kind, state: running ? 'running' : 'idle' })
     }
     void this.kernel
-      .runState(sessionId)
+      .runState(item.sessionId)
       .then((truth) => emit(truth.running))
       .catch(() => {
-        emit(this.sessions.some((item) => item.id === sessionId && item.running === true))
+        emit(this.sessions.some((session) => session.id === item.sessionId && session.running === true))
       })
   }
 

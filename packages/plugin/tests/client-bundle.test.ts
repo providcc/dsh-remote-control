@@ -243,18 +243,15 @@ async function flush(): Promise<void> {
 }
 
 /**
- * 走"点开 → 再按发码那颗"这两步。
+ * **未配对时点一下那颗 pill 就够了**（2026-10-04 改的）：直接进二维码页，
+ * 中间那一屏"先按一颗「生成配对码」才出码"已经删掉。
  *
- * 第二步是**这条用例存在的原因**：点开那颗 pill 只给状态，发码必须人再按一次，
- * 所以任何"看 QR / 看 6 位码 / 看倒计时"的断言都得先按这一下。少按一下就等于在断言
- * "面板停在信息上"，那条就会假绿。
+ * 所以这个 helper 现在只做一件事：点开 + 让那次自动发码的回答落地。
+ * 它仍然必须 `await flush()`——不 flush 就是在断言"面板停在 loading 上"，
+ * 那条会让所有"看 QR / 看 6 位码 / 看倒计时"的断言假绿。
  */
 async function openPairing(root: FakeElement): Promise<void> {
   root.find('drc-pill')!.emit('click')
-  await flush()
-  const button = root.find('drc-btn')
-  assert.ok(button, `面板里必须有一颗能按的按钮：${root.allText()}`)
-  button!.emit('click')
   await flush()
 }
 
@@ -267,6 +264,7 @@ const FAKE_REACT = {
 const DEFAULT_STATUS = {
   relay: 'online',
   paired: 0,
+  pairings: 0,
   serverUrl: 'wss://relay.example.com:443/relay',
   version: '0.0.0-test',
   waiting: 0,
@@ -517,7 +515,7 @@ test('注册进 conversation.composer.dock：槽位名、id、order 都要对', 
 })
 
 test('挂载之后抬头写的是状态路由给的那句', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
   const root = harness.mountPill()
   await flush()
   const pill = root.find('drc-pill')
@@ -525,16 +523,18 @@ test('挂载之后抬头写的是状态路由给的那句', async () => {
   // 抬头那句写在按钮里那个 `drc-label` 上，取它而不是按钮：假 DOM 的 textContent 不聚合后代。
   // 配上了几句台数**不写进抬头**：那排宽度是宿主给的，中文会被逐字断行（见下一条用例），
   // 而"几台"这件事点进去那颗按钮上看得见（只允许一台，所以它只可能是 0 或 1）。
-  assert.equal(root.find('drc-label')!.textContent, '已配对')
-  assert.equal(pill!.getAttribute('aria-label'), '已配对')
+  assert.equal(root.find('drc-label')!.textContent, '已连接')
+  assert.equal(pill!.getAttribute('aria-label'), '已连接')
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'on', '灯的颜色由 tone 决定')
 })
 
-test('在线但一台没配上：抬头是"未配对"，灯必须是灰的', async () => {
+test('在线但一台没配上：抬头是"远程未连接"，灯必须是灰的', async () => {
+  // 夹具的配对簿也是空的（pairings: 0）——真没配过。
+  // 配过但手机离线是另一种状态，见下面一条。
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
-  assert.equal(root.find('drc-label')!.textContent, '未配对')
+  assert.equal(root.find('drc-label')!.textContent, '远程未连接')
   assert.equal(
     root.find('drc-dot')!.getAttribute('data-tone'),
     'off',
@@ -542,10 +542,41 @@ test('在线但一台没配上：抬头是"未配对"，灯必须是灰的', asy
   )
 })
 
+test('在线、配对簿里还有会话但没有手机连着：抬头是"手机离线"，不是"远程未连接"', async () => {
+  // 现场：手机把小程序收进后台 / 关屏——socket 断了，但配对还在（pair-store 落盘、
+  // D3 长存），回前台自动重连。那一刻说"未配对"是在让用户扫一个不需要扫的码
+  // （2026-10-04 用户报的误解）。灯走黄：不是故障，也不是"可以用了"，是"等它自己回来"。
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 0, pairings: 1 } })
+  const root = harness.mountPill()
+  await flush()
+  assert.equal(root.find('drc-label')!.textContent, '手机离线')
+  assert.equal(
+    root.find('drc-dot')!.getAttribute('data-tone'),
+    'wait',
+    '黄色给"等它自己回来"：灰是没配上（要扫码），绿是配上了且在用，红才是故障',
+  )
+  // 点开不烧码（配对还在就是资格），也不该出二维码；按钮仍是"退出配对"——能退
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  assert.ok(root.find('drc-panel'), '面板要弹出来')
+  assert.ok(!root.find('drc-qr'), '配过了就不该再出二维码：手机离线不是没配上')
+  assert.equal(root.find('drc-head-label')!.textContent, '手机离线')
+  assert.equal(
+    harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '离线不放码：新码只会白耗中继的 pending 表',
+  )
+  assert.equal(root.find('drc-btn')!.textContent, '退出配对', '配对还在，按钮的身份就该还是退出配对')
+  assert.ok(
+    root.allText().includes('不用重新扫码'),
+    `离线那一屏要说清"不用重新扫码"，否则用户看到"手机离线"会去扫一个不需要扫的码：${root.allText().slice(0, 240)}`,
+  )
+})
+
 test('那一排挤不下时只许省略号，不许把中文逐字断行（真屏幕截图抓到的形状）', async () => {
   // 现场：宿主 dock 已经挤到 `6 轮 …`、`1.6M to…`，而我们那颗 `已连 1 台` 被压成竖排四个字。
   // flex 项默认可以缩到"中文的最小内容宽度 = 一个字"，所以 nowrap + 省略号必须写死在样式里。
-  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
   const root = harness.mountPill()
   await flush()
   const css = harness.fakeDocument().head.children.find((node) => node.tag === 'style')?.textContent ?? ''
@@ -558,8 +589,8 @@ test('那一排挤不下时只许省略号，不许把中文逐字断行（真�
   )
   // 截断之后全文仍然取得到（悬浮与读屏都靠这两条）
   const pill = root.find('drc-pill')!
-  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已配对')
-  assert.equal(pill.getAttribute('aria-label'), '已配对')
+  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已连接')
+  assert.equal(pill.getAttribute('aria-label'), '已连接')
 })
 
 test('中继断链时说的是"已断开连接"，而且是红的——不能和"还没配上"同一个灰', async () => {
@@ -588,7 +619,16 @@ test('页面不可见时不轮状态（Electron 里窗口在后台是常态）',
   )
 })
 
-test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文就是中继/状态/版本三行', async () => {
+/**
+ * 面板的两屏（2026-10-04 定形）：**未配对点开就是二维码页，已配对点开只给状态。**
+ *
+ * 原来这里是"未配对点开只给状态 + 一颗「生成配对码」"，那一屏被删掉了：没配上时面板上
+ * 没有任何别的东西可看，多点一次只换到一次"啊，原来在这儿"。
+ * 2026-10-03 那条取舍守的东西没有作废，只是挪了位置——**它现在守已配对那一侧**：
+ * 配上了之后点开仍然一次码都不发（见下面那条 paired 的用例），因为那时点开的第一预期
+ * 确实是"看一眼连得怎么样"，而一张码是有寿命的 pending 资源。
+ */
+test('未配对点开直接就是二维码页：发一次码、图与 6 位码都在，那颗按钮叫「刷新」', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
@@ -596,31 +636,58 @@ test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文�
   await flush()
 
   assert.ok(root.find('drc-panel'), '面板要弹出来')
+  assert.equal(root.find('drc-head-label')!.textContent, '远程未连接')
+  assert.ok(root.find('drc-qr'), `未配对点开就该在二维码页上，实际：${root.allText()}`)
+  assert.ok(root.find('drc-code'), '6 位码要单独印一行（QR 扫不出来时那是唯一退路）')
+  assert.equal(
+    harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    1,
+    '点开要发**且只发一次**码：这条路由幂等，但一次点开排两次是白耗中继的 pending 表',
+  )
+  assert.equal(root.find('drc-btn')!.textContent, '刷新', '没配上时那颗按钮的身份就是"再要一张码"')
+  // 正文那几行在未配对这一屏也要在场：它回答的是"连的哪一台 / 连没连上 / 跑的是哪一版"。
+  const rows = root
+    .findAll('drc-info')
+    .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
+  // 夹具里 `waiting: 0`，所以"待处理"那一行自己不占地方，正文就是这三行（次序也是判据）。
+  assert.deepEqual(rows, [
+    ['中继', 'relay.example.com:443'],
+    ['状态', '已就绪'],
+    ['版本', '0.0.0-test'],
+  ])
+  assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
+  // 已删掉的说法（这一轮又少了两个）：本机名、台数、再配一台、换一张、生成配对码。
+  const flat = root.allText()
+  for (const gone of ['本机', '已配对', '再配一台', '换一张', '生成配对码']) {
+    assert.ok(!flat.includes(gone), `删掉的说法不该再出现：「${gone}」在 ${flat}`)
+  }
+})
+
+test('已配对点开只给状态，一次码都不发；正文就是中继/状态/版本三行', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
     0,
-    '点开就发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
+    '配上之后点开还发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
   )
-  // 抬头那句状态与那颗 pill 同一个来源：面板开着时也读它。
-  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
-  const rows = root.findAll('drc-info')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
+  assert.ok(!root.find('drc-qr'), '已配对那一屏不该有二维码')
+  const rows = root
+    .findAll('drc-info')
+    .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
   assert.deepEqual(
-    rows.map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent]),
+    rows,
     [
       ['中继', 'relay.example.com:443'],
-      ['状态', '已连接'],
+      ['状态', '已就绪'],
       ['版本', '0.0.0-test'],
     ],
     `正文就那三行、按这个次序：${root.allText()}`,
   )
-  assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
-  // 这一轮真正删掉的说法：本机名、台数、再配一台、换一张。`状态` 与 `版本` 是**这一轮补回来的**，
-  // 所以它们不在禁列里（上一版那条禁令在这两处会假红）。
-  const flat = root.allText()
-  for (const gone of ['本机', '已配对', '再配一台', '换一张']) {
-    assert.ok(!flat.includes(gone), `这一轮删掉的说法不该再出现：「${gone}」在 ${flat}`)
-  }
-  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
 })
 
 /**
@@ -633,7 +700,7 @@ test('有东西在等时抬头说"等 N 件事"，面板第一行是"待处理 �
   const harness = load({
     react: FAKE_REACT,
     slots: true,
-    status: { ...DEFAULT_STATUS, paired: 1, waiting: 2, waitingOldestSec: 252 },
+    status: { ...DEFAULT_STATUS, paired: 1, pairings: 1, waiting: 2, waitingOldestSec: 252 },
   })
   const root = harness.mountPill()
   await flush()
@@ -650,7 +717,7 @@ test('有东西在等时抬头说"等 N 件事"，面板第一行是"待处理 �
     .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
   assert.deepEqual(
     rows[0],
-    ['待处理', '2 件 · 最久 4 分 12 秒'],
+    ['待处理', '2 件 最久 4 分 12 秒'],
     `待处理必须排第一（其余三条都是"知道就行"）：${JSON.stringify(rows)}`,
   )
   assert.deepEqual(
@@ -664,7 +731,7 @@ test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也
   const offline = load({
     react: FAKE_REACT,
     slots: true,
-    status: { ...DEFAULT_STATUS, paired: 1, relay: 'offline', waiting: 3, waitingOldestSec: 10 },
+    status: { ...DEFAULT_STATUS, paired: 1, pairings: 1, relay: 'offline', waiting: 3, waitingOldestSec: 10 },
   })
   const offlineRoot = offline.mountPill()
   await flush()
@@ -679,14 +746,18 @@ test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也
   })
   const unpairedRoot = unpaired.mountPill()
   await flush()
-  assert.equal(unpairedRoot.find('drc-label')!.textContent, '未配对', '没配上却说"等 1 件事"是让人去找一台不存在的手机')
+  assert.equal(
+    unpairedRoot.find('drc-label')!.textContent,
+    '远程未连接',
+    '没配上却说"等 1 件事"是让人去找一台不存在的手机',
+  )
   // 但面板里那一行仍然要说——它回答的是"这台机器上有没有回合被卡住"。
   unpairedRoot.find('drc-pill')!.emit('click')
   await flush()
   const first = unpairedRoot.findAll('drc-info')[0]!
   assert.deepEqual(
     [first.find('drc-key')!.textContent, first.find('drc-value')!.textContent],
-    ['待处理', '1 件 · 最久 40 秒'],
+    ['待处理', '1 件 最久 40 秒'],
     '抬头不抢，不代表面板可以不说',
   )
 })
@@ -697,17 +768,17 @@ test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也
  */
 test('等待时长的写法：<60 秒只说秒、十分钟以上不再带秒（这行是扫一眼的，不是秒表）', async () => {
   const cases: Array<[number, string]> = [
-    [37, '1 件 · 最久 37 秒'],
-    [60, '1 件 · 最久 1 分 0 秒'],
-    [252, '1 件 · 最久 4 分 12 秒'],
-    [600, '1 件 · 最久 10 分'],
-    [7265, '1 件 · 最久 121 分'],
+    [37, '1 件 最久 37 秒'],
+    [60, '1 件 最久 1 分 0 秒'],
+    [252, '1 件 最久 4 分 12 秒'],
+    [600, '1 件 最久 10 分'],
+    [7265, '1 件 最久 121 分'],
   ]
   for (const [seconds, expected] of cases) {
     const harness = load({
       react: FAKE_REACT,
       slots: true,
-      status: { ...DEFAULT_STATUS, paired: 1, waiting: 1, waitingOldestSec: seconds },
+      status: { ...DEFAULT_STATUS, paired: 1, pairings: 1, waiting: 1, waitingOldestSec: seconds },
     })
     const root = harness.mountPill()
     await flush()
@@ -723,7 +794,7 @@ test('waitingOldestSec 是怪值（老版宿主 / NaN）时那一行只说件数
     const harness = load({
       react: FAKE_REACT,
       slots: true,
-      status: { ...DEFAULT_STATUS, paired: 1, waiting: 2, waitingOldestSec: junk },
+      status: { ...DEFAULT_STATUS, paired: 1, pairings: 1, waiting: 2, waitingOldestSec: junk },
     })
     const root = harness.mountPill()
     await flush()
@@ -738,11 +809,17 @@ test('waiting 字段缺失（老版宿主）时那一行不建、抬头退回"�
   const harness = load({
     react: FAKE_REACT,
     slots: true,
-    status: { relay: 'online', paired: 1, serverUrl: 'wss://relay.example.com:443/relay', version: '1.2.0' },
+    status: {
+      relay: 'online',
+      paired: 1,
+      pairings: 1,
+      serverUrl: 'wss://relay.example.com:443/relay',
+      version: '1.2.0',
+    },
   })
   const root = harness.mountPill()
   await flush()
-  assert.equal(root.find('drc-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-label')!.textContent, '已连接')
   root.find('drc-pill')!.emit('click')
   await flush()
   const keys = root.findAll('drc-info').map((row) => row.find('drc-key')!.textContent)
@@ -787,12 +864,12 @@ test('中继那条链的细态按 relay 取值翻译：连接中 / 已断开 / �
 
 test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpair（带同一个守卫头）', async () => {
   // 先未配对地建出来，再把状态切成已配对并触发一次轮询，验证按钮会随状态改文案。
-  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
   const root = harness.mountPill()
   await flush()
   root.find('drc-pill')!.emit('click')
   await flush()
-  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
   const button = root.find('drc-btn')!
   assert.equal(button.textContent, '退出配对')
   assert.equal(
@@ -808,12 +885,20 @@ test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpai
     `按下退出配对必须打那条写路由：${harness.requests.join(' | ')}`,
   )
   // 乐观翻面：不用等下一次 2 秒轮询，抬头与那颗按钮当场就变。
-  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
-  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+  assert.equal(root.find('drc-head-label')!.textContent, '远程未连接')
+  // 退完之后不再是"先按一颗生成配对码"那一屏：**没配上就直接在二维码页上**，
+  // 那颗按钮的身份同时翻成 `刷新`（要再换一张码还是它）。
+  assert.equal(root.find('drc-btn')!.textContent, '刷新')
+  assert.ok(root.find('drc-qr'), `退出配对之后面板该停在二维码页，实际：${root.allText()}`)
 })
 
 test('退出配对那条断了：面板不白屏、抬头仍按乐观结果翻面，并且留下一行 warn', async () => {
-  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 }, unpairThrows: true })
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 },
+    unpairThrows: true,
+  })
   const root = harness.mountPill()
   await flush()
   root.find('drc-pill')!.emit('click')
@@ -837,7 +922,11 @@ test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板
   assert.ok(root.find('drc-panel'), '面板要弹出来')
   assert.equal(root.find('drc-qr')!.src, `${PAIR_IMAGE_ROUTE}?e=e1`, '图片地址要带上这一版码的 epoch')
   assert.equal(root.find('drc-code')!.textContent, '482913', '6 位码必须与 QR 同时在屏上——手输是唯一退路')
-  assert.equal(root.find('drc-note')!.textContent, '扫码配对 · 1 分 0 秒后过期')
+  assert.equal(root.find('drc-note')!.textContent, '微信扫码配对 1 分 0 秒后过期')
+  // 引导行：第一次装好插件的人要能在这一屏看明白"码是给谁扫的、扫完得到什么"。
+  // 口径是用户 2026-10-05 定的：一条、短、不带括号/顿号/书名号等符号（空格分隔）。
+  assert.equal(root.find('drc-guide')!.textContent, '打开小程序扫这个码 远程控制这台电脑')
+  assert.doesNotMatch(root.find('drc-guide')!.textContent, /[（()）「」【】·、，：:！!？?]/)
   // 出图这一版右上角那颗是**刷新**，不再是"生成配对码"——同一件事两个说法会让用户以为要重新配一次。
   assert.equal(root.find('drc-btn')!.textContent, '刷新', '二维码页那颗按钮的文案')
   assert.equal(root.find('drc-pill')!.getAttribute('aria-expanded'), 'true')
@@ -930,9 +1019,11 @@ test('手机上刚扫完码：面板从二维码当场翻回状态视图，右�
   assert.equal(root.find('drc-btn')!.textContent, '刷新')
 
   status.paired = 1
+  // 配对成功的那一刻主机就多了一条会话（簿从 0 变 1）——翻面判据读的是簿，不是台数。
+  status.pairings = 1
   await harness.fireAndFlush(0)
   assert.equal(root.find('drc-qr'), undefined, '配上之后那张图不该还占着面板')
-  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
   assert.equal(root.find('drc-btn')!.textContent, '退出配对')
   assert.ok(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length === 1, '翻面只是重画，不许顺手再要一张')
 })

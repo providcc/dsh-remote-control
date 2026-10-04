@@ -93,6 +93,11 @@ jobs:
       # 成功、attestation 事后 curl 也确实在，但 60s 的轮询先放弃 → 这一步红 → 后面的
       # `Create GitHub Release` 整个没跑。**假红比不红更坏**：它把"已发布的版本号不可复用"
       # 变成一个人去重发同一个号的死路。
+      #
+      # 200s 也输过一回（2026-10-04 发 control `2.0.0`）：Publish 绿、npm 上 2.0.0 在、
+      # attestation 几分钟后 curl 也在，但轮询在它落地之前放弃。靠"Publish 幂等 +
+      # `gh run rerun --failed` 只重跑红的那几步"捞回来的（v2.0.0 的 Release 是重跑补的）。
+      # 所以窗口放到 80 × 5s = 400s：注册表侧的落地延迟是它的事，不该由我们判红。
       - name: Verify provenance landed
         env:
           # 通过 env 传事件字段，避免把可被影响的值直接插进脚本。
@@ -101,7 +106,7 @@ jobs:
           set -e
           version="${TAG_NAME#v}"
           url="https://registry.npmjs.org/-/npm/v1/attestations/dsh-remote-control@${version}"
-          for i in $(seq 1 40); do
+          for i in $(seq 1 80); do
             body="$(curl -s "$url" || true)"
             if printf '%s' "$body" | grep -q '"attestations"'; then
               echo "provenance 已挂上：dsh-remote-control@${version}（第 ${i} 次轮询）"

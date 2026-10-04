@@ -31,7 +31,7 @@ function ticking(start = 1_700_000_000_000): { now: () => number; advance: (ms: 
 test('一条配对建出两把不同的方向密钥：主机用 h2c 密封、用 c2h 打开（B5）', () => {
   const book = new ConversationBook()
   const slot = new PairingSlots(ticking().now).create(120_000)
-  const conversation = book.open({ id: 'c_aaaabbbbcccc', psk: slot.psk, generation: 1, now: 1_700_000_000_000 })
+  const conversation = book.open({ id: 'c_aaaabbbbcccc', psk: slot.psk, now: 1_700_000_000_000 })
 
   assert.equal(conversation.kC2H.length, 32, '会话密钥必须是 32 字节：seal 会直接抛（KEY_BYTES 校验）')
   assert.equal(conversation.kH2C.length, 32, '两个方向的密钥都必须是 32 字节')
@@ -76,25 +76,29 @@ test('同一把 PSK 在不同 convId 下必须派生不同密钥（convId 参与
   )
 })
 
-test('closeBefore(generation) 只清掉旧代会话：中继重启不能顺手把新代的一起删了', () => {
+/**
+ * 2026-10-04：这一条原本是 `closeBefore(generation)` 的正向测试，
+ * 而 `closeBefore` 连同 `Conversation.generation` 一起被删了 ——
+ * 理由见下（它把"主机自己重启"误判成"中继重启"，每次重启都自毁全部配对）。
+ *
+ * 现在要钉住的是**反向**判据：**簿记里没有任何"按连接代号清会话"的能力**。
+ * 它必须由 `relay-client.test.ts` 的"主机重启后能续用"那一条在链路层兜住，
+ * 这里只保证没有后门 —— 因为只要这个方法还在，`hello-ok` 里那行误伤随时会被加回来。
+ */
+test('簿记不再有"按连接代号清会话"的能力：主机重启与中继重启在这里长得一样', () => {
   const book = new ConversationBook()
-  book.open({ id: 'c_old_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 1 })
-  book.open({ id: 'c_old_2', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 2 })
-  book.open({ id: 'c_new_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 2, now: 3 })
+  book.open({ id: 'c_keep_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', now: 1 })
+  book.open({ id: 'c_keep_2', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', now: 2 })
 
-  const dropped = book.closeBefore(2)
-  assert.deepEqual(
-    dropped.sort(),
-    ['c_old_1', 'c_old_2'],
-    `清掉的是 ${JSON.stringify(dropped)}：旧代会话必须全部作废（中继重启后没人路由它们）`,
+  // `closeBefore` 曾是唯一的清理入口。现在清会话只有两条路：
+  // **本端主动作废**（`close`，由解配 / 剪枝 / 解不开两次触发）与**上限剪枝**（`pruneStale`）。
+  assert.equal(
+    typeof (book as unknown as { closeBefore?: unknown }).closeBefore,
+    'undefined',
+    'closeBefore 又出现了：它无法区分主机重启与中继重启，加回来就是"每次重启都要重新扫码"',
   )
-  assert.equal(book.size, 1, '新代会话被一起删了 → 刚配好的手机被踢下线，要重新扫码')
-  assert.deepEqual(book.ids(), ['c_new_1'], '留下的必须恰好是当前代的那一条')
-
-  // 幂等：同一条代次再清一次不该再报任何东西。
-  assert.deepEqual(book.closeBefore(2), [], '重复清理又报了一遍：上层的"配对失效"提示会被刷屏')
-  assert.deepEqual(book.closeBefore(1), [], '更早的代次不该清掉当前会话')
-  assert.equal(book.size, 1, 'closeBefore 不该动当代会话')
+  assert.equal(typeof book.close, 'function', '本端主动作废这条路必须还在（解配与剪枝都走它）')
+  assert.equal(book.size, 2, `簿里只剩 ${book.size} 条：没有任何调用方该在重建连接时清簿`)
 })
 
 test('close/has/get 对不存在的 id 都是安全的空操作：解配与断连路径不能抛', () => {
@@ -105,7 +109,7 @@ test('close/has/get 对不存在的 id 都是安全的空操作：解配与断�
   assert.equal(book.size, 0)
   assert.deepEqual(book.ids(), [])
 
-  book.open({ id: 'c_real', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 10 })
+  book.open({ id: 'c_real', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', now: 10 })
   assert.equal(book.close('c_real'), true, 'close 存在的会话必须返回 true')
   assert.equal(book.has('c_real'), false, 'close 之后 has 仍为真：hasPeer 会谎报有对端，审批卡发出去没人收')
   assert.equal(book.size, 0, '会话数没降下来')
@@ -113,8 +117,8 @@ test('close/has/get 对不存在的 id 都是安全的空操作：解配与断�
 
 test('同一条 convId 重复 open 是覆盖而不是并出两条：簿记键只能是 convId', () => {
   const book = new ConversationBook()
-  const first = book.open({ id: 'c_dup', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 1 })
-  const second = book.open({ id: 'c_dup', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 2 })
+  const first = book.open({ id: 'c_dup', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', now: 1 })
+  const second = book.open({ id: 'c_dup', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', now: 2 })
   assert.equal(book.size, 1, `一条 convId 攒出 ${book.size} 条会话：广播会给同一条通道发两遍`)
   assert.notEqual(first.psk, second.psk, '夹具自检：两次 PSK 不同')
   assert.equal(book.get('c_dup')?.psk, second.psk, '后来的那张码没覆盖：手机用新码配对，主机还攥着旧密钥')
@@ -124,7 +128,7 @@ test('同一条 convId 重复 open 是覆盖而不是并出两条：簿记键只
 test('clientCount 数的是**手机台数**，不是会话数：解配重配会让会话变多而手机没变多', () => {
   const book = new ConversationBook()
   // 夹具自检：open() 那一刻成员表是空的，配对刚发生、还没有任何一帧过来。
-  const first = book.open({ id: 'c_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 1 })
+  const first = book.open({ id: 'c_1', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', now: 1 })
   assert.equal(book.clientCount(), 0, 'open() 里不预填成员：此刻确实还没有手机发过帧')
 
   first.clientIds.add('phone-1')
@@ -133,7 +137,7 @@ test('clientCount 数的是**手机台数**，不是会话数：解配重配会�
   // 「解除配对 → 重新配对」会开一条**新会话**，手机还是那一台。
   // 拿会话数当手机数报的话，用户解完配对看到数字反而变大 ——
   // 那个现象与"我的解配没生效"完全一致。
-  const second = book.open({ id: 'c_2', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', generation: 1, now: 2 })
+  const second = book.open({ id: 'c_2', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', now: 2 })
   second.clientIds.add('phone-1')
   assert.equal(book.size, 2, '夹具自检：两条会话')
   assert.equal(book.clientCount(), 1, '同一台手机不能被算成两台')
@@ -246,9 +250,9 @@ test('latest() 只用于展示，取密钥必须走 resolveFor：用 A 码建的
   const book = new ConversationBook()
   const picked = slots.resolveFor(usedByPhone.token)
   assert.ok(picked !== null, '按手机实际用的那张码必须取到 PSK')
-  const correct = book.open({ id: 'c_pair', psk: picked.psk, generation: 1, now: clock.now() })
+  const correct = book.open({ id: 'c_pair', psk: picked.psk, now: clock.now() })
   assert.ok(shown !== null, '夹具自检：展示位上有码')
-  const mistaken = book.open({ id: 'c_wrong', psk: shown.psk, generation: 1, now: clock.now() })
+  const mistaken = book.open({ id: 'c_wrong', psk: shown.psk, now: clock.now() })
 
   const record = seal(correct.kH2C, { t: 'ev.session_changed', sessions: [] })
   assert.equal(
@@ -308,19 +312,22 @@ test('两张码的 PSK 必须互不相同：PSK 每次配对轮换、单次有�
   assert.equal(psks.size, 100, 'PSK 出现重复：两张码共享密钥，一次性作废失去意义')
 })
 
-test('ConversationBook 的初始簿记形状：seqHost 从 0 起、clientIds 空、代次与时刻如实记下', () => {
+test('ConversationBook 的初始簿记形状：seqHost 从 0 起、clientIds 空、时刻如实记下', () => {
   const book = new ConversationBook()
   const conversation = book.open({
     id: 'c_shape',
     psk: 'AAAAAAAAAAAAAAAAAAAAAA==',
-    generation: 4,
     now: 1_700_000_999_000,
   })
   assert.equal(conversation.id, 'c_shape', '会话 id 必须逐字保留（F3：加工过一次就路由不回去）')
   assert.equal(conversation.seqHost, 0, '本端出站序号从 0 开始，第一帧发出去是 1')
   assert.equal(conversation.clientIds.size, 0, '新配对不该凭空带上客户端名单（D4 的成员校验用它）')
-  assert.equal(conversation.generation, 4, '代次没记下来：中继重启后 closeBefore 找不出该清哪些会话')
   assert.equal(conversation.createdAt, 1_700_000_999_000, 'createdAt 必须是传入时刻而不是 Date.now()：假时钟下要可核对')
+  assert.equal(
+    conversation.restored,
+    undefined,
+    '新配对的会话不是恢复出来的：剪枝会按它选 TTL，标错会让"用户早就配好的通道"被 24 小时规则清掉',
+  )
 })
 
 test('过期判据的边界：expiresAt 恰好等于此刻时仍算有效（与 resolveFor 的严格小于一致）', () => {
@@ -342,4 +349,89 @@ test('过期判据的边界：expiresAt 恰好等于此刻时仍算有效（与 
   clock.advance(1)
   assert.equal(slots.resolveFor(slot.token), null, '超过一刻就必须判过期')
   assert.equal(slots.latest(), null, '超过一刻展示位也要清空：status.json 里的码年龄判据靠它')
+})
+
+// ── 跨进程续用（2026-10-04）────────────────────────────────────────────
+//
+// 免扫码重连的全部机制：`(psk, convId)` 能重新派生方向密钥（B5），
+// 而手机侧的 installId 与 convId 本来就持久化在 wx storage 里 —— 手机侧零改动。
+
+test('snapshot → restore 之后派生的密钥逐字节相同：这是免扫码重连的唯一根据', () => {
+  const slot = new PairingSlots(ticking().now).create(120_000)
+  const first = new ConversationBook()
+  const original = first.open({ id: 'c_persist_1', psk: slot.psk, now: 1_000 })
+  original.clientIds.add('phone-1')
+  original.seqHost = 7
+
+  const second = new ConversationBook()
+  const restoredIds = second.restore(first.snapshot(), 999_000)
+  assert.deepEqual(
+    restoredIds,
+    ['c_persist_1'],
+    `恢复出 ${JSON.stringify(restoredIds)} 条：手机上就会撞 unknown_session`,
+  )
+
+  const back = second.get('c_persist_1')
+  assert.ok(back, '恢复后 get 不到这条会话')
+  assert.deepEqual([...back.kC2H], [...original.kC2H], 'kC2H 恢复后变了：手机发的主机解不开，表现为静默黑洞')
+  assert.deepEqual([...back.kH2C], [...original.kH2C], 'kH2C 恢复后变了：主机发的手机解不开')
+  assert.equal(back.seqHost, 7, 'seqHost 没带过来：本地编号跳号，排查密文顺序时对不上')
+})
+
+test('恢复出来的会话不带 clientIds：那一瞬没有人连着主机，谎报会让广播打进空会话', () => {
+  const source = new ConversationBook()
+  const original = source.open({ id: 'c_x', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', now: 1 })
+  original.clientIds.add('phone-1')
+  assert.equal(source.clientCount(), 1, '夹具自检：原簿里有一台手机')
+
+  const book = new ConversationBook()
+  book.restore([{ id: 'c_x', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', seqHost: 0, createdAt: 1, lastActivityAt: 1 }], 100)
+  const restored = book.get('c_x')
+  assert.equal(restored?.clientIds.size, 0, '把旧的成员名单也恢复了：主机一启动就往每条会话广播，手机还没回来')
+  assert.equal(book.clientCount(), 0, 'clientCount 因此虚报"有手机连着"，pill 会显示已配对而实际没人')
+  assert.equal(book.hasClient('c_x'), false, 'hasClient 为真 → broadcast 闸门失效，这些帧全被中继计成丢帧')
+  // 但密钥必须在：有密钥才是"等着手机回来"，没密钥就真的只能重扫了。
+  assert.equal(book.has('c_x'), true, '有密钥 ≠ 有人在线，这两条判据必须分开')
+})
+
+test('恢复出来的会话走另一条剪枝 TTL：长假的手机不该在主机一启动就被清掉', () => {
+  const policy = { idleTtlMs: 24 * 3_600_000, restoredIdleTtlMs: 7 * 24 * 3_600_000, maxConversations: 64 }
+  const record = (id: string) => ({ id, psk: 'AAAAAAAAAAAAAAAAAAAAAA==', seqHost: 0, createdAt: 0, lastActivityAt: 0 })
+
+  // 主机重启后簿里同时有"新配对的"与"从盘上恢复的"两条，都已经 3 天没动静。
+  const book = new ConversationBook()
+  const fresh = book.open({ id: 'c_fresh', psk: 'AgAAAAAAAAAAAAAAAAAAAA==', now: 0 })
+  fresh.lastActivityAt = 0
+  book.restore([record('c_restored')], 0)
+
+  const threeDays = 3 * 24 * 3_600_000
+  const dropped = book.pruneStale(threeDays, policy)
+  assert.deepEqual(
+    dropped,
+    ['c_fresh'],
+    `剪掉的是 ${JSON.stringify(dropped)}：3 天没动就该剪新配对的那条，而恢复出来的那条必须留着 —— 它代表"用户早就配好了、只是主机重启了"`,
+  )
+  assert.equal(book.has('c_restored'), true, '恢复出来的会话被 24 小时规则剪了：免扫码重连在长假场景下等于没做')
+
+  // 过了 7 天就该剪：中继的空闲 TTL 也是那个量级，那时它已经/routes 不到了，
+  // 主机再攥着这份 PSK 只是白占一份密钥材料。
+  book.restore([record('c_restored')], 0)
+  const eightDays = 8 * 24 * 3_600_000
+  const late = book.pruneStale(eightDays, policy)
+  assert.ok(
+    late.includes('c_restored'),
+    `${eightDays / 86_400_000} 天了还不剪：已超过中继的空闲 TTL（7 天），留着它主机单方面攥着一份没人能路由的密钥`,
+  )
+})
+
+test('没给 restoredIdleTtlMs 时退回 idleTtlMs：调用方不该因为少一个字段就把恢复会话立刻剪掉', () => {
+  const book = new ConversationBook()
+  book.restore([{ id: 'c_r', psk: 'AAAAAAAAAAAAAAAAAAAAAA==', seqHost: 0, createdAt: 0, lastActivityAt: 0 }], 0)
+  const twoDays = 2 * 24 * 3_600_000
+  const dropped = book.pruneStale(twoDays, { idleTtlMs: 24 * 3_600_000, maxConversations: 64 })
+  assert.deepEqual(
+    dropped,
+    ['c_r'],
+    '夹具自检的前提：默认策略下 2 天的恢复会话会被剪掉（idleTtlMs 兜底生效）。若这条红了说明兜底语义变了，需要重新评估',
+  )
 })

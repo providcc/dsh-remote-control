@@ -169,19 +169,6 @@ test('statusFile 为空只 warn 并关闭状态快照：GUI 宿主里那是唯�
   )
 })
 
-test('takeOverQuestions 必须 warn：它会剥夺桌面 UI 的提问能力', () => {
-  const problems = validateConfig(base({ takeOverQuestions: true }))
-  assert.ok(
-    problems.some((problem) => problem.field === 'takeOverQuestions' && problem.level === 'warn'),
-    '接管提问是不可逆的能力转移，必须提醒',
-  )
-  assert.equal(
-    validateConfig(base({ takeOverQuestions: false })).some((problem) => problem.field === 'takeOverQuestions'),
-    false,
-    '默认关时不该出现这条',
-  )
-})
-
 test('redact() 不许泄露 token：短 token 全打星，长 token 只留前 4 后 2 与长度', () => {
   const short = redact('tiny')
   assert.equal(short, '****', '长度 <=8 的凭据必须整体打星：留任何片段都等于把整条给出去')
@@ -222,11 +209,6 @@ test('布尔型环境变量只认显式的 1/0：拼错的值不许把功能打�
     readConfig({ pill: { enabled: true } }, { DRC_PILL: '0' }).pill.enabled,
     false,
     'DRC_PILL=0 必须关掉配对入口',
-  )
-  assert.equal(
-    readConfig({ takeOverQuestions: true }, { DRC_TAKE_OVER_QUESTIONS: '1' }).takeOverQuestions,
-    true,
-    '接管开关按显式 1 走',
   )
 })
 

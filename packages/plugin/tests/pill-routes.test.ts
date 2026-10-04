@@ -98,6 +98,7 @@ function deps(
     status: () => ({
       relay: 'online',
       paired: 1,
+      pairings: 1,
       serverUrl: 'wss://relay.example.com:443/relay',
       version: FAKE_VERSION,
       waiting: 0,
@@ -277,7 +278,7 @@ test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async ()
 
 // ── GET /status（pill 抬头那句连接状态）──────────────────────────────
 
-test('状态路由只出六个非凭据字段：relay / paired / serverUrl / version / waiting / waitingOldestSec', async () => {
+test('状态路由只出七个非凭据字段：relay / paired / pairings / serverUrl / version / waiting / waitingOldestSec', async () => {
   const d = deps()
   const { res, reply } = response()
   await pillStatusHandler(d)(request('GET', { host: '127.0.0.1:19387' }), res)
@@ -286,6 +287,7 @@ test('状态路由只出六个非凭据字段：relay / paired / serverUrl / ver
   assert.deepEqual(JSON.parse(got.body), {
     relay: 'online',
     paired: 1,
+    pairings: 1,
     serverUrl: 'wss://relay.example.com:443/relay',
     version: FAKE_VERSION,
     waiting: 0,
@@ -305,6 +307,7 @@ test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的�
     status: () => ({
       relay: 'idle',
       paired: 0,
+      pairings: 0,
       serverUrl: 'wss://relay.example.com:443/relay',
       version: FAKE_VERSION,
       waiting: 0,
@@ -316,6 +319,7 @@ test('runtime 还没起来时 relay 是 idle，不是 offline（pill 要说的�
   assert.deepEqual(JSON.parse(reply().body), {
     relay: 'idle',
     paired: 0,
+    pairings: 0,
     serverUrl: 'wss://relay.example.com:443/relay',
     version: FAKE_VERSION,
     // runtime 还没起来时"没有事在等"必须是**读出来的 0**，不是字段缺席——
