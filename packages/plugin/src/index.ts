@@ -33,6 +33,7 @@ import {
   readConfig,
   redact,
   resolvePairStoreFile,
+  resolveUploadDir,
   validateConfig,
   type PluginConfig,
 } from './shell/config.js'
@@ -317,6 +318,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     runtime = new HostRuntime(port, transport, sleep, clock, {
       listingRefreshMs: config.listingRefreshSec * 1000,
       unarchiveOnPrompt: config.unarchiveOnPrompt,
+      uploadDir: resolveUploadDir(config),
+      maxImageBytes: config.maxImageBytes,
       approvalTimeoutMs: config.approvalTimeoutSec * 1000,
       log: (message, fields) => log(message, fields),
     })

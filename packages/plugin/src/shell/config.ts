@@ -87,6 +87,16 @@ export interface PluginConfig {
    * 文件里有全部历史会话的 PSK，因此固定 0600 + 原子写，详见 `shell/pair-store.ts`。
    */
   pairStoreFile: string
+  /**
+   * 图片附件的落盘目录。`''` = 自动：`status.json` 同目录下的 `uploads/`。
+   *
+   * 为什么要有这么一项：手机发图时内核端口只收文本（见 `shell/uploads.ts` 的头注），
+   * 主机把图存成文件、把路径写进正文。目录里会积累用户发过的每一张图，
+   * 所以要能被配置指向一个有清理策略的位置（比如 tmp），默认值偏向"找得到"而不是"省地方"。
+   */
+  uploadDir: string
+  /** 单张图片的体积上限（字节）。默认 4MB：协议层只校"是不是 jpeg、几张"，校不了字节数。 */
+  maxImageBytes: number
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -111,6 +121,9 @@ export const DEFAULT_CONFIG: PluginConfig = {
   restoredIdleTtlSec: 604_800,
   // 密钥簿落盘：默认跟着 statusFile 走（见 `resolvePairStoreFile`）。
   pairStoreFile: '',
+  // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
+  uploadDir: '',
+  maxImageBytes: 4 * 1024 * 1024,
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
   // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
   pill: { enabled: true },
@@ -130,6 +143,24 @@ export function resolvePairStoreFile(config: PluginConfig, hostId: string): stri
   if (config.pairStoreFile === PAIR_STORE_OFF) return ''
   const configured = config.pairStoreFile.trim()
   if (!configured) return defaultPairStoreFile(config.statusFile, hostId)
+  if (configured.startsWith('/')) return configured
+  if (!config.statusFile) return configured
+  return path.join(path.dirname(config.statusFile), configured)
+}
+
+/**
+ * 图片附件落盘目录解析：与 `resolvePairStoreFile` 同一套规矩（`''` 走默认、
+ * 相对路径按 statusFile 所在目录解析），但没有 off 档——这一项没有"关掉"的语义，
+ * 想不落盘就把手机那侧的入口关掉（mp 只在上传成功后才会发带图的 prompt）。
+ */
+export function resolveUploadDir(config: PluginConfig): string {
+  const configured = config.uploadDir.trim()
+  if (!configured) {
+    const base = config.statusFile
+      ? path.dirname(config.statusFile)
+      : path.join(homedir(), '.dsh', 'dsh-remote-control')
+    return path.join(base, 'uploads')
+  }
   if (configured.startsWith('/')) return configured
   if (!config.statusFile) return configured
   return path.join(path.dirname(config.statusFile), configured)

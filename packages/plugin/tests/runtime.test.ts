@@ -10,6 +10,9 @@
  * 判据编号对应 docs/DESIGN.md §2.2：F7（updatedAt 只能是 ISO 字符串）、
  * F8（列表推送义务）、F9（done 帧不可丢）、F10（decision 逐字）、F11（两个无会话归属的载荷）。
  */
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { CmdPayload, EvPayload, SessionSummary } from 'dsh-remote-wire'
@@ -1608,4 +1611,104 @@ test('cmd.new_session：创建炸了也回执失败，且不推列表（手机�
     0,
     '没造出会话却推列表 = 让手机去刷新一个没变的东西',
   )
+})
+
+/* ── 图片附件：落盘 + 正文增补（wire 1.3.0 的 cmd.send_prompt.images）────────── */
+
+/** 回给手机的那条 ev.result 串成字符串，断言拒绝原因时用。 */
+const lastReplyText = (transport: FakeTransport): string => JSON.stringify(transport.replies.at(-1)?.payload ?? {})
+
+test('send_prompt 带图片：落盘后把路径写进正文，kernel 收到的是纯文本', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff20')
+  // 一张真 jpeg 的头（SOI + APP0 + 一点内容），落盘模块验的就是这个魔数
+  const jpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x02, 0x03, 0x04, 0xff, 0xd9,
+  ])
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张报错',
+      images: [{ name: 'shot.jpg', mediaType: 'image/jpeg', data: jpeg.toString('base64'), width: 1170, height: 800 }],
+    }),
+    'c_ffffffff20',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 1, '落盘成功就必须把指令送进去')
+  const sent = f.kernel.calls.sendPrompt[0]!
+  assert.equal(sent.sessionId, 'ses_img')
+  assert.match(sent.text, /^看这张报错/, '用户打的字在前')
+  assert.match(sent.text, /\[图片附件 1 张，已存到本机\]/, '正文要说明有几张、存在哪')
+  assert.match(
+    sent.text,
+    new RegExp(path.join(dir, 'ses_img', 'shot.jpg').replace(/[.]/g, '\\.') + '$'),
+    '路径要写进正文，且是绝对路径',
+  )
+  const saved = fs.readdirSync(path.join(dir, 'ses_img'))
+  assert.deepEqual(saved, ['shot.jpg'], '文件名按手机给的收敛后落盘')
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'ses_img', 'shot.jpg')), jpeg, '落盘内容与收到的逐字节相同')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('send_prompt 带图片但主机没配 uploadDir：拒收且不发给内核', async () => {
+  const f = fixture() // 默认 uploadDir 空 = 不收
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff21')
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张',
+      images: [
+        { name: 'a.jpg', mediaType: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0x00]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff21',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '没收图的许可就不该把这条指令发进去')
+  assert.match(lastReplyText(f.transport), /uploadDir/, '拒绝原因要原样回到手机上：用户得知道改哪')
+})
+
+test('send_prompt 带假 jpeg / 超上限：协议层之外主机再拒一道，kernel 不收到半截消息', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir, maxImageBytes: 16 })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff22')
+  // 内容其实是 png（魔数对不上）：mediaType 说谎也要拒
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        { name: 'a.png', mediaType: 'image/jpeg', data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '文件头对不上的 jpeg 必须被拒')
+  // 真 jpeg 但超过字节上限
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        {
+          name: 'b.jpg',
+          mediaType: 'image/jpeg',
+          data: Buffer.from([0xff, 0xd8, 0xff, ...Array.from({ length: 20 }, (_, i) => i)]).toString('base64'),
+        },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '超上限同样拒')
+  const left = fs.readdirSync(dir)
+  assert.ok(
+    left.every((d) => fs.readdirSync(path.join(dir, d)).length === 0),
+    '被拒的批次不许在磁盘上留下任何文件',
+  )
+  fs.rmSync(dir, { recursive: true, force: true })
 })
