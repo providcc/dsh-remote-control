@@ -98,6 +98,9 @@ export interface RelayClientOptions {
    * F13），`lastActivityAt` 差几秒不影响剪枝判定。批量落在 status 的 3 秒 tick 上做。
    */
   onBookActivity?: () => void
+  /** 存活探针间隔（默认 20 秒）与等 pong 的上限（默认 10 秒）。 */
+  probeIntervalMs?: number
+  probeTimeoutMs?: number
 }
 
 export interface RelayStateInfo {
@@ -111,6 +114,18 @@ export interface RelayStateInfo {
 const BACKOFF_MIN_MS = 1000
 const BACKOFF_MAX_MS = 30_000
 const HANDSHAKE_TIMEOUT_MS = 10_000
+/**
+ * 主机侧存活探针的节奏：每 20 秒问中继一句 `ping`，10 秒内没拿到 `pong` 就强拆。
+ *
+ * 为什么必须有它（2026-10-05 线上取证）：socket **半开**时两头都是瞎的——
+ * 对端已经走了（中继早把主机摘了、`hosts` 归零），本地一个 FIN/RST 都收不到，
+ * `close` 事件永远不来，于是状态一直报 online、重连永远不会开始。
+ * 实测：中继重启后主机重连成功，28 分钟后连接半开，中继 17:54 起就再无主机，
+ * 而插件直到进程重启都认为自己在线——手机上看到的就是"配对着却连不上"。
+ * 中继那侧本来就有心跳（它 ping 主机、2×60s 判死），缺的是主机这半边。
+ */
+const PROBE_INTERVAL_MS = 20_000
+const PROBE_TIMEOUT_MS = 10_000
 /** 已声明作废的 convId 记住多少条：远超一次会话里可能出现的配对通道数，又不会无界增长。 */
 const VOIDED_MAX = 256
 
@@ -130,6 +145,10 @@ export class RelayClient {
   private stopped = false
   private reconnectTimer: unknown
   private handshakeTimer: unknown
+  /** 存活探针的下一次提问（自重启的 setTimeout 链，见 {@link startProbe}）。 */
+  private probeTimer: unknown
+  /** 已提问、还没等到 pong 的那个定时器；undefined = 当前没有待答的问题。 */
+  private pongDeadline: unknown
   /** 连续解不开的会话：解不开说明这端已经没有对应密钥，留着它只会让手机永远转圈。 */
   private readonly undecryptable = new Map<string, number>()
   /** 已经向中继声明过的 convId（防重复 `session-leave`）；有上界，见 {@link VOIDED_MAX}。 */
@@ -214,6 +233,8 @@ export class RelayClient {
       })
     })
     socket.on('message', (raw) => this.onFrame(String(raw)))
+    // 存活探针：半开连接在本地是隐形的（对端走了、close 永不来），只能靠问。
+    this.startProbe(socket)
     socket.on('close', (code, reason) => {
       this.options.clock.clearTimeout(timeout)
       this.emitState('offline', `连接关闭 ${code} ${reason ? reason.toString() : ''}`.trim())
@@ -435,6 +456,8 @@ export class RelayClient {
         })
         return
       case 'pong':
+        // 探针的答复到了：这一轮的问题作废（没有待答问题时可视为心跳噪声）。
+        this.clearPongDeadline()
         return
       case 'enc':
       case 'enc-batch':
@@ -519,6 +542,8 @@ export class RelayClient {
       this.options.clock.clearTimeout(this.handshakeTimer)
       this.handshakeTimer = undefined
     }
+    // 探针跟着连接走：不清的话旧 socket 的提问会把新连接判死（表现为连上就重连）。
+    this.stopProbe()
     if (!socket) return
     socket.removeAllListeners()
     // 摘完监听器必须补一个 error 兜底，**不能只靠下面的 try/catch**。
@@ -533,6 +558,57 @@ export class RelayClient {
       socket.close()
     } catch {
       /* 已经关了 */
+    }
+  }
+
+  // ── 存活探针 ────────────────────────────────────────────────────────
+
+  /**
+   * 每隔 `probeIntervalMs` 问中继一句 `ping`，并给答复留 `probeTimeoutMs`。
+   *
+   * 用**自重启的 setTimeout 链**而不是 setInterval：时钟接口只有 setTimeout
+   * （见 `Clock`），而且链式写法天然带上"上一轮还没答就下一轮"的语义——
+   * 超时判死之后这条链也跟着 socket 一起被 closeSocket 收掉。
+   *
+   * `ping`/`pong` 是协议里本来就有的一对应用帧（中继无条件回 pong），
+   * 所以这一跳不需要动线协议；不直接用 ws 协议层 ping 是因为那一条在
+   * Node 的 ws 里由库自动应答，两端都"看得见"却都不留痕，排障时查不到。
+   */
+  private startProbe(socket: WebSocket): void {
+    this.stopProbe()
+    const interval = this.options.probeIntervalMs ?? PROBE_INTERVAL_MS
+    const timeout = this.options.probeTimeoutMs ?? PROBE_TIMEOUT_MS
+    const ask = (): void => {
+      // 连接已经换了/停了：这条链到此为止（closeSocket 会负责清定时器，
+      // 这里只保证不再对旧 socket 发问）。
+      if (this.stopped || this.socket !== socket) return
+      if (socket.readyState === WebSocket.OPEN) {
+        this.raw({ t: 'ping', ts: this.options.clock.now() })
+        this.clearPongDeadline()
+        this.pongDeadline = this.options.clock.setTimeout(() => {
+          // terminate 而不是 close：半开连接上 close() 要等 TCP 挥手，
+          // 而那条路早就断了——强拆才会逼出 close 事件，进而走重连。
+          this.options.log('relay probe timeout', { waitedMs: timeout })
+          socket.terminate()
+        }, timeout)
+      }
+      this.probeTimer = this.options.clock.setTimeout(ask, interval)
+    }
+    this.probeTimer = this.options.clock.setTimeout(ask, interval)
+  }
+
+  private stopProbe(): void {
+    if (this.probeTimer !== undefined) {
+      this.options.clock.clearTimeout(this.probeTimer)
+      this.probeTimer = undefined
+    }
+    this.clearPongDeadline()
+  }
+
+  private clearPongDeadline(): void {
+    if (this.pongDeadline !== undefined) {
+      this.options.clock.clearTimeout(this.pongDeadline)
+      this.pongDeadline = undefined
     }
   }
 

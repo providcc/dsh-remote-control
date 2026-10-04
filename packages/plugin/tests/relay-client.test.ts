@@ -148,6 +148,11 @@ function harness(): Harness {
   }
 }
 
+/** 起探针链（白盒，与 attachSocket 同一理由：connect() 会去建真 socket）。 */
+function startProbe(client: RelayClient, socket: FakeSocket): void {
+  ;(client as unknown as { startProbe(socket: FakeSocket): void }).startProbe(socket)
+}
+
 function attachSocket(client: RelayClient, socket: FakeSocket): void {
   ;(client as unknown as { socket: FakeSocket | undefined }).socket = socket
 }
@@ -880,4 +885,53 @@ test('停机时 socket 还停在 CONNECTING：close() 的异步 error 不许升�
   } finally {
     process.removeListener('uncaughtException', onUncaught)
   }
+})
+
+/* ── liveness probe (the half-open connection found in production 2026-10-05) ── */
+
+test('probe: asks a ping every 20s; ping/pong is a frame pair the protocol already has', async () => {
+  const h = harness()
+  startProbe(h.client, h.socket)
+  await h.clock.advance(0)
+  assert.equal(h.outOf('ping').length, 0, 'no ping right after attach')
+  await h.clock.advance(20_000)
+  assert.equal(h.outOf('ping').length, 1, 'one question per interval')
+  const ping = h.outOf('ping')[0]
+  assert.ok(ping, 'the ping must have been sent')
+  assert.equal(typeof ping.ts, 'number', 'ping carries a timestamp')
+  h.feed({ t: 'pong', ts: ping.ts })
+  await h.clock.advance(10_000)
+  assert.equal(h.socket.readyState, SOCKET_OPEN, 'answered in time must not be killed')
+  await h.clock.advance(10_000)
+  assert.equal(h.outOf('ping').length, 2, 'the chain reschedules itself')
+})
+
+test('probe: no pong within 10s means terminate (close never fires on a half-open socket)', async () => {
+  const h = harness()
+  startProbe(h.client, h.socket)
+  await h.clock.advance(20_000)
+  assert.equal(h.outOf('ping').length, 1)
+  await h.clock.advance(10_000)
+  assert.equal(
+    h.socket.readyState,
+    3,
+    'must terminate: close() on a half-open socket waits for a handshake that never comes',
+  )
+  const probeLog = h.logs.filter((line) => line.indexOf('relay probe timeout') === 0)
+  assert.equal(probeLog.length, 1, 'the timeout must leave a trace')
+  await h.clock.advance(60_000)
+  assert.equal(h.outOf('ping').length, 1, 'the chain stops once the socket is dead')
+})
+
+test('probe: stop or socket swap collects the chain, never kills the new connection', async () => {
+  const h = harness()
+  startProbe(h.client, h.socket)
+  await h.clock.advance(20_000)
+  assert.equal(h.outOf('ping').length, 1)
+  h.client.stop()
+  await h.clock.advance(120_000)
+  assert.equal(h.outOf('ping').length, 1, 'no questions after stop')
+  const last = h.states[h.states.length - 1]
+  assert.ok(last, 'a state must have been emitted')
+  assert.equal(last.relay, 'offline', 'stop lands the state on offline')
 })
