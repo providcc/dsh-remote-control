@@ -41,6 +41,7 @@ import {
   runState,
   sessionChanged,
   sessionHistory,
+  todoList,
   toolEvent,
 } from 'dsh-remote-wire/outbound'
 import type { ApprovalDecision, AskUserQuestionAnswerValue, KernelEvent, KernelPort } from '../ports/index.js'
@@ -402,15 +403,7 @@ export class HostRuntime {
         // 不做合并窗口——一轮 todo 也就十几条，逐条发手机也渲染得动；合并反而会让
         // "最后那份清单"晚到，而顶部那颗条子要的就是此刻。
         this.window.flushSession(event.sessionId)
-        // ⚠️ `ev.todo` 在 npm 上的 dsh-remote-wire@1.3.0 里还没有形状（协议侧已在
-        // dsh-remote-protocol 仓落地并通过它自己的往返判据，1.4.0 发版后才能 import
-        // `todoList`）。这里本地构造同一个对象，**字段必须与协议的 evTodo 逐字一致**；
-        // 等依赖升到 1.4.0 时把这三行换回 `todoList({...})`，行为不变。
-        this.broadcast({
-          t: 'ev.todo',
-          todos: event.todos,
-          sessionId: event.sessionId,
-        } as unknown as EvPayload)
+        this.broadcast(todoList({ todos: event.todos, sessionId: event.sessionId }))
         this.sleep.markActive()
         return
       case 'title':
