@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
-## [未发布]
+## [2.0.0] - 2026-10-04
 
 这一版把配对收敛成**一台、一条路、一颗按钮**，并把 `/drc` 整条删掉。属于**破坏性变更**，
 发布时该走主版本号。产品定义（为什么是这三条承诺、由承诺推出的界面判据）在伞仓
@@ -43,6 +43,16 @@
   （手机中途掉线），抬头也说的是"未配对"——用户能做的第一件事是重新配对，不是去找一台不存在的手机。
   数据来自 `HostRuntime.waiting`（`pending` 表里新增 `kind` 与 `askedAt`，时长用 `clock.now()`
   算，于是 FakeClock 能演"已经等了 4 分钟"）。
+
+- **重启不再逼用户重扫码：会话簿落盘 + 恢复**。配对密钥簿（PSK + convId + seqHost）落到
+  status.json 同目录的 `conversations-<hostId>.json`（0600 + 临时文件 rename + hostId 校验），
+  **不落**派生密钥、**不落**"此刻谁连着"（后者落盘会让主机一启动就往没人收的通道广播）。
+  恢复必须在 `relay.connect()` **之前**——反了会被第一帧 resync 声明空列表，中继当场删通道；
+  恢复出的会话立刻 `runtime.start()`，不等 `onPeerJoined`（手机是恢复不是重配，不发
+  pair-begin-client，等它 = 主机不订阅任何内核事件，症状与配对丢失一模一样）。
+  恢复出来的会话按 7 天剪（与中继 `DRC_CONV_IDLE_TTL_MS` 对齐：中继忘掉它那天本就是该重扫那天），
+  `pairStoreFile: 'off'` 关掉即回旧行为。`status.json` 新增
+  `pairStore{enabled,file,restored,lastSavedAt}` 四个非凭据字段。
 
 ### 变更
 
@@ -171,6 +181,14 @@
   （手机先答之后撤销了几次，**只在换成功时才计**）。屏幕上看不出桌面那张卡收没收的时候，
   这两个数就是唯一的现场证据：加了而卡还在 ⇒ 断在渲染端；没加 ⇒ 我们这侧没换成功。
 - `src/transport/relay.ts` 的 Prettier 格式（随 `4e2528c` 提交进来的长签名），`format:check` 全绿。
+
+- **手机聊天框不再出现原始 XML、工具标题是人话、结果预览不再是乱码**（三件事一个根因：
+  内核事件到插件事件的形状映射）。① `assistant/message` 的正文里带着 XML 序列化的工具调用
+  （与结构化 `tool/call` 事件是同一信息的第二份副本），剥掉后只留正文，剥完是空串时
+  仍发空正文帧（mp 对空正文不建块）；② 工具步骤标题改取模型写的 `description`——
+  原来整串贴 455 字符的 JSON；③ `tool/result` 的正文是 part 数组，旧实现 `JSON.stringify`
+  出字面量转义（手机上就是一片乱码），改成取文本（数组取文本 part、对象按字段递归、
+  非文本 part 跳过）。历史回放走同一个映射函数，旧会话翻上去也是干净的。
 
 ### 测试
 
