@@ -113,24 +113,47 @@
   手机这一侧立刻作废（`pending` 条目删掉、`waiting` 角标归零）。
   每一路赛跑结果都**带着"是谁答的"回来**：`'rejected'` 这个词两端都可能给，
   只比数值就不知道该不该收卡（第一版就是这么错的，测试把它钉住了）。
-  **还剩一半没到位**：手机那张卡的"收回"要发 `ev.permission_resolved`，协议里已经有了
-  （wire `66e9a63`），但本仓的 `dsh-remote-wire` 是从 npm 装的 1.1.0、那份里还没有这一帧——
-  **等带它的 wire 版本发布后接上**（追踪：伞仓 HANDOFF §3.10）。在那之前，桌面先答时
-  手机上那张卡会留到自己的倒计时走完；点下去是空操作（请求已作废），不会误批。
+  **任意一端答完，其他端那张卡当场作废**（这一轮补上的一条）：
+  - **手机先答 → 桌面那张卡消失**：交给链子下游的那份 `request.signal` 被换成
+    `AbortSignal.any([平台的, 我们这条])`，手机答完就撤销我们这条。宿主的 api-gateway 在
+    它断掉时向**每一个**渲染端推 `{type:'cancel', eventId}`，卡片由宿主自己的代码收——
+    我们只是宣告"这次请求结束了"，不替桌面决定结果（DSH 自己在多窗口场景本来就是这么做的：
+    第一个客户端给出结果时其余客户端都收到 cancel）。
+    ⚠️ 这条路只有读码读得出来：`next()` 忽略实参（换不掉下游收到的请求对象），
+    `ApprovalService.decide` 又在派发**之前**就读走了原件，所以能动的就是那一个字段。
+  - **桌面先答 / 平台撤回 / 主机超时 → 手机上那张卡消失**：结算点补发一帧 `ev.run_state`。
+    这条帧本来就是小程序认的"挂着的审批/提问卡作废"的唯一信号（它同时清审批卡与提问卡、
+    并停掉那条本地倒数），而内核**不会**为"审批被别人答掉了"发状态跳变（这一回合自始至终
+    是 running），所以只能由主机补发。补的是内核当前真相，读不到才退缓存快照、再退 `idle`。
+    协议里那条按 `requestId` 精确收单的 `ev.permission_resolved`（wire `66e9a63`）仍然待发——
+    本仓装的 `dsh-remote-wire` 是 npm 上的 1.1.0，那份里还没有这一帧（追踪：伞仓 HANDOFF §3.10）。
   ⚠️ **代价写在代码注释里**：排到最外层意味着也排在 Auto 预置的自动审阅之前。本机没配 Auto
   （profile 里只有 read-only / workspace-write / danger-full-access），所以没有安全闸门被跳过；
   哪天接上 Auto，这一行要重新审。
 - **`approvalFace` 不再被当成"能弹卡"的证据**：`status.json` 的 kernel 面新增四条读数——
   `approvalCalls`（监听器被调用次数）、`approvalLast`（最后一次走到哪一步：
-  `answered-by-phone(…)` / `handed-back(no phone target)` / `handed-back(phone declined or timed out)`）、
+  `answered-by-phone(…)` / `handed-back(no phone target)` / `handed-back(neither answered)`）、
   `approvalAsked`（内核报过几次 `approval/asked`）与 `approvalDecided`（最后一次 `approval/decided`
   的 outcome）。**"没人答"与"别人抢先答了"在现场长得一模一样**，只有 `decided` 能把它们分开——
   这一轮就是靠它从"还是被过滤了"翻到"是排在桌面后面"，少一个字段就要多猜一轮。
+- 关弹窗这一半再加两条读数：`approvalSignalHandoff`（`fused` / `ignored` / `failed: <原因>`——
+  请求对象的 `signal` 到底换没换成可撤销的那一份）与 `approvalDesktopVoided`
+  （手机先答之后撤销了几次，**只在换成功时才计**）。屏幕上看不出桌面那张卡收没收的时候，
+  这两个数就是唯一的现场证据：加了而卡还在 ⇒ 断在渲染端；没加 ⇒ 我们这侧没换成功。
 - `src/transport/relay.ts` 的 Prettier 格式（随 `4e2528c` 提交进来的长签名），`format:check` 全绿。
 
 ### 测试
 
-290 项（上一版 269）。`carrier-services.test.ts` 为"两边同时问"新增三条，**第一条就是那句红线**：
+298 项（上一版 290）。**跨端关弹窗这一轮新增八条，六次变异验证各自只抓到自己那条**：
+`carrier-services.test.ts` 三条——**手机先答时下游那份 `signal` 必须已被换掉且已撤销**
+（不换 / 不撤 / 撤销时连 runtime 那侧一起带倒，三种变异都红）、
+**平台中断时并算后的 signal 要保住原来的取消能力，`reason` 也要带下去**、
+**`signal` 不可写时不许抛**（严格模式给冻结对象赋值会抛，一抛就顺着 waterfall 把宿主的审批判死）；
+`runtime.test.ts` 五条——**桌面先答/超时/撤回三种收场都要补一帧 `ev.run_state` 并留 reason**
+（不补 → 5 红；reason 不区分"桌面先答"与"平台撤回" → 1 红）、
+**手机自己点掉时不许补**、**内核读不到真相时退缓存快照、再退 `idle`**、
+**提问那两类共用同一个结算点**。
+`carrier-services.test.ts` 为"两边同时问"新增三条，**第一条就是那句红线**：
 **手机先答也必须把链子交给桌面（`next()` 要跑到）**（把 `next()` 那一行拿掉它就红，已变异验证）、
 **桌面先答时手机那一侧必须被 `abort`（否则手机卡继续倒计时、`waiting` 角标也不会归零）**、
 **手机超时不算答案：桌面稍后给出的真决定必须赢**。
