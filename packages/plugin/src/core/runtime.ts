@@ -647,9 +647,11 @@ export class HostRuntime {
    * 再补一帧 `ev.run_state` 兜住"手机上装的是老版小程序"这一档。
    *
    * 为什么要两条而不是一条：`ev.permission_resolved` / `ev.question_resolved` 是按
-   * `requestId` 收单的（一次答完不会误收别的会话、别的请求那张卡），但**用户手机上现在装的
-   * 那一版还不认这两帧**——小程序的分发是一串 `if (p.t === …)`，认不出来的 `t` 静默忽略。
-   * 而 `ev.run_state` 正好是它早就认的那条"挂着的审批/提问作废"信号
+   * `requestId` 收单的（一次答完不会误收别的会话、别的请求那张卡），这是**正路**——
+   * mp 1.0.1 起就认这两帧（`pages/chat/chat.js` 的 `_onPermissionResolved` /
+   * `_onQuestionResolved`）。而 `ev.run_state` 是它从第一版就认的粗粒度信号
+   * （整会话两张卡一起收），发它只为兜住 **1.0.1 以前**的安装存量——那一档小程序
+   * 的分发是一串 `if (p.t === …)`，认不出来的 `t` 静默忽略。
    * （`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
    * 并停掉那条还在走的本地倒数）。所以两条都发：新版手机收到精确帧就精收一张，
    * 老版手机靠 `run_state` 也能当场收卡，不用等用户重新上传小程序。

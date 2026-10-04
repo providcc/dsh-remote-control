@@ -687,8 +687,8 @@ function lastReplyOf(transport: FakeTransport, type: string): Record<string, unk
 
 /**
  * 精确作废帧这一组：`ev.permission_resolved` / `ev.question_resolved` 按 `requestId` 收单，
- * 而 `ev.run_state` 是"这一会话的卡片全收"。两条一起发是因为**手机上装的那一版只认后者**
- * （分发是一串 `if (p.t === …)`，认不出的 `t` 静默忽略）。
+ * 而 `ev.run_state` 是"这一会话的卡片全收"。两条一起发：精确帧是正路（mp 1.0.1 起认），
+ * run_state 只为兜住 1.0.1 以前的存量安装（那一档的分发是 `if (p.t === …)`，认不出静默忽略）。
  */
 test('桌面先答时两条都要发：按 requestId 的精确作废帧，加上老版手机认的 ev.run_state', async () => {
   const { runtime, kernel, transport } = fixture()
