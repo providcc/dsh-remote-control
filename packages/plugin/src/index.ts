@@ -624,7 +624,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         return
       }
       decided = true
-      start(createServicesKernel(collected as never, { log, takeOverQuestions: config.takeOverQuestions, clock }))
+      start(createServicesKernel(collected as never, { log, clock }))
       return
     }
     // 没有 services 载体就不启动，也不退回 apiProxy/typert：桌面态从未注册 apiProxy 服务，

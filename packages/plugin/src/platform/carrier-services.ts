@@ -154,8 +154,6 @@ function fuseSignals(platform: AbortSignal | undefined, ours: AbortSignal): Abor
 export interface ServicesOptions {
   clock: Clock
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
-  /** 接管提问：`ctx.userQuestions` 只允许一个活跃 provider，接管会取代桌面 UI，故默认关。 */
-  takeOverQuestions?: boolean
   /** 标题读取的超时与批量上限（读失败只让列表无标题，不影响列表本身）。 */
   titleTimeoutMs?: number
   titleBatch?: number
@@ -1126,12 +1124,6 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         modelFace: modelFaceSummary(),
         workspaceRegistry: typeof services.workspaceRegistry === 'object',
         userQuestions: typeof services.userQuestions === 'object',
-        // 这个键**已经不生效**了：提问现在跟审批一样是 waterfall 参与者，两端同弹、
-        // 谁先答谁算，不再有"接管/取代桌面"这回事（那条 `registerProvider` 单提供者
-        // 路线在这一代宿主上根本不存在）。这里照实把配置值报出来，真正的状态看
-        // `questionsFace`。（删键要动 config.ts/index.ts，那两棵树此刻有并行会话在飞的改动。）
-        takeOverQuestions: options.takeOverQuestions === true,
-        takeOverQuestionsInert: options.takeOverQuestions === true,
         archivedSessions: archivedIds().size,
         hasOn: typeof services.on === 'function',
         // 真机排错的第一现场：内核到底发了哪些事件类型、其中哪些我们没认。

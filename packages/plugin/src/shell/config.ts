@@ -35,8 +35,6 @@ export interface PluginConfig {
   pairTtlMs: number
   /** 强 carrier 未到时，等多久才落到弱 carrier。 */
   carrierGraceMs: number
-  /** 提问接管：会剥夺桌面 UI 的提问能力，所以默认关（见 core/runtime.ts）。 */
-  takeOverQuestions: boolean
   approvalTimeoutSec: number
   listingRefreshSec: number
   /**
@@ -113,7 +111,6 @@ export const DEFAULT_CONFIG: PluginConfig = {
   pairOnStartSec: 0,
   pairTtlMs: 120_000,
   carrierGraceMs: 5000,
-  takeOverQuestions: false,
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
@@ -216,7 +213,6 @@ export function readConfig(
   // 1/0/true/false，其余值不猜、退回上层。
   if (fromEnv('DRC_PILL')) merged.pill.enabled = envFlag(env.DRC_PILL, merged.pill.enabled)
   if (fromEnv('DRC_MOCK_BRIDGE') === '1') merged.mockBridge = true
-  if (fromEnv('DRC_TAKE_OVER_QUESTIONS') === '1') merged.takeOverQuestions = true
   // token 只从环境变量取：patch 文件是 600 权限的 yaml，但把凭据写在配置文件里
   // 比留在环境变量里更容易被顺手提交或贴进工单。
   if (merged.hostTokenEnv) merged.hostToken = env[merged.hostTokenEnv] ?? merged.hostToken
@@ -298,14 +294,6 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
   }
   if (!config.statusFile) {
     problems.push({ level: 'warn', field: 'statusFile', message: '为空将关闭状态快照；GUI 宿主里这是唯一的排错入口' })
-  }
-  if (config.takeOverQuestions) {
-    problems.push({
-      level: 'warn',
-      field: 'takeOverQuestions',
-      message:
-        '提问接管会**取代桌面 UI 的提问能力**（ctx.userQuestions 只允许一个活跃 provider）；手机端不在线时提问会直接失败',
-    })
   }
   return problems
 }
