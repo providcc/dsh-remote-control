@@ -503,8 +503,14 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   function currentPairing(): LivePairing | null {
     const shown = active.pairing
     if (!shown) return null
-    if (!slots.resolveFor(shown.token)) return null
-    return { qr: shown.qr, token: shown.token, expiresAt: shown.expiresAt }
+    const slot = slots.resolveFor(shown.token)
+    if (!slot) return null
+    // 过期时刻以 **slot** 为准，不是 active 里那份出码时的旧值：中继的 pair-ready 会用
+    // 服务端权威 TTL 改写 slot.expiresAt（线上中继发的是 180s，本地默认 120s），
+    // 而 active 没人更新。用旧值算 expiresInMs，本地过期之后 slot 还有效的那一整段里，
+    // 发码路由每次都回 expiresInMs=0，pill 上就是"发码回答里的码不完整"，
+    // 而且按一次撞一次（2026-10-04 用户实测：断开重连后点刷新必现）。
+    return { qr: shown.qr, token: shown.token, expiresAt: slot.expiresAt }
   }
 
   /**
@@ -517,6 +523,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   function ensureFreshPairing(): LivePairing | null {
     const fresh = currentPairing() ?? createPairing()
     if (!fresh) return null
+    // 兜底一道：resolveFor 用 clock.now()，而路由算 expiresInMs 用 Date.now()，
+    // 两个时钟之间有窗口；服务端 TTL 改写也让"还有效"这件事有两个口径。
+    // 到点的码不当 fresh——现补一张（中继不在就回 null，路由那边会说 unavailable），
+    // 而不是回一个 expiresInMs=0 的"完整码"让 pill 显示"码不完整"。
+    if (fresh.expiresAt <= Date.now()) return createPairing()
     // **在这里就把 psk 摘掉**，而不是靠"下游记得只读那三个字段"：这条返回值会被浏览器
     // 可达的那条发码路由间接消费，红线（PSK 从不上网）要靠形状成立，不靠调用方自律。
     return { qr: fresh.qr, token: fresh.token, expiresAt: fresh.expiresAt }
