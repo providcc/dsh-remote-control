@@ -523,18 +523,18 @@ test('挂载之后抬头写的是状态路由给的那句', async () => {
   // 抬头那句写在按钮里那个 `drc-label` 上，取它而不是按钮：假 DOM 的 textContent 不聚合后代。
   // 配上了几句台数**不写进抬头**：那排宽度是宿主给的，中文会被逐字断行（见下一条用例），
   // 而"几台"这件事点进去那颗按钮上看得见（只允许一台，所以它只可能是 0 或 1）。
-  assert.equal(root.find('drc-label')!.textContent, '已配对')
-  assert.equal(pill!.getAttribute('aria-label'), '已配对')
+  assert.equal(root.find('drc-label')!.textContent, '已连接')
+  assert.equal(pill!.getAttribute('aria-label'), '已连接')
   assert.equal(root.find('drc-dot')!.getAttribute('data-tone'), 'on', '灯的颜色由 tone 决定')
 })
 
-test('在线但一台没配上：抬头是"未配对"，灯必须是灰的', async () => {
+test('在线但一台没配上：抬头是"远程未连接"，灯必须是灰的', async () => {
   // 夹具的配对簿也是空的（pairings: 0）——真没配过。
   // 配过但手机离线是另一种状态，见下面一条。
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
-  assert.equal(root.find('drc-label')!.textContent, '未配对')
+  assert.equal(root.find('drc-label')!.textContent, '远程未连接')
   assert.equal(
     root.find('drc-dot')!.getAttribute('data-tone'),
     'off',
@@ -542,7 +542,7 @@ test('在线但一台没配上：抬头是"未配对"，灯必须是灰的', asy
   )
 })
 
-test('在线、配对簿里还有会话但没有手机连着：抬头是"手机离线"，不是"未配对"', async () => {
+test('在线、配对簿里还有会话但没有手机连着：抬头是"手机离线"，不是"远程未连接"', async () => {
   // 现场：手机把小程序收进后台 / 关屏——socket 断了，但配对还在（pair-store 落盘、
   // D3 长存），回前台自动重连。那一刻说"未配对"是在让用户扫一个不需要扫的码
   // （2026-10-04 用户报的误解）。灯走黄：不是故障，也不是"可以用了"，是"等它自己回来"。
@@ -589,8 +589,8 @@ test('那一排挤不下时只许省略号，不许把中文逐字断行（真�
   )
   // 截断之后全文仍然取得到（悬浮与读屏都靠这两条）
   const pill = root.find('drc-pill')!
-  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已配对')
-  assert.equal(pill.getAttribute('aria-label'), '已配对')
+  assert.equal(pill.getAttribute('title'), 'dsh-remote-control：已连接')
+  assert.equal(pill.getAttribute('aria-label'), '已连接')
 })
 
 test('中继断链时说的是"已断开连接"，而且是红的——不能和"还没配上"同一个灰', async () => {
@@ -636,7 +636,7 @@ test('未配对点开直接就是二维码页：发一次码、图与 6 位码�
   await flush()
 
   assert.ok(root.find('drc-panel'), '面板要弹出来')
-  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '远程未连接')
   assert.ok(root.find('drc-qr'), `未配对点开就该在二维码页上，实际：${root.allText()}`)
   assert.ok(root.find('drc-code'), '6 位码要单独印一行（QR 扫不出来时那是唯一退路）')
   assert.equal(
@@ -652,7 +652,7 @@ test('未配对点开直接就是二维码页：发一次码、图与 6 位码�
   // 夹具里 `waiting: 0`，所以"待处理"那一行自己不占地方，正文就是这三行（次序也是判据）。
   assert.deepEqual(rows, [
     ['中继', 'relay.example.com:443'],
-    ['状态', '已连接'],
+    ['状态', '已就绪'],
     ['版本', '0.0.0-test'],
   ])
   assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
@@ -674,7 +674,7 @@ test('已配对点开只给状态，一次码都不发；正文就是中继/状�
     0,
     '配上之后点开还发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
   )
-  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
   assert.ok(!root.find('drc-qr'), '已配对那一屏不该有二维码')
   const rows = root
     .findAll('drc-info')
@@ -683,7 +683,7 @@ test('已配对点开只给状态，一次码都不发；正文就是中继/状�
     rows,
     [
       ['中继', 'relay.example.com:443'],
-      ['状态', '已连接'],
+      ['状态', '已就绪'],
       ['版本', '0.0.0-test'],
     ],
     `正文就那三行、按这个次序：${root.allText()}`,
@@ -717,7 +717,7 @@ test('有东西在等时抬头说"等 N 件事"，面板第一行是"待处理 �
     .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
   assert.deepEqual(
     rows[0],
-    ['待处理', '2 件 · 最久 4 分 12 秒'],
+    ['待处理', '2 件 最久 4 分 12 秒'],
     `待处理必须排第一（其余三条都是"知道就行"）：${JSON.stringify(rows)}`,
   )
   assert.deepEqual(
@@ -746,14 +746,18 @@ test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也
   })
   const unpairedRoot = unpaired.mountPill()
   await flush()
-  assert.equal(unpairedRoot.find('drc-label')!.textContent, '未配对', '没配上却说"等 1 件事"是让人去找一台不存在的手机')
+  assert.equal(
+    unpairedRoot.find('drc-label')!.textContent,
+    '远程未连接',
+    '没配上却说"等 1 件事"是让人去找一台不存在的手机',
+  )
   // 但面板里那一行仍然要说——它回答的是"这台机器上有没有回合被卡住"。
   unpairedRoot.find('drc-pill')!.emit('click')
   await flush()
   const first = unpairedRoot.findAll('drc-info')[0]!
   assert.deepEqual(
     [first.find('drc-key')!.textContent, first.find('drc-value')!.textContent],
-    ['待处理', '1 件 · 最久 40 秒'],
+    ['待处理', '1 件 最久 40 秒'],
     '抬头不抢，不代表面板可以不说',
   )
 })
@@ -764,11 +768,11 @@ test('两条优先级：断链仍然压过"等 N 件事"；没配上时挂起也
  */
 test('等待时长的写法：<60 秒只说秒、十分钟以上不再带秒（这行是扫一眼的，不是秒表）', async () => {
   const cases: Array<[number, string]> = [
-    [37, '1 件 · 最久 37 秒'],
-    [60, '1 件 · 最久 1 分 0 秒'],
-    [252, '1 件 · 最久 4 分 12 秒'],
-    [600, '1 件 · 最久 10 分'],
-    [7265, '1 件 · 最久 121 分'],
+    [37, '1 件 最久 37 秒'],
+    [60, '1 件 最久 1 分 0 秒'],
+    [252, '1 件 最久 4 分 12 秒'],
+    [600, '1 件 最久 10 分'],
+    [7265, '1 件 最久 121 分'],
   ]
   for (const [seconds, expected] of cases) {
     const harness = load({
@@ -815,7 +819,7 @@ test('waiting 字段缺失（老版宿主）时那一行不建、抬头退回"�
   })
   const root = harness.mountPill()
   await flush()
-  assert.equal(root.find('drc-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-label')!.textContent, '已连接')
   root.find('drc-pill')!.emit('click')
   await flush()
   const keys = root.findAll('drc-info').map((row) => row.find('drc-key')!.textContent)
@@ -865,7 +869,7 @@ test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpai
   await flush()
   root.find('drc-pill')!.emit('click')
   await flush()
-  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
   const button = root.find('drc-btn')!
   assert.equal(button.textContent, '退出配对')
   assert.equal(
@@ -881,7 +885,7 @@ test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpai
     `按下退出配对必须打那条写路由：${harness.requests.join(' | ')}`,
   )
   // 乐观翻面：不用等下一次 2 秒轮询，抬头与那颗按钮当场就变。
-  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '远程未连接')
   // 退完之后不再是"先按一颗生成配对码"那一屏：**没配上就直接在二维码页上**，
   // 那颗按钮的身份同时翻成 `刷新`（要再换一张码还是它）。
   assert.equal(root.find('drc-btn')!.textContent, '刷新')
@@ -918,7 +922,11 @@ test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板
   assert.ok(root.find('drc-panel'), '面板要弹出来')
   assert.equal(root.find('drc-qr')!.src, `${PAIR_IMAGE_ROUTE}?e=e1`, '图片地址要带上这一版码的 epoch')
   assert.equal(root.find('drc-code')!.textContent, '482913', '6 位码必须与 QR 同时在屏上——手输是唯一退路')
-  assert.equal(root.find('drc-note')!.textContent, '扫码配对 · 1 分 0 秒后过期')
+  assert.equal(root.find('drc-note')!.textContent, '微信扫码配对 1 分 0 秒后过期')
+  // 引导行：第一次装好插件的人要能在这一屏看明白"码是给谁扫的、扫完得到什么"。
+  // 口径是用户 2026-10-05 定的：一条、短、不带括号/顿号/书名号等符号（空格分隔）。
+  assert.equal(root.find('drc-guide')!.textContent, '打开小程序扫这个码 远程控制这台电脑')
+  assert.doesNotMatch(root.find('drc-guide')!.textContent, /[（()）「」【】·、，：:！!？?]/)
   // 出图这一版右上角那颗是**刷新**，不再是"生成配对码"——同一件事两个说法会让用户以为要重新配一次。
   assert.equal(root.find('drc-btn')!.textContent, '刷新', '二维码页那颗按钮的文案')
   assert.equal(root.find('drc-pill')!.getAttribute('aria-expanded'), 'true')
@@ -1015,7 +1023,7 @@ test('手机上刚扫完码：面板从二维码当场翻回状态视图，右�
   status.pairings = 1
   await harness.fireAndFlush(0)
   assert.equal(root.find('drc-qr'), undefined, '配上之后那张图不该还占着面板')
-  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
   assert.equal(root.find('drc-btn')!.textContent, '退出配对')
   assert.ok(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length === 1, '翻面只是重画，不许顺手再要一张')
 })

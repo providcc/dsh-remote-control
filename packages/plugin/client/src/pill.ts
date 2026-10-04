@@ -151,6 +151,8 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
   if (relay === 'connecting') return { text: '连接中', tone: 'wait' }
   if (relay !== 'online') return { text: '远程控制', tone: 'off' }
   const paired = typeof status?.paired === 'number' ? status.paired : 0
+  // 2026-10-05 用户定的口径：抬头只说"连没连上"，不说"配没配"——"已配对"对
+  // 第一次用的人不解释任何事，"已连接"才直接回答"现在能用了没有"。
   if (paired > 0) {
     // 有东西挂在手机上等回答时，`已配对` 这句话等于没说——那条回合正停在这台机器上，
     // 而这颗 pill 是它在桌面上唯一可能被看见的地方（判据见伞仓 docs/PRODUCT.md §3）。
@@ -158,14 +160,17 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
     // 用户能做的第一件事是重新配对，那才是该说的那句。
     const waiting = waitingCount(status)
     if (waiting > 0) return { text: `等 ${waiting} 件事`, tone: 'wait' }
-    return { text: '已配对', tone: 'on' }
+    return { text: '已连接', tone: 'on' }
   }
   // 一台都没连着、但密钥簿里还有会话 = **配过对，手机只是不在线**（小程序退后台、手机关屏）。
   // 配对按 D3 长存且 pair-store 落盘，手机回前台自动重连——这不是「没配上」：
   // 那一态说「未配对」是让用户去扫一个不需要扫的码（2026-10-04 用户报的误解）。
   // 灯走黄（wait）：不是故障，也不是「可以用了」，是「等它自己回来」。
   if (pairingCount(status) > 0) return { text: '手机离线', tone: 'wait' }
-  return { text: '未配对', tone: 'off' }
+  // 2026-10-05 用户定的口径："远程未连接"而不是"未配对"。"配对"是内部动作，
+  // 第一次装好插件的人不知道自己要"配对"；"远程未连接"直接说清了现在
+  // "这台机器还没接上手机"——也顺手回答了那颗 pill 点开能看到什么。
+  return { text: '远程未连接', tone: 'off' }
 }
 
 /** 挂在手机上等回答的件数。老版路由没给这个字段时算 0（那一行自己不占地方）。 */
@@ -187,6 +192,16 @@ export function pairingCount(status: StatusAnswer | undefined): number {
 }
 
 /** `37 秒` / `4 分 12 秒` / `12 分`。十分钟以上不再报秒——这行是扫一眼的，不是秒表。 */
+/**
+ * 二维码那一屏顶上那句引导。规则只有三条：**一条、短、不带符号**。
+ *
+ * 一条：这一屏只教一件事——码是给小程序扫的、扫完能远程控制这台电脑；
+ * 短：扫一眼就要读完，长句会被当成服务条款直接跳过；
+ * 不带符号：顿号冒号书名号全不用，空格就是分隔（2026-10-05 用户定的口径，
+ * 括号等符号会让一行"系统提示"更像错误而不是引导）。
+ */
+const GUIDE_LINE = '打开小程序扫这个码 远程控制这台电脑'
+
 export function humanDuration(sec: unknown): string {
   const total = typeof sec === 'number' && sec > 0 ? Math.floor(sec) : 0
   if (total < 60) return `${total} 秒`
@@ -204,7 +219,7 @@ export function waitingRow(status: StatusAnswer | undefined): string {
   const count = waitingCount(status)
   if (count === 0) return ''
   const oldest = typeof status?.waitingOldestSec === 'number' ? status.waitingOldestSec : 0
-  return `${count} 件${oldest > 0 ? ` · 最久 ${humanDuration(oldest)}` : ''}`.slice(0, 40)
+  return `${count} 件${oldest > 0 ? ` 最久 ${humanDuration(oldest)}` : ''}`.slice(0, 40)
 }
 
 /**
@@ -236,7 +251,9 @@ export function relayRow(status: StatusAnswer | undefined): string {
 /** 中继那条链的细态：抬头在线时只讲"配没配上"，这条才讲"连没连上"。 */
 export function relayStateRow(status: StatusAnswer | undefined): string {
   const relay = status?.relay
-  if (relay === 'online') return '已连接'
+  // 2026-10-05 用户定的口径：弹窗这一行说"已就绪"不说"已连接"——"已连接"
+  // 留给抬头那句结论（配没配上），这里讲的是中继这条链本身通了，两句话不打架。
+  if (relay === 'online') return '已就绪'
   if (relay === 'connecting') return '连接中'
   if (relay === 'offline') return '已断开'
   if (relay === 'idle') return '未启动'
@@ -297,7 +314,10 @@ const CSS = `
 .drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .drc-qr { display: block; width: 200px; height: 200px; margin: 8px auto 0; image-rendering: pixelated; }
 .drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
-.drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
+  /* 引导行：比 note 重一档（第一次用的人要看清），但不加图标不加底色——
+     这一屏的主角是二维码，多一个色块就成了推销而不是引导。 */
+  .drc-guide { margin: 8px 0 0; text-align: center; color: var(--dsw-alias-label-secondary, #5f6368); font-size: 12px; }
+  .drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
 .drc-note[data-kind="failed"] { color: var(--dsw-alias-state-error-primary, #ff4d4f); }
 `
 
@@ -462,8 +482,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   }
 
   /** 二维码那一行的说明：没过期报剩余时间，过期了就明说要自己再按一次（不再自动补一张）。 */
+  // 2026-10-05 用户定的口径：不加间隔号、不用书名号——扫一眼的行，一个多余符号
+  // 就多一分"像系统消息不像人话"的感觉。"微信扫码配对"直接点名用哪个 App 扫。
   const qrNote = (): string =>
-    expiresInMs > 0 ? `扫码配对 · ${secondsText(expiresInMs)}后过期` : '配对码已过期，点右上角「刷新」重新生成'
+    expiresInMs > 0 ? `微信扫码配对 ${secondsText(expiresInMs)}后过期` : '配对码已过期 点右上角刷新重新生成'
 
   /**
    * 抬头一行：左边状态、右边动作。**面板唯一那颗动作按钮就收在这里**（面板的右上角）。
@@ -495,7 +517,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   const offlineNote = (): HTMLElement | null => {
     if (!lastStatus) return null
     if (pillLabel(lastStatus).text !== '手机离线') return null
-    return text('p', 'drc-note', '配对还在：小程序回前台会自动重连，不用重新扫码。')
+    return text('p', 'drc-note', '配对还在 小程序回前台会自动重连 不用重新扫码')
   }
 
   /** 正文那几行（待处理 / 中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
@@ -532,13 +554,17 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     panel.replaceChildren()
     panel.appendChild(header())
     if (view.kind === 'loading') {
-      panel.appendChild(text('p', 'drc-note', '正在生成配对码…'))
+      panel.appendChild(text('p', 'drc-note', '正在生成配对码'))
     } else if (view.kind === 'qr') {
       const image = doc.createElement('img')
       image.className = 'drc-qr'
       image.setAttribute('alt', '配对二维码')
       image.src = view.imageSrc
       panel.appendChild(image)
+      // 第一次用的人唯一需要的那句话：这码是给谁扫的、扫完得到什么。
+      // 一条、短、不带符号——侵入性比弹一次模态框小，但同样把人领进门
+      // （2026-10-05 用户定的口径：引导但不侵入，文案要短）。
+      panel.appendChild(text('p', 'drc-guide', GUIDE_LINE))
       // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路）。
       panel.appendChild(text('p', 'drc-code', view.token))
       panel.appendChild(text('p', 'drc-note', qrNote()))
