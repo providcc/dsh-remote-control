@@ -1193,6 +1193,9 @@ export const MAPPED_SESSION_EVENTS = new Set([
   'session/title',
   'approval/asked',
   'approval/decided',
+  // 内核的 todo/write 在真机的 eventTypes 里（status.json 的 unmappedEventTypes 曾一直记着它），
+  // 但没人转发到手机——于是手机上一整轮"现在在干什么"都是空白。2026-10-05 补上。
+  'todo/write',
 ])
 
 export function sessionEventKernelEvents(input: {
@@ -1271,6 +1274,31 @@ export function sessionEventKernelEvents(input: {
           ...(argsRaw === undefined ? {} : { argsPreview: argsPreviewOf(argsRaw) }),
         },
       ]
+    }
+    case 'todo/write': {
+      // 内核形状（取证：app.asar 的 typert.host.js）：`todo/write: { todos: TodoItem[] }`，
+      // `TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' }`。
+      // 每次都是**全量快照**——所以这里也只发整份，不做增量，手机侧同样整份替换。
+      //
+      // 三条夹取，每条都对应一个真机上的坏味道：
+      // - status 不在三元里 → 当 pending（未知状态显示成"没状态"比降级成待办更怪）；
+      // - content 非字符串 / 空 → 丢掉这一条（一条没有字的待办在面板里就是一行空白）；
+      // - 整份夹到 50 条：真机上单轮 todo 一般十条以内，超了说明这一轮真的很大，
+      //   那更该给手机一个能滚动的清单而不是把面板顶到屏幕外。
+      const raw = Array.isArray(data.todos) ? (data.todos as LooseObject[]) : []
+      const todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[] = []
+      for (const item of raw) {
+        if (todos.length >= 50) break
+        const content = typeof item?.content === 'string' ? item.content.trim() : ''
+        if (!content) continue
+        const status = item?.status
+        todos.push({
+          content: content.slice(0, 200),
+          status: status === 'in_progress' || status === 'completed' || status === 'pending' ? status : 'pending',
+        })
+      }
+      // 空数组也发：内核清空清单时手机必须跟着清（会话跑完一轮 todo 常常整个被清掉）。
+      return [{ kind: 'todo', sessionId, todos }]
     }
     case 'tool/result': {
       const message = data.message as LooseObject | undefined

@@ -50,6 +50,13 @@ export type KernelEvent =
       resultPreview?: string
     }
   | { kind: 'run-state'; sessionId: string; state: 'running' | 'idle'; detail?: string }
+  | {
+      /** 待办清单全量快照（内核 `todo/write`）。
+       * 单条上限由 carrier-services 的映射函数夹：content ≤ 200 字、整份 ≤ 50 条。 */
+      kind: 'todo'
+      sessionId: string
+      todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[]
+    }
   | { kind: 'title'; sessionId: string; title: string }
   | { kind: 'sessions-changed'; reason?: string }
 

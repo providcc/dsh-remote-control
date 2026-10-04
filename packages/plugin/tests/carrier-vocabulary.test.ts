@@ -23,6 +23,8 @@ const asDelta = (events: KernelEvent[]) =>
   events.filter((event): event is Extract<KernelEvent, { kind: 'delta' }> => event.kind === 'delta')
 const asTool = (events: KernelEvent[]) =>
   events.filter((event): event is Extract<KernelEvent, { kind: 'tool' }> => event.kind === 'tool')
+const asTodo = (events: KernelEvent[]) =>
+  events.filter((event): event is Extract<KernelEvent, { kind: 'todo' }> => event.kind === 'todo')
 
 test('assistant/message：正文在 data.message.content，不在顶层', () => {
   const events = sessionEventKernelEvents({
@@ -86,6 +88,65 @@ test('user/message 的正文在顶层（与 assistant 不同形状，两处都�
   assert.equal(delta?.text, '只回复 ok 两个字，不要调用任何工具', '用户回声读不到顶层 content → 手机上发出去的话不显示')
   assert.equal(delta?.role, 'user')
   assert.equal(delta?.messageId, '1957861b')
+})
+
+test('todo/write：整份快照原样转发（内核每次都给全量，插件不做增量）', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'todo/write',
+    seq: 830,
+    data: {
+      todos: [
+        { content: '复现问题', status: 'completed' },
+        { content: '改完跑全链路', status: 'in_progress' },
+        { content: '写判据', status: 'pending' },
+      ],
+    },
+  })
+  assert.equal(events.length, 1, '一条 todo/write 翻成一个事件')
+  const [todo] = asTodo(events)
+  assert.equal(todo?.kind, 'todo')
+  assert.deepEqual(
+    todo?.todos,
+    [
+      { content: '复现问题', status: 'completed' },
+      { content: '改完跑全链路', status: 'in_progress' },
+      { content: '写判据', status: 'pending' },
+    ],
+    'status 三元一个都不许改：手机上的勾/半满/完成全靠它',
+  )
+  assert.ok(MAPPED_SESSION_EVENTS.has('todo/write'), '不在映射表里 = 真机上这条事件会被丢进 unmappedEventTypes')
+})
+
+test('todo/write：空数组也要发（内核清空清单时手机必须跟着清）', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'todo/write',
+    seq: 831,
+    data: { todos: [] },
+  })
+  const [todo] = asTodo(events)
+  assert.deepEqual(todo?.todos, [], '空清单不是"不发"：发了手机才收得回去')
+})
+
+test('todo/write：坏形状逐条夹——未知 status 降级、空 content 丢、超长截断', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'todo/write',
+    seq: 832,
+    data: {
+      todos: [
+        { content: '   ', status: 'pending' },
+        { content: '状态不认识', status: 'done' },
+        { content: 42 },
+        { content: 'x'.repeat(400), status: 'pending' },
+      ],
+    },
+  })
+  const [todo] = asTodo(events)
+  assert.equal(todo?.todos.length, 2, '空 content 与非字符串 content 丢掉，剩两条')
+  assert.equal(todo?.todos[0]?.status, 'pending', "'done' 不在三元里 → 降级 pending，不许把未知状态透出去")
+  assert.equal(todo?.todos[1]?.content.length, 200, '超长截到 200 字')
 })
 
 test('tool/call：真机给的是 arguments 不是 args；工具名、参数预览、标题都要落到手机上', () => {
