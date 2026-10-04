@@ -65,7 +65,7 @@ body:
       multiple: true
       options:
         - 主插件（配对 / 中继 / 会话 / 审批 / 防休眠）
-        - 右栏二维码（presentation）
+        - 右栏二维码（sidebar）
         - 安装脚本 / profile
         - 中继服务
         - 小程序客户端

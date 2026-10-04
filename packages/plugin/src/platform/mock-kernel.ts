@@ -96,6 +96,25 @@ export class MockKernel implements KernelPort {
     if (found.state === 'archived') return { ok: false, message: '会话已归档，需先恢复' }
     this.running.add(sessionId)
     this.emit({ kind: 'run-state', sessionId, state: 'running' })
+    // 待办清单：本地闭环里也真发一遍（内核 `todo/write` 的语义是全量快照，
+    // 每次整份替换）。发两份 —— 一份两条待办、一份把第一条标成进行中 ——
+    // 这样"清单会变"在本地链路里也是能看见的。
+    this.emit({
+      kind: 'todo',
+      sessionId,
+      todos: [
+        { content: '复现用户报的问题', status: 'completed' },
+        { content: '改完跑一遍本地全链路', status: 'pending' },
+      ],
+    })
+    this.emit({
+      kind: 'todo',
+      sessionId,
+      todos: [
+        { content: '复现用户报的问题', status: 'completed' },
+        { content: '改完跑一遍本地全链路', status: 'in_progress' },
+      ],
+    })
     if (this.options.autoApproval !== false && this.sink) {
       // 冒烟路径也走一遍真实的交互协议：审批卡、decision 逐字回传、锁续持。
       const decision = await this.sink.approval({ sessionId, action: 'bash echo', reason: 'mock 审批' })

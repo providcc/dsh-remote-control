@@ -211,24 +211,23 @@ test('没有退订函数的宿主代际要靠 off() 退订：两条路都要尽�
   assert.doesNotThrow(() => off2(), '退订失败抛了出去：进程要走了，退订失败无所谓')
 })
 
-test('参与名单是极窄的显式清单：approval/request 允许以参与者身份注册，其它 waterfall 一律不许', () => {
+test('参与名单是极窄的显式清单：只有审批与提问两条能参与，其它 waterfall 一律不许', () => {
   assert.deepEqual(
     [...WATERFALL_PARTICIPANTS],
-    ['approval/request'],
-    '参与名单只能有这一条：审批要想到达手机只能参与这条 waterfall',
+    ['approval/request', 'user-questions/request'],
+    '参与名单只能有这两条：它们都是"人工交互"的应答通道，而到达手机只能靠参与',
   )
   assert.equal(
     canParticipate('approval/request'),
     true,
     'approval/request 必须允许参与：它是 emit-mode 替代通道不存在的情况下唯一的路',
   )
-  for (const name of [
-    'agent/request',
-    'llm/stream',
-    'user-questions/request',
-    'session/event',
-    'system-prompt/assemble',
-  ]) {
+  // 提问那条的取证在宿主自己的服务实现里：`UserQuestionService.ask()` 末端就是
+  // `ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', …, noAnswerer)`，
+  // 桌面 UI 是网关转发的 `$on` 参与者。它以前被放在"不许参与"那一组里，是因为
+  // 我们以为要走 `registerProvider`——而那一代宿主根本没有那个口（伞仓 HANDOFF §9.16）。
+  assert.equal(canParticipate('user-questions/request'), true, '提问必须能参与：否则手机上永远不会有提问卡')
+  for (const name of ['agent/request', 'llm/stream', 'session/event', 'system-prompt/assemble']) {
     assert.equal(canParticipate(name), false, `${name} 不许被"参与"：那是把观察代码写成链上的一环`)
   }
   assert.equal(canParticipate(''), false, '空名字不许放行')

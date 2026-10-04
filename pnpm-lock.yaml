@@ -15,8 +15,8 @@ importers:
   packages/plugin:
     dependencies:
       dsh-remote-wire:
-        specifier: ^1.0.0
-        version: 1.0.0
+        specifier: ^1.4.0
+        version: 1.4.0
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
@@ -32,35 +32,13 @@ importers:
     devDependencies:
       '@types/node':
         specifier: ^22.9.0
-        version: 22.20.4
+        version: 22.20.5
       '@types/qrcode':
         specifier: ^1.5.5
         version: 1.5.6
       '@types/ws':
         specifier: ^8.5.12
         version: 8.18.2
-      esbuild:
-        specifier: ^0.27.7
-        version: 0.27.7
-      prettier:
-        specifier: ^3.3.3
-        version: 3.9.9
-      typescript:
-        specifier: ^5.6.3
-        version: 5.9.3
-
-  packages/presentation:
-    dependencies:
-      qrcode:
-        specifier: ^1.5.4
-        version: 1.5.4
-    devDependencies:
-      '@types/node':
-        specifier: ^22.9.0
-        version: 22.20.4
-      '@types/qrcode':
-        specifier: ^1.5.5
-        version: 1.5.6
       esbuild:
         specifier: ^0.27.7
         version: 0.27.7
@@ -229,8 +207,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@types/node@22.20.4':
-    resolution: {integrity: sha512-zJRE40jpHtKqE/C4fgHrAKQLJuSpzEnP9ff9Y7YtoR3Wd2pwqzlekDeEuUQXjRd+QCYnVnNwuJYmhdk9XV8gvA==}
+  '@types/node@22.20.5':
+    resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
 
   '@types/qrcode@1.5.6':
     resolution: {integrity: sha512-te7NQcV2BOvdj2b1hCAHzAoMNuj65kNBMz0KBaxM6c3VGBOhU0dURQKOtH8CFNI/dsKkwlv32p26qYQTWoB5bw==}
@@ -267,8 +245,8 @@ packages:
   dijkstrajs@1.0.3:
     resolution: {integrity: sha512-qiSlmBq9+BCdCA/L46dw8Uy93mloxsPSbwnm5yrKn2vMPiy8KyAskTF6zuV/j5BMsmOGZDPs7KjU+mjb670kfA==}
 
-  dsh-remote-wire@1.0.0:
-    resolution: {integrity: sha512-mxU53HJLAoe2VsA6SYBNcW6oAWzaPLdMcjOQoRNbQA7GvHVz4kmMbCydL8HgFG8aNNSMDR+6zMV8FOnK7QVmLQ==}
+  dsh-remote-wire@1.4.0:
+    resolution: {integrity: sha512-xqvDA4Smt8DeBNCMb+7LKkSm/iG5UYNW7r2LHmScZeEuVW6d/xfQpCP4mcxMDkmYjvXWsMe/8TKD+maffObZEA==}
     engines: {node: '>=20'}
 
   emoji-regex@8.0.0:
@@ -467,17 +445,17 @@ snapshots:
   '@esbuild/win32-x64@0.27.7':
     optional: true
 
-  '@types/node@22.20.4':
+  '@types/node@22.20.5':
     dependencies:
       undici-types: 6.21.0
 
   '@types/qrcode@1.5.6':
     dependencies:
-      '@types/node': 22.20.4
+      '@types/node': 22.20.5
 
   '@types/ws@8.18.2':
     dependencies:
-      '@types/node': 22.20.4
+      '@types/node': 22.20.5
 
   ansi-regex@5.0.1: {}
 
@@ -503,7 +481,7 @@ snapshots:
 
   dijkstrajs@1.0.3: {}
 
-  dsh-remote-wire@1.0.0:
+  dsh-remote-wire@1.4.0:
     dependencies:
       tweetnacl: 1.0.3
       zod: 4.6.5

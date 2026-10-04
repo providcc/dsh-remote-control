@@ -34,8 +34,6 @@ export const SUBSCRIBABLE_EVENTS = [
   'agent/error',
 ] as const
 
-export type SubscribableEvent = (typeof SUBSCRIBABLE_EVENTS)[number]
-
 /**
  * 已知为 waterfall 的事件名。
  *
@@ -77,13 +75,23 @@ export const WATERFALL_EVENTS: readonly string[] = [
  * 也就是说：审批要想到达手机，只能参与这条 waterfall，没有 emit-mode 的替代通道
  * （`approval/asked` / `approval/decided` 只是审计事件，不能应答）。
  *
+ * `user-questions/request` 是**同一条形状**，取证在宿主自己的服务实现里：
+ * `@deepseek-ai/dsh-user-questions/lib/index.js` 的 `ask()` 末端就是
+ * `ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', {...request, agent}, noAnswerer)`，
+ * 而桌面那一位是通过网关转发的 `$on("user-questions/request", function(request, next) …)` 参与的
+ * （`@deepseek-ai/dsh-client-ui-user-questions/lib/client.js`）。
+ * ⚠️ 原来走的 `userQuestions.registerProvider` 那条口**在这一代宿主上不存在**
+ * （整个服务里 provider 这个词零命中，成员只有 `ask / askTimed / answer / continued / releaseReply`），
+ * 而"注册一个提供者"这个形状本身就是单提供者语义——接管会让桌面问不了问题。
+ * 参与 waterfall 才是既两端同弹、又不改变宿主行为的那条路。
+ *
  * 所以这里是一份**显式、极窄**的参与名单，而不是一句"waterfall 一律禁止"。
  * 名单外的名字一律拒；名单内的处理器必须返回合法 outcome 或调用 next()，
  * 绝不能返回 undefined —— 那正是把内核每个 turn 都搞崩的形状。
+ * 提问那条的"没人答"不是 undefined 而是**把链子的错误原样抛回去**（`noAnswerer` 抛
+ * `NO_PROVIDER`），所以参与者那边必须留一份原始 rejection 可复述（见 carrier 的 `participate`）。
  */
-export const WATERFALL_PARTICIPANTS = ['approval/request'] as const
-
-export type WaterfallParticipant = (typeof WATERFALL_PARTICIPANTS)[number]
+export const WATERFALL_PARTICIPANTS = ['approval/request', 'user-questions/request'] as const
 
 const allowed = new Set<string>(SUBSCRIBABLE_EVENTS)
 const participants = new Set<string>(WATERFALL_PARTICIPANTS)

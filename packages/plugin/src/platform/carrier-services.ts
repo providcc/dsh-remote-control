@@ -26,10 +26,8 @@
  *    但这里不假装是逐 token 流。
  */
 import type { QuestionItem, SessionSummary } from 'dsh-remote-wire'
-import { canParticipate, canSubscribe, guardedSubscribe } from './guard.js'
+import { canParticipate, guardedSubscribe } from './guard.js'
 import type {
-  ApprovalDecision,
-  AskUserQuestionAnswerValue,
   Clock,
   InteractionSink,
   KernelEvent,
@@ -60,16 +58,102 @@ export interface ServicesBundle {
    * 不该把整条载体判定拖垮，所以它是可选服务。
    */
   sessionController?: LooseObject
-  /** cordis 的事件注册口；对 waterfall 是**参与式**监听。 */
-  on?(name: string, listener: (...args: unknown[]) => void): unknown
+  /**
+   * cordis 的事件注册口；对 waterfall 是**参与式**监听。
+   *
+   * 第三个参数是 `EventOptions`（`{ global?, prepend? }`）。两条参与面（审批与提问）
+   * 都**必须带 `global: true`**，理由见 `PARTICIPATE_OPTIONS`。
+   */
+  on?(name: string, listener: (...args: unknown[]) => void, options?: unknown): unknown
   off?(name: string, listener: (...args: unknown[]) => void): unknown
+}
+
+/**
+ * `ctx.on('<那条 waterfall>', …)` 的第三个参数，审批与提问两条共用。
+ * 两个选项各治一种"卡没弹"，**缺一不可**。
+ *
+ * ### `global: true` —— 不被作用域过滤掉
+ *
+ * 派发方是 `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)`
+ * （桌面 asar 里 `ApprovalService.decide`；提问那条是 `UserQuestionService.ask()` 用同一个
+ * `scopeTarget(agent, agent)` 派发同一个形状的请求），而 cordis 的 `dispatch()` 判据是
+ * `hook.global || !filter || filter.call(thisArg, hook.ctx)`；`scopeTarget` 的 filter 只放行
+ * "未打作用域标签的上下文"与"派发键的**祖先**作用域"，原文注释写着
+ * 'A tag BELOW the dispatch key stays excluded — events flow up the chain, never down'。
+ * 插件那条 fiber 与 agent 作用域是兄弟不是祖先。`global` 是 cordis 留的唯一一条逃生口
+ * （`EventOptions` 原文：'Receive the event regardless of context filter checks'）。
+ *
+ * ### `prepend: true` —— 排在桌面那一位**前面**，然后立刻把链子交下去
+ *
+ * waterfall 是"外层不调 `next()`，内层就永远轮不到"，而 `dispatch()` 返回的数组里
+ * **第一个就是外层**（`register()` 用 `unshift` 实现 prepend）。桌面 UI 的应答者登记得比我们早，
+ * 它一拿到请求就去等真人点按钮、且不 `next()`——于是真机上出现过这个形状：
+ * `approvalAsked=1`、`approvalDecided=not-seen`（卡在桌面等人）、`approvalCalls=0`（我们没轮到），
+ * 手机上什么都没有，而 `approvalFace` 一直报 `registered`。
+ *
+ * ⚠️ **但排到前面不等于可以抢答。** 只 `prepend`、然后自己在那儿等手机，结果是
+ * "手机上弹了、桌面上不弹了"——那是插件在改变宿主自己的行为（2026-10-04 真机被用户当场指出）。
+ * 正确的形状写在 `participate()` 里：**一进函数就 `next()` 把桌面启动起来**，手机并行问，两边赛跑。
+ *
+ * **代价，说清楚**：排到最外层意味着也排在 Auto 预置的自动审阅之前（那条是 `prepend` 登记的）。
+ * 本机没配 Auto 预置（profile 里只有 read-only / workspace-write / danger-full-access），
+ * 所以这里没有东西被跳过；哪天接上 Auto，这一行要重新审——正确做法大概是"先让自动审阅跑完，
+ * 再同时问桌面与手机"，而不是继续抢在最外层。
+ */
+const PARTICIPATE_OPTIONS = { global: true, prepend: true } as const
+
+/**
+ * 要**参与**的两条 waterfall：审批与提问。
+ *
+ * 为什么提问也走参与而不是"注册一个提供者"：宿主自己的提问服务末端就是
+ * `ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', {...request, agent}, noAnswerer)`
+ * （取证 `@deepseek-ai/dsh-user-questions/lib/index.js` 的 `ask()`），桌面那一位是网关转发的
+ * `$on("user-questions/request", function(request, next) …)`（`dsh-client-ui-user-questions`）。
+ * 而 `userQuestions.registerProvider` **在这一代宿主上不存在**（整个服务里 provider 零命中），
+ * 何况"注册提供者"本来就是单提供者语义——接管会让桌面问不了问题，那是插件在改变宿主的行为。
+ *
+ * 两条的差别只在"没人答"怎么表达：审批那条链末端 resolve `'unavailable'`，
+ * 提问那条是 `noAnswerer()` **抛出** `NO_PROVIDER`。所以参与者必须留一份原始 rejection 可复述，
+ * 不能把它吞成 undefined（见 `participate` 末尾那条分支）。
+ */
+const PARTICIPATED_EVENTS = ['approval/request', 'user-questions/request'] as const
+
+type ParticipatedEvent = (typeof PARTICIPATED_EVENTS)[number]
+
+/**
+ * 把"平台的中断"与"这次审批已经结算"并成一条 signal，交给链子下游的应答者。
+ *
+ * 为什么只有 `AbortSignal.any` 这一种形状：参与者**没法用返回值换掉下游收到的请求**——
+ * cordis 的 `waterfall` 里 `next = () => (cbs.shift() ?? inner)(...args)`，`next()` 的实参
+ * 被整个忽略，`args` 是派发时那一份（见 cordis `EventsService.waterfall`）。
+ * 能改的只有那个请求对象**自己身上**的字段，而下游（宿主的桌面 UI 经 api-gateway
+ * 转发的那条 remote event）是在它自己被调用时才读 `request.signal`：
+ * `startRemoteEvent()` 把 `projected.signal` 放进 `signals`，它一断就
+ * `cancelRemoteEvent()` → 向每个渲染端推 `{type:'cancel', eventId}` →
+ * 那一侧的 `PendingApproval.abort()` → 卡片由宿主自己的代码收掉。
+ *
+ * 所以这条并算是**宣告"这次请求结束了"**，不是替桌面决定结果：结果早已由先答的那一端给出。
+ * `engines` 声明的是 `>=20`，而 `AbortSignal.any` 是 20.3 才有的，故留一条手写的中继。
+ */
+function fuseSignals(platform: AbortSignal | undefined, ours: AbortSignal): AbortSignal {
+  if (!platform) return ours
+  const any = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  if (typeof any === 'function') return any.call(AbortSignal, [platform, ours])
+  const fused = new AbortController()
+  for (const source of [platform, ours]) {
+    if (fused.signal.aborted) break
+    if (source.aborted) {
+      fused.abort(source.reason)
+      break
+    }
+    source.addEventListener('abort', () => fused.abort(source.reason), { once: true })
+  }
+  return fused.signal
 }
 
 export interface ServicesOptions {
   clock: Clock
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
-  /** 接管提问：`ctx.userQuestions` 只允许一个活跃 provider，接管会取代桌面 UI，故默认关。 */
-  takeOverQuestions?: boolean
   /** 标题读取的超时与批量上限（读失败只让列表无标题，不影响列表本身）。 */
   titleTimeoutMs?: number
   titleBatch?: number
@@ -77,6 +161,12 @@ export interface ServicesOptions {
   historyTimeoutMs?: number
   /** 新建会话的超时。 */
   createTimeoutMs?: number
+  /**
+   * 新建会话时显式使用的项目目录（cwd）。空 = 智能选（见 newSession 里的三级）。
+   * 为什么要有这个口子：宿主进程的 process.cwd() 是 `/`，会话挂在那儿不属于任何
+   * 用户项目，GUI 的列表按项目分组就看不见它（用户 2026-10-04 实测）。
+   */
+  newSessionCwd?: string
 }
 
 const MAX_TITLE_BATCH_DEFAULT = 25
@@ -85,6 +175,33 @@ const HISTORY_TIMEOUT_DEFAULT = 15_000
 /** 新建会话的超时。创建要分配 id、可能还要挂 workspace，比读标题慢，但也不该让手机干等。 */
 const CREATE_TIMEOUT_DEFAULT = 8000
 const LIST_LIMIT_DEFAULT = 100
+
+/**
+ * 猜「模型面」可能叫什么。**这是探测清单，不是接口声明** —— 内核各代际命名不同，
+ * 猜不中就报 `none`，而不能猜中一个就不报（那样「有这项能力」会被误当成「没有」）。
+ *
+ * 代价很低：每个名字只做一次 `typeof` 检查，不真的调用。
+ */
+const MODEL_FACE_METHODS = [
+  'currentSelection',
+  'list',
+  'listModels',
+  'available',
+  'availableModels',
+  'selections',
+  'options',
+  'get',
+  'set',
+  'select',
+  'setSelection',
+  'setDefault',
+  'update',
+] as const
+
+/** 命中这些名字之一才算「能列可选模型」。 */
+const MODEL_LIST_METHODS = new Set(['list', 'listModels', 'available', 'availableModels', 'selections', 'options'])
+/** 命中这些名字之一才算「能切换模型」。 */
+const MODEL_SET_METHODS = new Set(['set', 'select', 'setSelection', 'setDefault', 'update'])
 
 /** 折叠后的插件内部形状。 */
 interface ListedSession {
@@ -115,15 +232,78 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   /** 取证用：内核实际发过来的会话事件类型，以及我们**没有映射**的那些（进 status.json）。 */
   const seenEventTypes = new Set<string>()
   const unmappedEventTypes = new Set<string>()
+  /**
+   * 被判成"宿主注入"而**故意没出站**的 user/message，按 `source.kind` 计数。
+   *
+   * 为什么单独留这一份：注入内容（time-context / skill-catalog / runtime-context …）
+   * 在手机上是不能显示的——它们顶着「你的指令」那颗蓝气泡，内容是
+   * 「Time sampled while preparing turn 3 …」，用户没发过这句话（真机截图实证）。
+   * 但"我们丢掉"这件事必须能被别人看见，否则「手机上看不到 X」这个问题就分不清
+   * 是宿主没发、我们丢了、还是路上丢了。
+   */
+  const injectedUserMessages = new Map<string, number>()
   /** 事件回调里抛过的错（按类型计数）。没有这一条，"回合跑到一半没声音"就只能靠猜。 */
   const listenerErrors = new Map<string, number>()
   /**
-   * 人工交互两面的登记结果，进 status.json。
-   * 真机上"审批卡为什么没弹"有三种原因（宿主策略根本没问 / 我们没登记上 /
-   * 登记了但此刻没有已配对的手机），没有这两个字段就只能猜。
+   * 两条 waterfall 参与面的现场读数（都进 status.json）。
+   *
+   * 真机上"卡为什么没弹"有三种原因（宿主策略根本没问 / 我们没登记上 / 登记了但此刻
+   * 没有已配对的手机），没有这些字段就只能猜。
+   *
+   * `registered` 只证明"我们把自己挂上去了"，一点都不能证明"挂的地方收得到"——
+   * cordis 的 waterfall 按作用域过滤派发，挂错作用域的监听器登记成功、永不触发
+   * （见 `PARTICIPATE_OPTIONS`）。真机那一次"审批卡没弹"就是靠 `calls=0` 排除了
+   * "我们抢答了又丢掉"，把问题钉在派发那一步。
    */
-  let approvalFace = 'not-attached'
-  let questionsFace = 'pending'
+  interface ParticipantFace {
+    /** 登记结果：`registered` / `not-attached` / `refused by guard` / `no on()` / `failed: …`。 */
+    registered: string
+    /** 监听器被派发几次。 */
+    calls: number
+    /** 最后一次走到了哪一步。 */
+    last: string
+    /** 手机先答之后撤销了几次下游 signal（= 桌面那张卡的关闭句柄被按下去几次）。 */
+    desktopVoided: number
+    /** 能不能把可撤销的 signal 交给下游（`request.signal` 不可写时是 failed/ignored）。 */
+    handoff: string
+  }
+  const faces: Record<ParticipatedEvent, ParticipantFace> = {
+    'approval/request': {
+      registered: 'not-attached',
+      calls: 0,
+      last: 'not-called',
+      desktopVoided: 0,
+      handoff: 'unknown',
+    },
+    'user-questions/request': {
+      registered: 'not-attached',
+      calls: 0,
+      last: 'not-called',
+      desktopVoided: 0,
+      handoff: 'unknown',
+    },
+  }
+  /**
+   * 内核自己报出来的审批审计：**问过几次**与**最后一次是怎么收的场**（进 status.json）。
+   *
+   * 这两条是用来分"审批卡没弹"的两种根因的，它们在现场长得一模一样：
+   * - `approvalAsked>0` 而 `approvalCalls=0`、`approvalDecided=unavailable`
+   *   → 整条链没人答，说明**我们的监听器压根没被派发**（作用域过滤那一类）；
+   * - `approvalAsked>0` 而 `approvalCalls=0`、`approvalDecided=rejected|allowed-once`
+   *   → **别人抢先答了**：waterfall 是"外层不 next() 就没人能答"，我们排在桌面那一位后面。
+   * 少了 `approvalDecided` 这两者分不开，只能靠猜（2026-10-03 深夜就这么猜错了一次）。
+   */
+  let approvalAsked = 0
+  let approvalDecided = 'not-seen'
+
+  /**
+   * 模型面的登记结果，进 status.json。
+   *
+   * 为什么要单独记一份而不在读的时候现探：手机上「模型下拉是空的」有两种完全不同的原因
+   * —— 宿主根本不能换（那下拉就该置灰并说明），或者能换但我们没读到清单。
+   * 不把`agentDefaultModel` 的实际成员报出来，这两者就只能靠猜。
+   */
+  const modelMethods: string[] = []
 
   /** 软探测一个成员是不是函数。返回类型用 unknown 参数表，调用点各自窄化。 */
   const fn = (owner: unknown, name: string): ((...args: any[]) => unknown) | undefined => {
@@ -156,34 +336,24 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
   }
 
+  /** 任意一个活着的 agent（只用于能力探测，不参与业务）。没有活 agent 时报no-live-agent。 */
+  function firstLiveAgent(): LooseObject | undefined {
+    const list = fn(services.agents, 'list')
+    if (list) {
+      try {
+        const all = list.call(services.agents) as unknown
+        if (Array.isArray(all) && all.length) return all[0] as LooseObject
+      } catch {
+        /* 退回逐个get */
+      }
+    }
+    return undefined
+  }
+
   function agentStatus(sessionId: string): string {
     const agent = liveAgent(sessionId)
     const status = agent?.status
     return typeof status === 'string' ? status : 'idle'
-  }
-
-  /**
-   * 一条会话的工作区目录（会话头里的 `cwd`）。二维码 PNG 按它落 `<workspace>/.dsh/`。
-   *
-   * **只查活会话**：`services.sessions.get(id)` 拿到的是内核的 `Session` 对象，
-   * `header.cwd` 由内核自己校验成绝对路径（dsh-session：`cwd must be an absolute path`）。
-   * 不走持久化语料那条路（`sessionQuery.listSessions` 要读整份语料、还顺带拉标题），
-   * 因为用到它的两个时机——用户敲 `/drc pair`、右栏轮询——都发生在**用户正在那条会话里**。
-   * 查不到就返回 undefined，调用方退回 `~/.dsh/` 并把那个路径如实写进卡片。
-   */
-  function sessionWorkspace(sessionId: string): string | undefined {
-    const get = fn(services.sessions, 'get')
-    if (!get || sessionId === '') return undefined
-    try {
-      const session = get.call(services.sessions, sessionId) as
-        { header?: { cwd?: unknown }; cwd?: unknown } | undefined
-      // 两个读法都留着：真身是 `session.header.cwd`，而某些代际把会话折叠成扁平记录
-      // （`{id, cwd}`，见 listSessions 里 `sessions.list` 那个分支的读法）。
-      const cwd = session?.header?.cwd ?? session?.cwd
-      return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
-    } catch {
-      return undefined
-    }
   }
 
   function toSummary(record: ListedSession, archived: Set<string>): SessionSummary {
@@ -327,10 +497,28 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       return { ok: false, message: `sessionController.commands 上没有 create()（成员：${shapeOf(commands)}）` }
     }
     try {
-      // 只传空对象：不指定 sessionId（交给内核分配）、不指定 cwd / workspaceId（用默认项目目录）。
-      // 两者同时给会被内核当场拒（`gateway/bad-request`），所以这里一个都不给。
+      // cwd 要显式给（2026-10-04 用户实测："mp 端创建的会话不会出现在 dsh 的会话列表中"）。
+      // 不给的时候内核用宿主进程的 process.cwd() 兜底——真机上 lsof 一看就是 `/`，
+      // 于是会话挂在一个不属于任何用户项目的目录里，GUI 的列表按项目分组自然看不见它
+      // （手机侧照能用，只是主机那一面"新建了却不在列表里"）。
+      //
+      // 三级取值：配置点名的 > 最近一条会话的目录（用户此刻在做的项目，列表本来就带 cwd）
+      //        > 还是不给（宿主自己安排，日志留痕）。
+      // ⚠️ 仍然永远不给 sessionId（那会让内核复用旧会话而不是新建），
+      // 也永远不与 workspaceId 同时给（两者并存会被内核当场拒 gateway/bad-request）。
+      let cwd = String(options.newSessionCwd ?? '').trim()
+      if (!cwd) {
+        try {
+          const newest = (await listSessions(1))[0]
+          cwd = String(newest?.summary?.workspace ?? '').trim()
+        } catch {
+          // 列表读失败不挡新建：退回旧行为（宿主默认目录），日志由 listSessions 自己记。
+        }
+      }
+      const request: Record<string, unknown> = cwd === '' ? {} : { cwd }
+      if (cwd === '') log('new session without explicit cwd; host default applies', {})
       const made = (await withTimeout(
-        Promise.resolve(create.call(commands, {})),
+        Promise.resolve(create.call(commands, request)),
         options.createTimeoutMs ?? CREATE_TIMEOUT_DEFAULT,
       )) as LooseObject | undefined
       const id = typeof made?.sessionId === 'string' ? made.sessionId : ''
@@ -386,6 +574,41 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * 模型面探测：**逐名试调用**，不用 `Object.keys`。
+   *
+   * 踩过的坑：cordis 服务对象的成员挂在原型链上（服务本身是 accessor/proxy），
+   * `Object.keys(agentDefaultModel)` 返回**空数组**——而 `sessionController.commands`
+   * 这种 own-property 形态就能列出来。同一个 `shapeOf` 在两个服务上一个有用一个没���，
+   * 照抄形状会得出"内核不能换模型"的**假结论**。
+   *
+   * 所以这里改成问"这些名字里有没有能用的"，并把命中的名字报出来。
+   * 判据只回答两个问题：能不能列可选、能不能写。
+   */
+  function probeModelFace(): { hits: string[]; canList: boolean; canSet: boolean } {
+    const owner = services.agentDefaultModel as LooseObject | undefined
+    if (!owner) return { hits: [], canList: false, canSet: false }
+    const hits: string[] = []
+    for (const name of MODEL_FACE_METHODS) {
+      if (fn(owner, name)) hits.push(name)
+    }
+    modelMethods.length = 0
+    modelMethods.push(...hits)
+    return {
+      hits,
+      canList: hits.some((n) => MODEL_LIST_METHODS.has(n)),
+      canSet: hits.some((n) => MODEL_SET_METHODS.has(n)),
+    }
+  }
+
+  /** 探测结果的一句话摘要，进 status.json。 */
+  function modelFaceSummary(): string {
+    if (!services.agentDefaultModel) return 'absent'
+    const { hits, canList, canSet } = probeModelFace()
+    if (!hits.length) return `none (tried=${MODEL_FACE_METHODS.length})`
+    return `${canList ? 'list' : 'no-list'}+${canSet ? 'set' : 'no-set'} via=${hits.join(',')}`.slice(0, 180)
   }
 
   async function sendPrompt(sessionId: string, text: string): Promise<{ ok: boolean; message?: string }> {
@@ -568,6 +791,10 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     if (!sessionId || !type) return
     seenEventTypes.add(type)
     const data = (event?.data ?? {}) as LooseObject
+    // 审批的审计面对象：`asked` 带 toolName，`decided` 带 outcome。这里只记账不翻译——
+    // 卡片本身走 `approval/request` 那条 waterfall，见 attachInteractionSink。
+    if (type === 'approval/asked') approvalAsked += 1
+    if (type === 'approval/decided') approvalDecided = String(data.outcome ?? '?')
     for (const mapped of sessionEventKernelEvents({ sessionId, type, seq: event?.seq, data })) {
       // 标题缓存留在闭包这一侧：纯函数只负责"这条事件翻成什么"，不负责记账。
       if (mapped.kind === 'title') titleCache.set(sessionId, { title: mapped.title, at: options.clock.now() })
@@ -580,6 +807,13 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         unmappedEventTypes.add(type)
         log('unmapped session event type', { type, keys: shapeOf(data) })
       }
+    }
+    // 被判成"宿主注入"而没出站的 user/message：同样要留痕。
+    // 不留痕的话「手机上看不到某条注入」与「内核根本没发」在 status.json 里长得一模一样，
+    // 而这两件事的下一步完全不同（改映射 vs 查宿主）。
+    if (type === 'user/message' && !isHumanUserMessage(data)) {
+      const kind = String((data.source as LooseObject | undefined)?.kind ?? '?')
+      injectedUserMessages.set(kind, (injectedUserMessages.get(kind) ?? 0) + 1)
     }
   }
 
@@ -597,67 +831,40 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     sink = next
     const disposers: Array<() => void> = []
     const on = services.on
-    if (typeof on === 'function') {
-      const name = 'approval/request'
-      if (canParticipate(name)) {
-        // **参与**这条 waterfall：必须返回 outcome 或调用 next()，返回 undefined 会冲掉整条链。
-        const listener = (...args: unknown[]): Promise<string> => participate(args)
-        try {
-          const disposer = (on as (n: string, fn: unknown) => unknown).call(services, name, listener)
-          // 这条登记要进 status.json：真机上审批卡"为什么没弹"分三种原因
-          // （策略根本没问 / 没登记上 / 登记了但没配对的手机），没有这个字段就只能猜。
-          approvalFace = 'registered'
-          disposers.push(() => {
-            if (typeof disposer === 'function') (disposer as () => void)()
-            else if (typeof services.off === 'function') services.off(name, listener)
-          })
-        } catch (error) {
-          approvalFace = `failed: ${messageOf(error)}`.slice(0, 80)
-          log('approval/request participation failed', { message: messageOf(error) })
-        }
-      } else {
-        approvalFace = 'refused by guard'
+    if (typeof on !== 'function') {
+      for (const name of PARTICIPATED_EVENTS) faces[name].registered = 'no on()'
+      return () => {
+        sink = undefined
       }
-    } else {
-      approvalFace = 'no on()'
     }
-    const questions = services.userQuestions as LooseObject | undefined
-    if (!options.takeOverQuestions) {
-      // 默认关：`ctx.userQuestions` 只允许一个活跃提供者，接管就意味着桌面 UI 不再问。
-      questionsFace = 'not-taken-over'
-    } else if (!questions || typeof questions.registerProvider !== 'function') {
-      // 把服务实际暴露的成员一起报出来：真机上这一代宿主没有 `registerProvider`，
-      // 只写"没有提供者"就分不清是"服务不在"还是"这一代的 API 换了名字"。
-      questionsFace = `no registerProvider (keys=${questions ? shapeOf(questions) : 'service absent'})`.slice(0, 120)
-    }
-    if (options.takeOverQuestions && questions && typeof questions.registerProvider === 'function') {
-      const provider = {
-        ask: async (request: LooseObject) => {
-          const agent = request.agent as { session?: { id?: string } } | undefined
-          const sessionId = String(agent?.session?.id ?? request.sessionId ?? '')
-          const items = Array.isArray(request.questions) ? (request.questions as LooseObject[]) : []
-          const mapped: QuestionItem[] = items.map((item, index) => mapQuestion(item, index))
-          const answer = await sink?.question({
-            sessionId,
-            questions: mapped,
-            ...(request.signal ? { signal: request.signal as AbortSignal } : {}),
-          })
-          if (!answer) {
-            // 提问服务没有 next() 可交还（单提供者），所以这里必须明确失败，
-            // 绝不能静默挂着——那会把整个 agent 卡死。
-            throw new Error('手机端未应答这次提问（未配对、不在线或已超时）')
-          }
-          return { answers: answer.answers }
-        },
+    for (const name of PARTICIPATED_EVENTS) {
+      const face = faces[name]
+      if (!canParticipate(name)) {
+        // 名单是 guard 里那份极窄的显式清单。走到这里说明有人改了名单却没同步这里——
+        // 宁可这条面不接，也不要悄悄订阅一条 waterfall。
+        face.registered = 'refused by guard'
+        continue
       }
+      // **参与**这条 waterfall：必须返回真答案或调用 `next()`；返回 undefined 会冲掉整条链
+      // （那是"每个 turn 都崩"的形状，见 guard.ts）。
+      const listener = (...args: unknown[]): Promise<unknown> => participate(name, args)
       try {
-        const dispose = (questions.registerProvider as (p: unknown) => unknown).call(questions, provider)
-        if (typeof dispose === 'function') disposers.push(dispose as () => void)
-        questionsFace = 'registered'
-        log('question provider taken over from the desktop UI')
+        const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
+          services,
+          name,
+          listener,
+          PARTICIPATE_OPTIONS,
+        )
+        // 这条登记要进 status.json：真机上"卡为什么没弹"分三种原因（宿主没问 / 没登记上 /
+        // 登记了但没有配对的手机），没有这个字段就只能猜。
+        face.registered = 'registered'
+        disposers.push(() => {
+          if (typeof disposer === 'function') (disposer as () => void)()
+          else if (typeof services.off === 'function') services.off(name, listener)
+        })
       } catch (error) {
-        questionsFace = `failed: ${messageOf(error)}`.slice(0, 80)
-        log('question provider registration failed', { message: messageOf(error) })
+        face.registered = `failed: ${messageOf(error)}`.slice(0, 80)
+        log(`${name} participation failed`, { message: messageOf(error) })
       }
     }
     return () => {
@@ -672,25 +879,178 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
   }
 
-  /** `approval/request(this, req, next)`：req 是只读审批问题，next 交还给其他应答者。 */
-  async function participate(args: unknown[]): Promise<string> {
+  /**
+   * 一条被参与的 waterfall 的处理器：`<event>(this, req, next)`。
+   * **同时**问手机和桌面，谁先给出真实决定谁算——审批与提问共用这一份实现。
+   *
+   * 为什么不能抢答（2026-10-04 真机踩过，用户当场指出来）：waterfall 是"外层不调 `next()`
+   * 内层就永远轮不到"，而我们为了排到桌面前面用了 `prepend`——结果**桌面那一半整个不弹了**。
+   * 那是插件在改变宿主自己的行为，红线。所以一进这个函数就要立刻把 `next()` 叫起来
+   * （桌面照常弹、照常等它的人），手机这一侧并行问，两边赛跑。
+   *
+   * "谁先答谁算"里的"答"要收紧：审批那条的 `'decline'`（手机超时）/`'cancelled'`（被我们撤回）/
+   * `'unavailable'`（链子末端没人应答）都不算；提问那条的 `null` 同样不算。把它们当答案的后果很具体：
+   * 手机没电了会变成"自动拒绝"，而桌面上暂时没人会变成"手机还没点就失败"。
+   *
+   * 桌面先答时我们 `abort` 给 runtime 那条信号（reason `'desktop'`），`runtime` 收到之后
+   * 向手机发精确作废帧 + 补一帧 `ev.run_state` 把卡收回去。
+   *
+   * **反方向也收得掉**（2026-10-04 补上这条，此前那段注释写的是"收不了"，那是没读到
+   * cordis `waterfall` 与 api-gateway `startRemoteEvent` 之前的结论）：手机先答之后我们
+   * 撤销交给下游的那份 signal，宿主的网关便向每个渲染端发 cancel，桌面那张卡按宿主
+   * 自己的代码消失。判据是这条面上的 `desktopVoided` 计数器——它加了而屏幕上卡还在，
+   * 问题就在渲染端；没加就是这一侧没换成功（`handoff` 会说为什么）。两条 waterfall 在网关
+   * 那边是同一条转发路径（客户端都是 `$on(名字, function(request, next) …)`），所以这招不必
+   * 为提问重写一遍。
+   *
+   * 两条唯一的实质差别是"没人答"怎么表达：审批那条链末端 resolve `'unavailable'`，
+   * 提问那条是 `noAnswerer()` **抛出** `NO_PROVIDER`。所以最后那条分支必须把原始 rejection
+   * 复述回去，而不是吞成 `undefined`——那正是"把内核每个 turn 都搞崩"的形状（见 guard.ts）。
+   */
+  async function participate(event: ParticipatedEvent, args: unknown[]): Promise<unknown> {
+    const isApproval = event === 'approval/request'
+    const face = faces[event]
+    face.calls += 1
+    // 请求对象就是 args 里形状对得上的那一个：审批认 `toolName`，提问认 `questions`。
     const request = args.find(
-      (arg) => arg && typeof arg === 'object' && typeof (arg as { toolName?: unknown }).toolName === 'string',
-    ) as { agent?: { session?: { id?: string } }; toolName?: string; reason?: string; signal?: AbortSignal } | undefined
+      (arg) =>
+        Boolean(arg) &&
+        typeof arg === 'object' &&
+        (isApproval
+          ? typeof (arg as { toolName?: unknown }).toolName === 'string'
+          : Array.isArray((arg as { questions?: unknown }).questions)),
+    ) as
+      | {
+          agent?: { session?: { id?: string } }
+          toolName?: string
+          reason?: string
+          questions?: LooseObject[]
+          signal?: AbortSignal
+        }
+      | undefined
     const next = args.find((arg) => typeof arg === 'function') as (() => Promise<unknown>) | undefined
     const sessionId = String(request?.agent?.session?.id ?? '')
     if (!sink || !sessionId || !servicesPeers()) {
-      // 没有手机端在线 → 交还桌面 UI。这一步是"插件不抢答"的关键。
-      return String((await next?.()) ?? 'unavailable')
+      // 压根没有能收消息的手机 → 一行都不弹，完整交还桌面。这一步是"插件不抢答"的关键。
+      // 这里**不 catch**：提问那条没人答时宿主本来就是抛 `NO_PROVIDER`，
+      // 把它吞成值会改变宿主的错误形状（未配对的手机上"提问"就变成了一次空答案）。
+      face.last = 'handed-back(no phone target)'
+      const value = await next?.()
+      return isApproval ? String(value ?? 'unavailable') : value
     }
-    const decision = await sink.approval({
-      sessionId,
-      action: String(request?.toolName ?? '工具调用'),
-      ...(request?.reason ? { reason: String(request.reason) } : {}),
-      ...(request?.signal ? { signal: request.signal } : {}),
-    })
-    if (decision === 'decline') return String((await next?.()) ?? 'unavailable')
-    return decision
+    const controller = new AbortController()
+    // 平台自己撤回这次请求时（回合被取消等）也必须让手机把卡收掉，所以把它的 signal 接回
+    // 我们这条 controller 上——往下只传一个信号源，`reason` 用来区分"桌面先答"与"平台撤回"。
+    const platform = request?.signal
+    if (platform) {
+      if (platform.aborted) controller.abort('platform')
+      else platform.addEventListener('abort', () => controller.abort('platform'), { once: true })
+    }
+    // 手机先答之后要能宣告"这次请求结束了"，于是把下游拿到的 signal 换成并算后的那一份。
+    // 顺序很重要：**先抓原件再接上去**，否则我们自己也会被这次撤销绊一下（`controller`
+    // 一旦跟着断，runtime 会把手机刚点掉的那次应答当成"被撤回"再作废一遍）。
+    const canceller = new AbortController()
+    let handedOff = false
+    if (request) {
+      try {
+        const fused = fuseSignals(platform, canceller.signal)
+        request.signal = fused
+        handedOff = request.signal === fused
+        face.handoff = handedOff ? 'fused' : 'ignored'
+      } catch (error) {
+        // 请求对象被冻结时赋值会抛（ESM 一律严格模式）。这里退回"桌面那张卡等它自己的
+        // 工具调用生命周期"——那是换 signal 之前的老行为，少收一张卡不至于更糟。
+        face.handoff = `failed: ${messageOf(error)}`.slice(0, 80)
+      }
+    }
+    /** 结算之后一律撤销：手机先答时它是"关掉桌面那张卡"的那一下，其余分支只是 release。 */
+    const finish = (reason: string) => {
+      if (!canceller.signal.aborted) canceller.abort(reason)
+    }
+    type Chain = { answered: boolean; value?: unknown; error?: unknown }
+    // 桌面那一半**现在就启动**，不等手机。
+    const desktop: Promise<Chain> = Promise.resolve()
+      .then(() => next?.())
+      .then(
+        (value) =>
+          // `undefined` 是"这个参与者没认领"（会把整条链冲掉），不是答案；
+          // `'unavailable'` 是审批那条链末端的"没人可问"，也不是答案。
+          value === undefined || (isApproval && value === 'unavailable')
+            ? { answered: false, value }
+            : { answered: true, value },
+        (error) => ({ answered: false, error }),
+      )
+    const asked: Promise<unknown> = isApproval
+      ? sink.approval({
+          sessionId,
+          action: String(request?.toolName ?? '工具调用'),
+          ...(request?.reason ? { reason: String(request.reason) } : {}),
+          signal: controller.signal,
+        })
+      : sink.question({
+          sessionId,
+          questions: (request?.questions ?? []).map((item, index) => mapQuestion(item, index)),
+          signal: controller.signal,
+        })
+    const phone: Promise<Chain> = asked.then(
+      (value) =>
+        // 每一支都**带着自己是谁**回来：`'rejected'` 这个词手机和桌面都可能给出，
+        // 只比数值就没法知道该收哪一张卡（第一版就是这么错的）。
+        isApproval
+          ? value === 'allowed-once' || value === 'rejected'
+            ? { answered: true, value }
+            : { answered: false, value }
+          : value === null || value === undefined
+            ? { answered: false, value }
+            : { answered: true, value },
+      // runtime 抛了（未配对、不在线、被撤）同样不算答案。
+      () => ({ answered: false }) as Chain,
+    )
+    // 不算答案的那些取值换成"永远不落地"，于是 `Promise.race` 只会把真答案送出来；
+    // 两边都收场了却都没有真答案时，由最后那条分支兜住（否则这里会挂死）。
+    const pending = new Promise<{ src: 'phone' | 'desktop'; chain: Chain }>(() => {})
+    const winner = await Promise.race([
+      phone.then((chain) => (chain.answered ? { src: 'phone' as const, chain } : pending)),
+      desktop.then((chain) => (chain.answered ? { src: 'desktop' as const, chain } : pending)),
+      Promise.all([phone, desktop]).then(([, chain]) => ({ src: 'desktop' as const, chain })),
+    ])
+    if (!winner.chain.answered) {
+      // 两边都没答上：手机那一侧要作废（pending 删掉、`waiting` 归零、卡片收掉）。
+      controller.abort('desktop')
+      finish('settled-without-answer')
+      if (isApproval) {
+        face.last = 'handed-back(neither answered)'
+        return 'unavailable'
+      }
+      // 提问这条的"没人答"在宿主这边是一个 rejection（链子末端的 `noAnswerer()`），
+      // 所以复述它，而不是返回一个"看起来像答案"的东西。
+      face.last = 'no-answer'
+      if (winner.chain.error !== undefined) throw winner.chain.error
+      throw new Error('手机端未应答这次提问（未配对、不在线或已超时）')
+    }
+    // 桌面先答 → 手机那一侧要立刻作废（pending 条目删掉、`waiting` 归零、连手机上的卡一起收掉）。
+    if (winner.src === 'desktop') controller.abort('desktop')
+    if (winner.src === 'phone') {
+      // 手机先答 → 桌面那张卡作废。撤销之后网关的 cancel 会发给每一个渲染端。
+      finish('answered-by-phone')
+      // 只有真的把可撤销的句柄交下去了，这一笔才算"桌面那张卡由我们关掉"；
+      // 没换成功时按下去也没有任何东西会断，计数器不能替我们说谎。
+      if (handedOff) face.desktopVoided += 1
+    } else {
+      finish('answered-by-desktop')
+    }
+    face.last = `${winner.src === 'phone' ? 'answered-by-phone' : 'answered-by-desktop'}(${describeOutcome(
+      isApproval,
+      winner.chain.value,
+    )})`
+    return winner.chain.value
+  }
+
+  /** 落点字符串：审批直接印 outcome 词表，提问印"答了几项"（答案正文不进 status.json）。 */
+  function describeOutcome(isApproval: boolean, value: unknown): string {
+    if (isApproval) return String(value)
+    const answers = (value as { answers?: unknown } | undefined)?.answers
+    return Array.isArray(answers) ? `${answers.length} 项` : typeof value
   }
 
   /** 有没有能收消息的对端由 runtime 判断；这里只做一个粗筛（有 sink 即可能有对端）。 */
@@ -732,10 +1092,25 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     subscribe,
     attachInteractionSink,
     ensureRunnable,
-    sessionWorkspace,
     // 与发指令/续跑走同一条读取路径：这里原来还有一份实现，而且是 `current()` 裸调用
     // （不带 receiver；真要用 this 的服务方法会当场抛），两份迟早分叉。
     modelSelection: currentSelection,
+    /**
+     * 可切换模型清单。**这一代内核给不出清单也换不了**（`agentDefaultModel` 上只有
+     * `currentSelection`），所以这里报 `canSwitch: false` 并附一句人话。
+     *
+     * 报false 而不是省略这个方法：省略会被 core 当成"只读"但**说不出原因**，
+     * 手机上就只剩一个置灰的模型名，用户不知道是主机不支持还是自己哪里做错了。
+     */
+    modelOptions() {
+      const { hits, canList, canSet } = probeModelFace()
+      return {
+        // 两个都要有才算能切：只有 list 没有 set 时手机上会列出候选却点了没反应，
+        // 那比"换不了"更糟。
+        canSwitch: canList && canSet,
+        reason: canList && canSet ? undefined : `主机内核只提供读取（命中：${hits.join(',') || '无'}）`,
+      }
+    },
     describe() {
       return {
         carrier: 'services',
@@ -753,24 +1128,46 @@ export function createServicesKernel(services: ServicesBundle, options: Services
           typeof fn(services.sessionController?.commands, 'create') === 'function'
             ? 'commands.create'
             : `absent (keys=${shapeOf(services.sessionController)})`.slice(0, 120),
-        // 二维码落点依赖这一条。它缺席时 PNG 会退回 ~/.dsh/，卡片上的路径会跟着变——
-        // 用户看到"图不在工作区"时，第一件事就是看这个字段是不是 absent。
-        workspaceFace:
-          typeof fn(services.sessions, 'get') === 'function'
-            ? 'sessions.get'
-            : `absent (keys=${shapeOf(services.sessions)})`.slice(0, 120),
+        // 第二条换模型的可能路径：命令控制器上自带的方法（`setModel` / `switchModel`…），
+        // 以及活agent 自己暴露的模型字段。前者能列出来就说明这条路通不通。
+        commandsFace: shapeOf(services.sessionController?.commands),
+        agentModelFields: (() => {
+          const first = firstLiveAgent()
+          if (!first) return 'no-live-agent'
+          return (
+            Object.keys(first)
+              .filter((k) => /model|provider|preset/i.test(k))
+              .slice(0, 8)
+              .join(',') || 'none'
+          )
+        })(),
         agents: typeof services.agents === 'object',
         agentDefaultModel: typeof services.agentDefaultModel === 'object',
+        // 模型面到底有没有"写"的能力（能列可选、能切换）。手机上模型下拉该不该置灰，
+        // 取决于这个而不是取决于"读得到当前值" —— 读得到只够显示一行文字。
+        modelFace: modelFaceSummary(),
         workspaceRegistry: typeof services.workspaceRegistry === 'object',
         userQuestions: typeof services.userQuestions === 'object',
-        takeOverQuestions: options.takeOverQuestions === true,
         archivedSessions: archivedIds().size,
         hasOn: typeof services.on === 'function',
         // 真机排错的第一现场：内核到底发了哪些事件类型、其中哪些我们没认。
         eventTypes: [...seenEventTypes].slice(-24).join('|'),
         unmappedEventTypes: [...unmappedEventTypes].join('|'),
-        approvalFace,
-        questionsFace,
+        injectedUserMessages: [...injectedUserMessages].map(([kind, count]) => `${count}×${kind}`).join('|') || 'none',
+        approvalFace: faces['approval/request'].registered,
+        approvalCalls: faces['approval/request'].calls,
+        approvalLast: faces['approval/request'].last,
+        approvalAsked,
+        approvalDecided,
+        approvalDesktopVoided: faces['approval/request'].desktopVoided,
+        approvalSignalHandoff: faces['approval/request'].handoff,
+        // 提问那一条与审批同构，所以读数也同一套：登记结果 / 被派发几次 / 最后走到哪一步 /
+        // 手机先答时撤销了几次下游 signal / 那份 signal 换没换成功。
+        questionsFace: faces['user-questions/request'].registered,
+        questionsCalls: faces['user-questions/request'].calls,
+        questionsLast: faces['user-questions/request'].last,
+        questionsDesktopVoided: faces['user-questions/request'].desktopVoided,
+        questionsSignalHandoff: faces['user-questions/request'].handoff,
         listenerErrors:
           [...listenerErrors]
             .slice(0, 4)
@@ -796,6 +1193,9 @@ export const MAPPED_SESSION_EVENTS = new Set([
   'session/title',
   'approval/asked',
   'approval/decided',
+  // 内核的 todo/write 在真机的 eventTypes 里（status.json 的 unmappedEventTypes 曾一直记着它），
+  // 但没人转发到手机——于是手机上一整轮"现在在干什么"都是空白。2026-10-05 补上。
+  'todo/write',
 ])
 
 export function sessionEventKernelEvents(input: {
@@ -808,18 +1208,57 @@ export function sessionEventKernelEvents(input: {
   switch (type) {
     case 'turn/start':
       return [{ kind: 'run-state', sessionId, state: 'running' }]
-    case 'assistant/message':
-    case 'user/message':
+    case 'assistant/message': {
+      // 工具调用在这一代宿主里有**两条**通道：结构化的 `tool/call` 事件，以及
+      // assistant 正文里一段 XML 序列化（真机形状见 `stripToolCallXml` 的注释，
+      // 取证：本机 session log 的 assistant/message 的 `type:'text'` part）。
+      // 正文这段是同一信息的第二份副本——不剥掉它，手机上每条助手消息都挂着
+      // 一段 XML 原文（用户 2026-10-04 截图：聊天框出现原始 tool_call XML），
+      // 而结构化那条在步骤卡片里已经呈现（title 走 `argsTitle`）。
+      //
+      // 剥完之后可能是空串（整条消息只有一个工具调用）：这时**仍然发出这一帧**
+      // （空正文 + messageId）。mp 的 `_applyText` 对空正文不建块（那里的注释
+      // 记着真机上的“一排只有 padding 的空白窄条”），所以发空帧是安全的；
+      // 而 messageId 必须跟着，否则下一条带字的消息会被挂到这一行上。
+      const text = stripToolCallXml(textOf(data))
+      return [
+        {
+          kind: 'delta',
+          sessionId,
+          messageId: messageIdOf(data, input.seq),
+          text,
+          role: 'assistant',
+          done: true,
+        },
+      ]
+    }
+    case 'user/message': {
+      // **只有真人输入才算"用户消息"**。宿主往会话里塞的东西一律走 `user/message`
+      // 这个事件类型，但它们的 `source.kind` 分别是 time-context / runtime-context /
+      // skill-catalog / agent-instructions / model-selection / tool-jobs / subagent-settled /
+      // compact-checkpoint / schedule / team-message ……
+      //
+      // 第一版在这里不看 `source`，于是一条 `time-context` 快照在手机上顶着
+      // 「你的指令」那颗蓝色气泡，内容是
+      // 「Time sampled while preparing turn 3, step 1: 2026-10-02T23:04:02+08:00 …」——
+      // 用户没发过这句话，却显示成他发的，这是**假事实**，比不显示坏得多。
+      //
+      // 所以判据只有一条：`source.kind === 'user'`。其余一律不出站。
+      // 「静默丢掉」不成立：调用方（`translateSessionEvent`）会把这个计数写进
+      // status.json 的 `injectedUserMessages`，真机问「为什么手机上看不到 X」时，
+      // 第一步就能分清是宿主没发、我们丢了、还是路上丢了（与 outbound 计数同一套纪律）。
+      if (!isHumanUserMessage(data)) return []
       return [
         {
           kind: 'delta',
           sessionId,
           messageId: messageIdOf(data, input.seq),
           text: textOf(data),
-          role: type === 'assistant/message' ? 'assistant' : 'user',
+          role: 'user',
           done: true,
         },
       ]
+    }
     case 'tool/call': {
       // 字段名要按真机形状读：内核给的是 `arguments`（一个 JSON 串），不是 `args`；
       // 读错了这一帧永远停在 'started'，手机上看不到参数、也看不出工具在跑什么。
@@ -831,10 +1270,35 @@ export function sessionEventKernelEvents(input: {
           callId: String(data.callId ?? data.id ?? `tool_${input.seq ?? 0}`),
           phase: argsRaw === undefined || argsRaw === null ? 'started' : 'args',
           tool: typeof data.name === 'string' ? data.name : undefined,
-          title: typeof data.title === 'string' ? data.title : previewOf(argsRaw),
-          ...(argsRaw === undefined ? {} : { argsPreview: previewOf(argsRaw) }),
+          title: typeof data.title === 'string' ? data.title : argsTitle(argsRaw),
+          ...(argsRaw === undefined ? {} : { argsPreview: argsPreviewOf(argsRaw) }),
         },
       ]
+    }
+    case 'todo/write': {
+      // 内核形状（取证：app.asar 的 typert.host.js）：`todo/write: { todos: TodoItem[] }`，
+      // `TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' }`。
+      // 每次都是**全量快照**——所以这里也只发整份，不做增量，手机侧同样整份替换。
+      //
+      // 三条夹取，每条都对应一个真机上的坏味道：
+      // - status 不在三元里 → 当 pending（未知状态显示成"没状态"比降级成待办更怪）；
+      // - content 非字符串 / 空 → 丢掉这一条（一条没有字的待办在面板里就是一行空白）；
+      // - 整份夹到 50 条：真机上单轮 todo 一般十条以内，超了说明这一轮真的很大，
+      //   那更该给手机一个能滚动的清单而不是把面板顶到屏幕外。
+      const raw = Array.isArray(data.todos) ? (data.todos as LooseObject[]) : []
+      const todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[] = []
+      for (const item of raw) {
+        if (todos.length >= 50) break
+        const content = typeof item?.content === 'string' ? item.content.trim() : ''
+        if (!content) continue
+        const status = item?.status
+        todos.push({
+          content: content.slice(0, 200),
+          status: status === 'in_progress' || status === 'completed' || status === 'pending' ? status : 'pending',
+        })
+      }
+      // 空数组也发：内核清空清单时手机必须跟着清（会话跑完一轮 todo 常常整个被清掉）。
+      return [{ kind: 'todo', sessionId, todos }]
     }
     case 'tool/result': {
       const message = data.message as LooseObject | undefined
@@ -928,8 +1392,6 @@ function eventContent(data: LooseObject): unknown {
 
 // ── 历史：内核日志 → 一页线格式条目 ───────────────────────────────────
 
-/** 一页历史默认给多少条线格式条目（够看几轮，又不会顶满中继的帧预算）。 */
-export const HISTORY_LIMIT_DEFAULT = 40
 /** 单张页面的正文总预算（字符）。超了就少给几条，剩下的由游标继续翻。 */
 const HISTORY_CHAR_BUDGET = 100_000
 /** 单条正文的硬上限。小程序侧的正文块上限是 20000，这里留出余量。 */
@@ -1049,6 +1511,28 @@ function charCountOf(event: KernelEvent): number {
   return 0
 }
 
+/**
+ * 这条 `user/message` 是不是**真人敲的那一句**。
+ *
+ * 取证（`~/.dsh/sessions/**\/session.v4.jsonl.zstd`，把全部会话按 `source.kind` 统计）：
+ * 宿主把注入内容也写成 `user/message`，靠 `source.kind` 区分，实测见过
+ * `user`（真人的话）、`time-context`、`runtime-context`、`skill-catalog`、
+ * `agent-instructions`、`model-selection`、`tool-jobs`、`subagent-settled`、
+ * `compact-checkpoint`、`schedule`、`team-message`、`agent-message`、`user-approval`、
+ * `ptc-mode`。判据必须是 `source`，不是事件类型 —— 事件类型它们全都一样。
+ *
+ * **缺 `source` 时按真人处理**：宿主若真的发了不带 `source` 的一条，那是旧一代的形状，
+ * 而把真人指令误判成注入 = 用户发的话凭空消失，代价比多显示一条注入大得多。
+ */
+function isHumanUserMessage(data: LooseObject): boolean {
+  const source = data?.source
+  if (source === undefined || source === null) return true
+  if (typeof source !== 'object') return true
+  const kind = (source as LooseObject).kind
+  if (typeof kind !== 'string' || !kind) return true
+  return kind === 'user'
+}
+
 function textOf(data: LooseObject): string {
   const content = eventContent(data)
   if (typeof content === 'string') return content
@@ -1071,9 +1555,121 @@ function messageIdOf(data: LooseObject, seq: unknown): string {
   return `msg_${String(seq ?? Date.now())}`
 }
 
-function previewOf(value: unknown): string | undefined {
+/**
+ * 剥掉 assistant 正文里的工具调用 XML。
+ *
+ * 真机形状（取证：本机 session log 的 assistant/message）：这一代宿主把工具
+ * 调用**同时**写进结构化 part（`type:'tool-call'`）和一个 `type:'text'` part
+ * 的 XML 序列化里。结构化那条由 `tool/call` 事件单独出站（title 走
+ * `argsTitle`），正文这段是同一信息的第二份副本——把它透到手机上，用户看到
+ * 的就是聊天框里一段 XML 原文（用户 2026-10-04 截图报的就是它）。
+ *
+ * 三条判别，都是被真机形状逼出来的：
+ * ① **只剥完整的块**（开标签到闭合标签），块外的正文一个字不动；
+ * ② **尾部未闭合的块也剥**（流被掐断时），但要求开标签后紧跟 function=——
+ *    否则正文里反引号包着的提到（真机上出现过：助手解释“手机上有原始
+ *    XML”这件事时自己写了那个标签）会被当成块开头，从那儿把真正的正文删光；
+ * ③ 剥完可能是空串（整条消息只有一个工具调用）——调用方按空正文发帧，
+ *    mp 侧不建块（见 `_applyText` 的“空正文不建块”注释）。
+ */
+const TOOL_CALL_BLOCK = /<tool_call>\s*<function=[\s\S]*?<\/tool_call>/g
+const TOOL_CALL_UNCLOSED = /<tool_call>\s*<function=[\s\S]*$/
+
+export function stripToolCallXml(text: string): string {
+  const stripped = text.replace(TOOL_CALL_BLOCK, '').replace(TOOL_CALL_UNCLOSED, '')
+  // 只剩空白（整条都是 XML + 换行）就归还真正的空串：mp 对空串不建块，
+  // 对一个 '\n' 却会建（真机上那是一排只有 padding 的空白窄条）。
+  return stripped.trim() === '' ? '' : stripped
+}
+
+/**
+ * 工具调用的“这一步行标题”。
+ *
+ * 真机形状：`arguments` 是一个 **JSON 串**。旧实现把它整串当 title，于是步骤
+ * 卡片上每个 run_code 都挂着一 455 字符的 JSON——用户原话“run_code 有点
+ * 看不懂”（2026-10-04 截图）。模型写工具调用时都会带 `description`（一句话
+ * 说明这一步在干什么），那才是给人看的标题。取不到的才退回整串预览。
+ */
+function argsTitle(argsRaw: unknown): string | undefined {
+  const parsed = tryParseJson(argsRaw)
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const record = parsed as LooseObject
+    for (const key of ['description', 'prompt', 'command', 'path', 'file_path', 'pattern', 'query', 'url']) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) return oneLine(value)
+    }
+  }
+  return previewOf(argsRaw)
+}
+
+/** 展开时看的参数：是 JSON 就美化（真换行、有缩进），否则原样。 */
+function argsPreviewOf(argsRaw: unknown): string | undefined {
+  const parsed = tryParseJson(argsRaw)
+  if (parsed !== undefined) {
+    try {
+      return previewOf(JSON.stringify(parsed, null, 2))
+    } catch {
+      /* 美化失败就原样，下面那句兜底 */
+    }
+  }
+  return previewOf(argsRaw)
+}
+
+function tryParseJson(value: unknown): unknown {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
+
+function oneLine(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat
+}
+
+/**
+ * 把任意内核值折成“给人看的预览文本”。
+ *
+ * 为什么不能直接 JSON.stringify：真机上 `tool/result` 的正文是
+ * `data.message.content`，一个 **part 数组**。旧实现对非字符串一律 stringify，
+ * 于是手机上每个工具结果都长这样 `[{"type":"text","text":"{\n …`——
+ * 换行是两个字面量、引号带反斜杠，markdown 渲染出来就是一片乱码
+ * （用户 2026-10-04 截图报的正是它）。所以：能取出人话就取人话，
+ * 取不到才 stringify（那是真的结构化数据）。
+ *
+ * 取不到的判定同样重要：part 数组里的非文本 part（图片等）没有 text 字段，
+ * 把它们也 stringify 进去等于把协议碎片贴给用户——跳过，只留文本。
+ */
+function readableText(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined
-  const text = typeof value === 'string' ? value : safeJson(value)
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((part) => readableText(part))
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
+    return parts.length > 0 ? parts.join('\n') : undefined
+  }
+  if (typeof value === 'object') {
+    const record = value as LooseObject
+    // 文本字段按“最像正文”的顺序找。message / result / error 是嵌套入口
+    // （真机形状：{message:{content:[...]}}、{error:{message:'...'}}）。
+    for (const key of ['content', 'text', 'output', 'stdout', 'stderr', 'message', 'result', 'error']) {
+      if (record[key] === undefined || record[key] === null) continue
+      const nested = readableText(record[key])
+      if (nested !== undefined && nested !== '') return nested
+    }
+    // 带 type 但不是文本的 part（图片、文件…）：没有可取的人话，不贴协议碎片。
+    if (typeof record.type === 'string' && record.type !== 'text') return undefined
+    return safeJson(record)
+  }
+  return safeJson(value)
+}
+
+function previewOf(value: unknown): string | undefined {
+  const text = readableText(value)
   if (!text) return undefined
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
 }

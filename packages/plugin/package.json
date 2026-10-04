@@ -1,7 +1,7 @@
 {
   "name": "dsh-remote-control",
-  "version": "1.0.0",
-  "description": "DSH Remote Control host plugin: pairs a running DeepSeek Harness with the DRC relay so a WeChat Mini Program can send prompts, watch streamed output, and answer approvals. Payload-level E2E encryption; the relay never sees plaintext.",
+  "version": "2.0.2",
+  "description": "DSH Remote Control host plugin: pairs a running DeepSeek Harness with the DRC relay so a WeChat Mini Program can send prompts, watch streamed output, and answer approvals. Payload-level E2E encryption; the relay never sees plaintext. Pairing is one click on the status-bar pill (three same-origin routes + a browser half).",
   "type": "module",
   "license": "MIT",
   "author": "providcc",
@@ -20,7 +20,10 @@
     "e2ee",
     "tweetnacl",
     "x25519",
-    "xsalsa20-poly1305"
+    "xsalsa20-poly1305",
+    "qrcode",
+    "pill",
+    "status-bar"
   ],
   "engines": {
     "node": ">=20"
@@ -28,16 +31,21 @@
   "main": "./dist/bundle/index.js",
   "exports": {
     ".": "./dist/bundle/index.js",
+    "./client": "./dist/bundle/client.cjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "dist",
+    "dist/bundle",
     "cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   },
   "publishConfig": {
@@ -46,14 +54,14 @@
   },
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsc -p tsconfig.json && node ../../scripts/bundle-plugin.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p client/tsconfig.json",
+    "build": "pnpm clean && tsc -p tsconfig.json && tsc -p client/tsconfig.json && node ../../scripts/bundle-plugin.mjs",
     "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "dsh-remote-wire": "^1.0.0",
+    "dsh-remote-wire": "^1.4.0",
     "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0",
