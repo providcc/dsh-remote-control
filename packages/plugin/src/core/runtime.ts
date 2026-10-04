@@ -718,7 +718,8 @@ function messageOf(error: unknown): string {
  * `KernelEvent` → 历史条目。
  *
  * 运行态 / 标题 / 列表变化在历史里没有位置——它们是"此刻"的事，回放历史不该去改顶栏；
- * 返回 `undefined` 由调用方丢掉。
+ * 返回 `undefined` 由调用方丢掉。**待办例外**（2026-10-05）：它是全量快照，
+ * 一页里最后一条就是那一页截止时的清单，回放它进一条跑过的会话也看得见待办。
  *
  * `done` 恒为 `true`：历史里的消息是**已经写完的**。不置的话手机上正文末尾会挂着一个
  * 一直闪的光标，看起来像还在生成。
@@ -731,6 +732,9 @@ function historyWireItem(event: KernelEvent): HistoryItem | undefined {
       done: true,
       ...(event.role === undefined ? {} : { role: event.role }),
     })
+  }
+  if (event.kind === 'todo') {
+    return todoList({ todos: event.todos })
   }
   if (event.kind === 'tool') {
     return toolEvent({

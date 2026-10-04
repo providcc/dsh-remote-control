@@ -100,20 +100,23 @@ PSK，而手机扫的是屏幕上那张，取错密钥就全线解不开（当�
 **环境变量 > patch 里的 `config` > 内置默认值**。分发包自带的默认行见
 [`packages/plugin/cordis.patch.yml`](./packages/plugin/cordis.patch.yml)。
 
-| 键                         | 默认                  | 说明                                                                                                                                                                               |
-| -------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                  | `true`                | 关掉即整行不干活                                                                                                                                                                   |
-| `serverUrl`                | `ws://127.0.0.1:8787` | 中继地址。生产必须 `wss://`（写非回环的 `ws://` 只 warn 不拦，但明文链路上配对码可见）                                                                                             |
-| `hostTokenEnv`             | `DRC_HOST_TOKEN`      | **token 所在的环境变量名**。token 本身不进 patch                                                                                                                                   |
-| `hostLabel`                | `dsh-host`            | 手机上显示的主机名                                                                                                                                                                 |
-| `keepAwake.enabled`        | `true`                | 有会话时阻止系统休眠                                                                                                                                                               |
-| `keepAwake.idleReleaseSec` | `300`                 | 空闲多久后释放防休眠                                                                                                                                                               |
-| `unarchiveOnPrompt`        | `true`                | 收到指令时自动取消会话归档                                                                                                                                                         |
-| ~~`takeOverQuestions`~~    | `false`               | **已不生效**：提问改成像审批那样**参与** `user-questions/request` 这条 waterfall，两端同弹、谁先答谁算，不再有「接管」这回事（这个键此刻还没删，是因为它正被另一条在飞的改动占着） |
-| `approvalTimeoutSec`       | `180`                 | 审批等待上限                                                                                                                                                                       |
-| `pairTtlMs`                | `120000`              | 向中继申请 PSK 的有效期；**服务端权威值会覆盖它**                                                                                                                                  |
-| `pill.enabled`             | `true`                | 状态栏那颗 pill = **配对的唯一入口**。关掉它这台主机就没有配对入口，会留一条 `warn:pill`                                                                                           |
-| `conversationIdleTtlSec`   | `86400`               | 空闲多久剪掉一条配对通道（不接受"永不剪枝"）                                                                                                                                       |
+| 键                         | 默认                  | 说明                                                                                                                                                                                         |
+| -------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                  | `true`                | 关掉即整行不干活                                                                                                                                                                             |
+| `serverUrl`                | `ws://127.0.0.1:8787` | 中继地址。生产必须 `wss://`（写非回环的 `ws://` 只 warn 不拦，但明文链路上配对码可见）                                                                                                       |
+| `hostTokenEnv`             | `DRC_HOST_TOKEN`      | **token 所在的环境变量名**。token 本身不进 patch                                                                                                                                             |
+| `hostLabel`                | `dsh-host`            | 手机上显示的主机名                                                                                                                                                                           |
+| `keepAwake.enabled`        | `true`                | 有会话时阻止系统休眠                                                                                                                                                                         |
+| `keepAwake.idleReleaseSec` | `300`                 | 空闲多久后释放防休眠                                                                                                                                                                         |
+| `unarchiveOnPrompt`        | `true`                | 收到指令时自动取消会话归档                                                                                                                                                                   |
+| ~~`takeOverQuestions`~~    | —                     | **已删除**：提问改成像审批那样**参与** `user-questions/request` 这条 waterfall，两端同弹、谁先答谁算，不再有「接管」这回事（patch 里还留着这个键不报错也不生效，删掉即可）                   |
+| `approvalTimeoutSec`       | `180`                 | 审批等待上限                                                                                                                                                                                 |
+| `pairTtlMs`                | `120000`              | 向中继申请 PSK 的有效期；**服务端权威值会覆盖它**                                                                                                                                            |
+| `pill.enabled`             | `true`                | 状态栏那颗 pill = **配对的唯一入口**。关掉它这台主机就没有配对入口，会留一条 `warn:pill`                                                                                                     |
+| `conversationIdleTtlSec`   | `86400`               | 空闲多久剪掉一条配对通道（不接受"永不剪枝"）                                                                                                                                                 |
+| `uploadDir`                | 空                    | 图片附件落盘目录。**空 = 拒收图片**（手机照常能发，主机会说明原因）                                                                                                                          |
+| `maxImageBytes`            | `4194304`             | 单张图片体积上限（4 MiB）。协议层只校"是不是 jpeg、几张"，校不了字节数                                                                                                                       |
+| `newSessionCwd`            | 空                    | 新建会话用的项目目录。空 = 跟着**最近一条会话**的目录走；一条会话都没有时才退回宿主默认（`process.cwd()`，真机上是 `/`——会话会挂在不属于任何用户项目的目录里，GUI 列表按项目分组就看不见它） |
 
 对应的环境变量覆盖见
 [`packages/plugin/src/shell/config.ts`](./packages/plugin/src/shell/config.ts)（`DRC_SERVER_URL`、

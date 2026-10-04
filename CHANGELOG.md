@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.3] - 2026-10-05
+
+### 新增：待办进历史回放（补上 2.0.2 留下的 v1 边界）
+
+进一条跑过的会话也立刻看得见待办，不用等下一次 `todo/write`。内核日志里的
+`todo/write` 事件本来就已被翻译成 KernelEvent，这一跳只是让它在历史页里也有位置
+（`historyWireItem` 不再丢 todo），并依赖 wire 1.5.0 的 historyItem 扩员。
+手机侧规则：只应用**第一页**（最新一页）的快照，更早页的是过期快照；
+已经在流的实时帧优先（后到者胜）。
+
+### 清理
+
+- 随包分发的 `cordis.patch.yml` 删掉 `takeOverQuestions` 死键（⑥ 的漏网，默认配置里还发着）；
+- README 配置表补 `uploadDir` / `maxImageBytes` / `newSessionCwd` 三行，`takeOverQuestions` 行改为“已删除”。
+
 ## [2.0.2] - 2026-10-05
 
 ### 新增：待办清单上屏（todo list）

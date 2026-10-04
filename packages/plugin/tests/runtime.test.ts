@@ -1465,9 +1465,46 @@ test('cmd.session_history：条目走与实时流同一批出站构造器，游�
     '条目顺序必须保持（升序），否则手机上整段历史是倒着讲的',
   )
   assert.equal(page.nextBeforeSeq, 9, '有更早的一页就必须把游标带回去，否则「加载更早」永远点不动')
-  // 运行态不许混进历史：回放历史不该去改顶栏。类型上本来就写不出来（条目只允许两种叶子载荷），
+  // 运行态不许混进历史：回放历史不该去改顶栏。类型上本来就写不出来（条目只允许三种叶子载荷），
   // 这里再对**产物**查一遍——schema 是运行期才拦的，而漏掉它只会静默生效。
   assert.equal(JSON.stringify(page.items).includes('run_state'), false)
+})
+
+test('cmd.session_history：待办快照也走同一条路径（一页最后一条 = 那一页截止时的清单）', async () => {
+  const { runtime, transport, kernel } = fixture()
+  kernel.readHistory = (sessionId) =>
+    Promise.resolve({
+      events: [
+        { kind: 'delta', sessionId, messageId: 'm1', text: '把待办补进历史', role: 'user', done: true },
+        { kind: 'todo', sessionId, todos: [{ content: '改完跑全链路', status: 'in_progress' }] },
+        { kind: 'todo', sessionId, todos: [{ content: '改完跑全链路', status: 'completed' }] },
+      ],
+      nextBeforeSeq: 12,
+    })
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+  transport.replies.length = 0
+
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSessionHistory, { sessionId: 'ses_live', limit: 3 }),
+    'c_000000000001',
+  )
+  await settle()
+
+  const pages = transport.replies
+    .map((item) => item.payload)
+    .filter((payload) => payload.t === PAYLOAD_TYPES.evSessionHistory)
+  assert.equal(pages.length, 1)
+  const page = pages[0] as Extract<EvPayload, { t: 'ev.session_history' }>
+  assert.deepEqual(
+    page.items.map((item) => item.t),
+    ['ev.message_delta', 'ev.todo', 'ev.todo'],
+    '两条快照都要在（全量语义，不折叠）',
+  )
+  const last = page.items[page.items.length - 1] as Extract<EvPayload, { t: 'ev.todo' }>
+  assert.deepEqual(last.todos, [{ content: '改完跑全链路', status: 'completed' }], '最后一条是那一页截止时的清单')
+  assert.equal('sessionId' in last, false, '条目里不带 sessionId（外层已经带了）')
 })
 
 test('cmd.session_history：内核没有这个能力时明确拒绝，绝不回一张空页', async () => {

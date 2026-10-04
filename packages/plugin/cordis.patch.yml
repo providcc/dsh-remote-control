@@ -12,7 +12,6 @@
         hostTokenEnv: DRC_HOST_TOKEN
         hostLabel: dsh-host
         unarchiveOnPrompt: true
-        takeOverQuestions: false
         listingRefreshSec: 15
         approvalTimeoutSec: 180
         keepAwake:
