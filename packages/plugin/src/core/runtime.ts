@@ -64,6 +64,12 @@ export interface RuntimeOptions {
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
 }
 
+/**
+ * 这次等待是**被谁**收的场。只有不是手机收的场才需要给 `settle()` 传它——
+ * 一传就意味着手机上那张卡在本侧已经作废，得当场把它收掉（见 `voidStaleCard`）。
+ */
+type VoidReason = 'desktop' | 'withdrawn' | 'timeout'
+
 interface PendingInteraction {
   conversationId: string
   sessionId: string
@@ -465,8 +471,7 @@ export class HostRuntime {
     this.sleep.hold(id)
     const answered = await new Promise<ApprovalDecision>((resolve) => {
       const timer = this.clock.setTimeout(() => {
-        this.pending.delete(id)
-        resolve('decline')
+        this.settle(id, 'decline', 'timeout')
       }, this.options.approvalTimeoutMs)
       this.pending.set(id, {
         conversationId,
@@ -476,7 +481,14 @@ export class HostRuntime {
         kind: 'approval',
         askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, 'cancelled'), { once: true })
+      // `reason` 是 `carrier-services.participate()` 打的标记：'desktop' = 桌面先答了，
+      // 其余（'platform'）是宿主自己把这次请求撤了。两种都要让手机把卡收掉，
+      // 但说出来的话不一样。
+      info.signal?.addEventListener(
+        'abort',
+        () => this.settle(id, 'cancelled', info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+        { once: true },
+      )
       this.replyTo(
         conversationId,
         permissionRequest({
@@ -493,13 +505,8 @@ export class HostRuntime {
     // 结算点（settleApproval）已经把手机的 'approve'/'reject' 翻成平台词汇了，
     // 这里不再翻第二次——两处映射表迟早会分叉。
     //
-    // 手机没被点过（我们超时、桌面先答、平台撤回）时，这张挂在手机上的卡**在本侧已经作废**：
-    // `pending` 条目删掉了、`waiting` 角标归零、防休眠的 hold 也放了。
-    // 但手机上那张卡要等到它自己的倒计时走完才会消失——把它立刻收掉需要
-    // `ev.permission_resolved`（协议里已经有了：wire `66e9a63`），而本仓的 `dsh-remote-wire`
-    // 是从 npm 装的 1.1.0，那份里还没有这一帧。**等带它的 wire 版本发布后接上**，
-    // 追踪条目在伞仓 HANDOFF §3.10。这里不留本地伪造的帧：类型上骗过一次，
-    // 下一次改协议的人就再也对不上账了。
+    // 手机没被点过（超时、桌面先答、平台撤回）时那张卡的作废在 `settle()` 里就发了，
+    // 不用在这里补第二次：那一处同时管审批与提问两类卡。
     return answered
   }
 
@@ -514,8 +521,7 @@ export class HostRuntime {
     this.sleep.hold(id)
     const answer = await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
       const timer = this.clock.setTimeout(() => {
-        this.pending.delete(id)
-        resolve(null)
+        this.settle(id, null, 'timeout')
       }, this.options.questionTimeoutMs)
       this.pending.set(id, {
         conversationId,
@@ -526,7 +532,7 @@ export class HostRuntime {
         kind: 'question',
         askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, null), { once: true })
+      info.signal?.addEventListener('abort', () => this.settle(id, null, 'withdrawn'), { once: true })
       this.replyTo(
         conversationId,
         questionRequest({
@@ -571,12 +577,41 @@ export class HostRuntime {
     return true
   }
 
-  private settle(id: string, value: unknown): void {
+  private settle(id: string, value: unknown, voidAs?: VoidReason): void {
     const item = this.pending.get(id)
     if (!item) return
     this.pending.delete(id)
     this.clock.clearTimeout(item.timer)
+    // 只有"不是手机自己点的"才需要作废：那种情况下手机上那张卡还亮着，而它已经没用了。
+    if (voidAs) this.voidStaleCard(id, item.sessionId, voidAs)
     item.resolve(value)
+  }
+
+  /**
+   * 让手机上那张已经作废的卡片**当场**收掉。
+   *
+   * 为什么用 `ev.run_state` 而不是新加一帧：这条帧就是小程序认定的"挂着的审批/提问卡作废"
+   * 信号（`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
+   * 并且停掉那条还在走的本地倒数），而**用户手机上现在装的这一版就认它**——不必等重新上传小程序。
+   * 协议里那条按 requestId 精确收单的 `ev.permission_resolved` 仍是要走的终点，
+   * 但它得先有一版带它的 wire 发布（伞仓 HANDOFF §3.10）。
+   *
+   * 内核**不会**为"审批被别人答掉了"发状态跳变（这一回合自始至终是 running），
+   * 所以这一帧只能由我们补发；补发的是**当前真相**而不是硬编码 `running`——
+   * 手机上那个"思考中"跟着这一帧走，发错方向会一直错到下一次真实跳变。
+   * 读不到真相时退回缓存快照，再退 `idle`：宁可少一个转圈，不能凭空多一个转圈。
+   */
+  private voidStaleCard(requestId: string, sessionId: string, reason: VoidReason): void {
+    const emit = (running: boolean): void => {
+      this.broadcast(runState({ sessionId, state: running ? 'running' : 'idle' }))
+      this.log('pending card voided', { requestId, reason, state: running ? 'running' : 'idle' })
+    }
+    void this.kernel
+      .runState(sessionId)
+      .then((truth) => emit(truth.running))
+      .catch(() => {
+        emit(this.sessions.some((item) => item.id === sessionId && item.running === true))
+      })
   }
 
   /**

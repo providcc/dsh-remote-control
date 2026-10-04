@@ -454,6 +454,152 @@ test('手机超时不算答案：桌面稍后给出的真决定必须赢（不�
   )
 })
 
+/**
+ * 这三条钉的是**反方向**那一半：手机先答之后，桌面那张卡也得当场消失。
+ *
+ * 句柄只有一个：链子下游那份 `request.signal`。宿主的 api-gateway 在它的 signal 断掉时
+ * 向每个渲染端推 `{type:'cancel', eventId}`，渲染端据此 `PendingApproval.abort()`
+ * ——卡片由宿主自己的代码收，插件只是宣告"这次请求结束了"。
+ * 所以这里要钉的是"我们有没有把那个句柄拿到手、并且在对的时刻按一下"。
+ */
+test('手机先答时必须撤销交给下游的那份 signal——那是关掉桌面那张卡的唯一句柄', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let phoneSignal: AbortSignal | undefined
+  kernel.attachInteractionSink!({
+    approval: async (info: { signal?: AbortSignal }) => {
+      phoneSignal = info.signal
+      return 'allowed-once'
+    },
+    question: async () => null,
+  })
+  const platform = new AbortController()
+  const request: { agent: { session: { id: string } }; toolName: string; signal?: AbortSignal } = {
+    agent: { session: { id: 'ses_live' } },
+    toolName: 'write_file',
+    signal: platform.signal,
+  }
+  // 桌面那一半**在被调用时**才读 `request.signal`（网关的 `projected.signal` 就是这么取的），
+  // 所以这里也在回调里读，而不是在调用之前读一份快照。
+  let downstream: AbortSignal | undefined
+  const pending = listeners['approval/request']!(request, () => {
+    downstream = request.signal
+    // 桌面上一直没人点：手机答完之后这张卡就靠我们那一下撤销来收。
+    return new Promise<string>(() => {})
+  })
+  assert.equal(await pending, 'allowed-once')
+  assert.notEqual(
+    downstream,
+    platform.signal,
+    '下游拿到的还是原件那份 signal：手机答完之后没有任何句柄能关掉桌面那张卡',
+  )
+  assert.equal(downstream?.aborted, true, '换到了句柄却没撤销：桌面那张卡照样挂着')
+  const described = kernel.describe() as Record<string, unknown>
+  assert.equal(
+    described.approvalSignalHandoff,
+    'fused',
+    `换 signal 的落点读不出来：${String(described.approvalSignalHandoff)}`,
+  )
+  assert.equal(
+    described.approvalDesktopVoided,
+    1,
+    '这一次撤销没进 status.json：线上就只能靠屏幕猜"桌面那张卡到底收没收"',
+  )
+  // 撤销**只该往下游传**：runtime 那侧的 signal 跟着断的话，手机自己点掉的这次会被
+  // 当成"被撤回"再作废一遍（`settle(id,'cancelled',…)` 会把答案盖掉）。
+  assert.equal(phoneSignal?.aborted, false, '我们把下游撤销了，却连 runtime 那侧一起撤了：手机的答案会被自己作废')
+})
+
+test('平台自己中断时并算后的 signal 要保住原来的取消能力（reason 也要带下去）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let phoneSignal: AbortSignal | undefined
+  kernel.attachInteractionSink!({
+    approval: async (info: { signal?: AbortSignal }) => {
+      phoneSignal = info.signal
+      // 手机这一侧被撤回后就是"没人答"（runtime 会结掉它）。
+      return new Promise<'decline'>((resolve) => {
+        info.signal?.addEventListener('abort', () => resolve('decline'), { once: true })
+      })
+    },
+    question: async () => null,
+  })
+  const platform = new AbortController()
+  const request: { agent: { session: { id: string } }; toolName: string; signal?: AbortSignal } = {
+    agent: { session: { id: 'ses_live' } },
+    toolName: 'bash',
+    signal: platform.signal,
+  }
+  let downstream: AbortSignal | undefined
+  let releaseDesktop: (value: string) => void = () => {}
+  const pending = listeners['approval/request']!(
+    request,
+    () =>
+      new Promise<string>((resolve) => {
+        downstream = request.signal
+        releaseDesktop = resolve
+      }),
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  const reason = new Error('turn cancelled')
+  platform.abort(reason)
+  assert.equal(downstream?.aborted, true, '平台都中断了、下游那份却没跟着断：并算把宿主的取消能力换掉了')
+  assert.equal(downstream?.reason, reason, 'reason 要原样带下去：渲染端靠它说明这张卡为什么消失')
+  assert.equal(phoneSignal?.aborted, true, '手机那一侧同样要收到撤回，否则它会挂到超时')
+  releaseDesktop('unavailable')
+  assert.equal(await pending, 'unavailable', '平台中断且两边都没答时必须交还失败闭合（宿主自己判 cancelled）')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalDesktopVoided,
+    0,
+    '这一场不是手机答的，那颗计数器不该动',
+  )
+})
+
+test('请求对象的 signal 不可写时不许抛：换不出去就退回"卡片等它自己的生命周期"', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.attachInteractionSink!({ approval: async () => 'allowed-once', question: async () => null })
+  const request: { agent: { session: { id: string } }; toolName: string; signal?: AbortSignal } = {
+    agent: { session: { id: 'ses_live' } },
+    toolName: 'write_file',
+  }
+  // 冻结这一个字段（ESM 严格模式下赋值会**抛** TypeError，那一抛会顺着 waterfall 把宿主的审批判死）。
+  Object.defineProperty(request, 'signal', {
+    value: new AbortController().signal,
+    writable: false,
+    enumerable: true,
+    configurable: false,
+  })
+  const outcome = await listeners['approval/request']!(request, async () => 'unavailable')
+  assert.equal(outcome, 'allowed-once', '换不出去也得照常把手机的答案交回去，审批不能因为我们这一行而失败')
+  assert.equal(request.signal?.aborted, false, '不可写时不许碰原件那份 signal（更不许因为换不出去就把审批判死）')
+  const handoff = String((kernel.describe() as Record<string, unknown>).approvalSignalHandoff)
+  assert.match(
+    handoff,
+    /^(failed|ignored)/,
+    `换不出去要说得出来（严格模式下赋值会抛，抛了就带原因）：否则"桌面那张卡为什么没关"在现场查不到`,
+  )
+  assert.equal((kernel.describe() as Record<string, unknown>).approvalDesktopVoided, 0)
+})
+
 test('takeOverQuestions=true 时才注册提问提供者；没有那个服务要说得出来', () => {
   const f = fixture()
   const services = f.bundle({ live: true })

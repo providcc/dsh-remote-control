@@ -100,6 +100,37 @@ export interface ServicesBundle {
  */
 const APPROVAL_SUBSCRIBE_OPTIONS = { global: true, prepend: true } as const
 
+/**
+ * 把"平台的中断"与"这次审批已经结算"并成一条 signal，交给链子下游的应答者。
+ *
+ * 为什么只有 `AbortSignal.any` 这一种形状：参与者**没法用返回值换掉下游收到的请求**——
+ * cordis 的 `waterfall` 里 `next = () => (cbs.shift() ?? inner)(...args)`，`next()` 的实参
+ * 被整个忽略，`args` 是派发时那一份（见 cordis `EventsService.waterfall`）。
+ * 能改的只有那个请求对象**自己身上**的字段，而下游（宿主的桌面 UI 经 api-gateway
+ * 转发的那条 remote event）是在它自己被调用时才读 `request.signal`：
+ * `startRemoteEvent()` 把 `projected.signal` 放进 `signals`，它一断就
+ * `cancelRemoteEvent()` → 向每个渲染端推 `{type:'cancel', eventId}` →
+ * 那一侧的 `PendingApproval.abort()` → 卡片由宿主自己的代码收掉。
+ *
+ * 所以这条并算是**宣告"这次请求结束了"**，不是替桌面决定结果：结果早已由先答的那一端给出。
+ * `engines` 声明的是 `>=20`，而 `AbortSignal.any` 是 20.3 才有的，故留一条手写的中继。
+ */
+function fuseSignals(platform: AbortSignal | undefined, ours: AbortSignal): AbortSignal {
+  if (!platform) return ours
+  const any = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  if (typeof any === 'function') return any.call(AbortSignal, [platform, ours])
+  const fused = new AbortController()
+  for (const source of [platform, ours]) {
+    if (fused.signal.aborted) break
+    if (source.aborted) {
+      fused.abort(source.reason)
+      break
+    }
+    source.addEventListener('abort', () => fused.abort(source.reason), { once: true })
+  }
+  return fused.signal
+}
+
 export interface ServicesOptions {
   clock: Clock
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
@@ -207,6 +238,17 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    */
   let approvalCalls = 0
   let approvalLast = 'not-called'
+  /**
+   * 手机先答之后，我们把下游那份 signal 撤销掉了几次（进 status.json）。
+   *
+   * 这一颗计数器是"桌面那张卡该消失"这一半唯一的**现场证据**：撤销发出去之后
+   * 宿主的 api-gateway 会向每个渲染端推 `{type:'cancel', eventId}`，卡片由宿主自己收。
+   * 屏幕上看不见那张卡到底收没收，就看这个数加没加——它加了而卡还在，问题在渲染端；
+   * 它没加，问题在我们这一侧（换 signal 那一步没生效）。
+   */
+  let approvalDesktopVoided = 0
+  /** 参与者能不能把可撤销的 signal 交给下游（`request.signal` 不可写时是 false，进 status.json）。 */
+  let approvalSignalHandoff = 'unknown'
   /**
    * 内核自己报出来的审批审计：**问过几次**与**最后一次是怎么收的场**（进 status.json）。
    *
@@ -830,10 +872,13 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    * 链子末端没人应答（`'unavailable'`）都不算答案**。把它们当答案的后果很具体：
    * 手机没电了会变成"自动拒绝"，而桌面上暂时没人会变成"手机还没点就失败"。
    *
-   * 桌面先答时我们会 `abort` 自己那条信号，`runtime` 收到之后向手机补一帧
-   * `ev.permission_resolved` 把卡收回去。**反方向收不了**：手机先答之后桌面那张卡要等
-   * 宿主自己的 `signal`（这次工具调用的生命周期）结束才消失——插件没有那个句柄，
-   * 这是"两边都弹"必须付的代价，写在注释里是为了下次别去找不存在的解。
+   * 桌面先答时我们会 `abort` 自己那条信号，`runtime` 收到之后向手机补一帧把卡收回去。
+   *
+   * **反方向也收得掉**（2026-10-04 补上这条，此前那段注释写的是"收不了"，那是没读到
+   * cordis `waterfall` 与 api-gateway `startRemoteEvent` 之前的结论）：手机先答之后我们
+   * 撤销交给下游的那份 signal，宿主的网关便向每个渲染端发 cancel，桌面那张卡按宿主
+   * 自己的代码消失。判据是 `approvalDesktopVoided` 这颗计数器——它加了而屏幕上卡还在，
+   * 问题就在渲染端；没加就是这一侧没换成功（`approvalSignalHandoff` 会说为什么）。
    */
   async function participate(args: unknown[]): Promise<string> {
     approvalCalls += 1
@@ -850,9 +895,31 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const controller = new AbortController()
     // 平台自己撤回这次请求时（回合被取消等）也必须让手机把卡收掉，所以把它的 signal 接回
     // 我们这条 controller 上——往下只传一个信号源，`reason` 用来区分"桌面先答"与"平台撤回"。
-    if (request?.signal) {
-      if (request.signal.aborted) controller.abort('platform')
-      else request.signal.addEventListener('abort', () => controller.abort('platform'), { once: true })
+    const platform = request?.signal
+    if (platform) {
+      if (platform.aborted) controller.abort('platform')
+      else platform.addEventListener('abort', () => controller.abort('platform'), { once: true })
+    }
+    // 手机先答之后要能宣告"这次请求结束了"，于是把下游拿到的 signal 换成并算后的那一份。
+    // 顺序很重要：**先抓原件再接上去**，否则我们自己也会被这次撤销绊一下（`controller`
+    // 一旦跟着断，runtime 会把手机刚点掉的那次应答当成"被撤回"再作废一遍）。
+    const canceller = new AbortController()
+    let handedOff = false
+    if (request) {
+      try {
+        const fused = fuseSignals(platform, canceller.signal)
+        request.signal = fused
+        handedOff = request.signal === fused
+        approvalSignalHandoff = handedOff ? 'fused' : 'ignored'
+      } catch (error) {
+        // 请求对象被冻结时赋值会抛（ESM 一律严格模式）。这里退回"桌面那张卡等它自己的
+        // 工具调用生命周期"——那是换 signal 之前的老行为，少收一张卡不至于更糟。
+        approvalSignalHandoff = `failed: ${messageOf(error)}`.slice(0, 80)
+      }
+    }
+    /** 结算之后一律撤销：手机先答时它是"关掉桌面那张卡"的那一下，其余分支只是 release。 */
+    const finish = (reason: string) => {
+      if (!canceller.signal.aborted) canceller.abort(reason)
     }
     // 桌面那一半**现在就启动**，不等手机。
     const desktop = Promise.resolve()
@@ -888,12 +955,21 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     if (winner.outcome === 'unavailable') {
       // 两边都没答上：交还链子末端的失败闭合（宿主自己解释成"没人可问"）。
       controller.abort('desktop')
+      finish('settled-without-answer')
       approvalLast = 'handed-back(neither answered)'
       return 'unavailable'
     }
-    // 桌面先答 → 手机那一侧要立刻作废（pending 条目删掉、`waiting` 归零、
-    // 等 wire 那一帧上线后连手机上的卡也会一起收掉）。
+    // 桌面先答 → 手机那一侧要立刻作废（pending 条目删掉、`waiting` 归零、连手机上的卡一起收掉）。
     if (winner.src === 'desktop') controller.abort('desktop')
+    if (winner.src === 'phone') {
+      // 手机先答 → 桌面那张卡作废。撤销之后网关的 cancel 会发给每一个渲染端。
+      finish('answered-by-phone')
+      // 只有真的把可撤销的句柄交下去了，这一笔才算"桌面那张卡由我们关掉"；
+      // 没换成功时按下去也没有任何东西会断，计数器不能替我们说谎。
+      if (handedOff) approvalDesktopVoided += 1
+    } else {
+      finish('answered-by-desktop')
+    }
     approvalLast =
       winner.src === 'phone' ? `answered-by-phone(${winner.outcome})` : `answered-by-desktop(${winner.outcome})`
     return winner.outcome
@@ -1006,6 +1082,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         approvalLast,
         approvalAsked,
         approvalDecided,
+        approvalDesktopVoided,
+        approvalSignalHandoff,
         questionsFace,
         listenerErrors:
           [...listenerErrors]
