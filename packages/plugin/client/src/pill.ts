@@ -4,10 +4,12 @@
  * 它做三件事：往宿主的 `conversation.composer.dock` 槽位注册一颗 pill，按节拍问
  * `GET /plugins/dsh-remote-control/status` 把连接状态写在上面，点击时弹面板。
  *
- * **面板的形状**（2026-10-03 重设计，以"精炼"为准）：抬头一行是状态 + 右上角那**一颗**动作按钮，
- * 下面三行**中继 / 状态 / 版本**（各自拿不到值时那一行不占地方）。那颗按钮跟着当前视图走：
- * 出图时是 `刷新`（同一条幂等发码路由 `POST /pairing/new`，`GET /pairing.png` 画进面板），
- * 其余情形**未配对**时是 `生成配对码`、**已配对**时是 `退出配对`（`POST /unpair`）。
+ * **面板的形状**（2026-10-03 重设计、2026-10-04 删掉中间那一屏）：**未配对点开直接就是二维码页**
+ * （`POST /pairing/new` + `GET /pairing.png` 画进面板），**已配对点开是状态**——抬头一行状态 +
+ * 右上角那**一颗**动作按钮，下面三行**中继 / 状态 / 版本**（各自拿不到值时那一行不占地方）。
+ * 那颗按钮只按"配没配上"分两种身份：没配上是 `刷新`（幂等发码：码还在就还是它、过期了才换新的），
+ * 配上了是 `退出配对`（`POST /unpair`）。原来"未配对 → 先按一颗「生成配对码」才出码"那一屏
+ * 与那颗按钮一起删掉了：没配上时这一屏没有任何别的内容可看，多点一次没有换到任何东西。
  * 更早那版是四行"本机 / 中继 / 状态 / 已配对"，随后收成"只剩中继"、用户嫌单薄又补两条凑三行：
  * 留下的是"连的哪一台 / 连没连上 / 跑的是哪一版"，本机名与台数不上屏——抬头那句已经是状态，
  * 台数只可能是 0 或 1。`再配一台`、`换一张` 与"倒计时走完自动补一张"也在这一轮删掉了：
@@ -440,9 +442,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   /**
    * 抬头一行：左边状态、右边动作。**面板唯一那颗动作按钮就收在这里**（面板的右上角）。
    *
-   * 它跟着当前视图走：正在出图时是 `刷新`（同一条幂等发码路由，码还在就还是它、过期了才换新的），
-   * 其余情形按配没配上给 `生成配对码` / `退出配对`。原来二维码那一版仍印着 `生成配对码`，
-   * 同一件事两个说法，2026-10-03 用户按真屏幕改掉了。
+   * 2026-10-04 这一轮把"未配对 → 先生成配对码"那一屏删掉了：**未配对时点开就是二维码页**，
+   * 所以那颗按钮只剩两种身份——配上了是 `退出配对`，没配上是 `刷新`（重要一张码，
+   * 走同一条幂等发码路由：码还在就还是它、过期了才换新的）。原来"生成配对码 / 刷新"
+   * 是同一件事的两个说法，而删掉那一屏之后连这个歧义都不存在了。
    *
    * 状态那句话跟那颗 pill 读同一份 `pillLabel(lastStatus)`，所以面板开着时轮询一回来
    * （比如手机上刚扫完码）这句话就跟着变。
@@ -456,12 +459,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     head.appendChild(stateText)
     const actions = doc.createElement('div')
     actions.className = 'drc-actions'
-    const action =
-      view.kind === 'qr' || view.kind === 'loading'
-        ? { label: '刷新', run: requestPairing }
-        : pairedNow() > 0
-          ? { label: '退出配对', run: requestUnpair }
-          : { label: '生成配对码', run: requestPairing }
+    const action = pairedNow() > 0 ? { label: '退出配对', run: requestUnpair } : { label: '刷新', run: requestPairing }
     actions.appendChild(buttonOf(action.label, () => void action.run()))
     head.appendChild(actions)
     return head
@@ -488,15 +486,21 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       })
   }
 
+  /**
+   * 画当前这一屏：**抬头 + 视图主体 + 那几行正文**，三种视图都带正文那几行。
+   *
+   * 原来二维码那一屏是 `return` 掉的（正文只在状态屏出现），但"未配对点开就是二维码页"之后
+   * 那一屏成了未配对时唯一的一屏——把正文藏起来就等于把"连的哪一台 / 连没连上 / 跑的是哪一版"
+   * 和"这台机器上有没有回合被卡住"四条事实一起删了（伞仓 docs/PRODUCT.md §3 第 2 条要它们在场）。
+   * `loading` 也照带：它只有几百毫秒，不带会让面板先窄后宽地跳一次。
+   */
   const paint = (): void => {
     if (!panel) return
     panel.replaceChildren()
     panel.appendChild(header())
     if (view.kind === 'loading') {
       panel.appendChild(text('p', 'drc-note', '正在生成配对码…'))
-      return
-    }
-    if (view.kind === 'qr') {
+    } else if (view.kind === 'qr') {
       const image = doc.createElement('img')
       image.className = 'drc-qr'
       image.setAttribute('alt', '配对二维码')
@@ -505,9 +509,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路）。
       panel.appendChild(text('p', 'drc-code', view.token))
       panel.appendChild(text('p', 'drc-note', qrNote()))
-      return
-    }
-    if (view.kind === 'unavailable' || view.kind === 'failed') {
+    } else if (view.kind === 'unavailable' || view.kind === 'failed') {
       const note =
         view.kind === 'unavailable'
           ? text('p', 'drc-note', view.reason)
@@ -596,10 +598,16 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     }
     if (disposed || !panel) return
     if (lastStatus) lastStatus = { ...lastStatus, paired: 0 }
-    view = { kind: 'info' }
+    // 退完配对这一刻就"没配上"了，而没配上时这一屏唯一的内容就是下一张码（见 `openPanel` 那条分支）：
+    // 直接进二维码页，不让用户退完之后再去别处找发码的入口——那个入口已经删掉了。
+    //
+    // 这里**故意不立刻补一次 `/status` 轮询**：乐观翻面与"对账"撞在同一个 tick 里，
+    // 翻面就等于没翻（宿主那条路由是异步作废的，秒回的多半还是 `paired:1`）。
+    // 对账交给下一次 2 秒节拍——那才是这句注释原来说的"真相会带回来"。
     write()
+    view = { kind: 'loading' }
     paint()
-    void pollStatus()
+    void requestPairing()
   }
 
   const openPanel = (): void => {
@@ -612,15 +620,24 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     root.appendChild(panel)
     button.setAttribute('aria-expanded', 'true')
     /**
-     * 点开**只给状态与那颗按钮**，发码要人再按一下右上角那颗。
+     * **未配对 → 点开就是二维码页；已配对 → 点开只给状态**（发码这一步在 2026-10-04 删掉了：
+     * 没配上的时候那颗按钮存在的唯一意义就是把人往二维码页推一步，而"未配对还点开看别的"
+     * 不存在——面板上没有任何别的东西可看）。
      *
-     * 原来这里是"点 pill = 发码"，因为那颗 pill 唯一的用途就是配对。现在抬头那句已经是
-     * 状态（`未配对` / `已配对`），点它的第一预期变成"看一眼连得怎么样"，于是发码不再是
-     * 点开的副产品：一张码是有寿命的资源，`ensureFresh` 虽然幂等，把"看一眼"接到它上面
-     * 就等于每次点开都可能向中继申请一张新的挂在 pending 表里。
+     * 这一条把 2026-10-03 那次"点开不发码"的取舍**反转了一半**：当时守的是
+     * "看一眼不该消耗一张有寿命的 pending 码"，现在守的是同一件事，但只守**配上了**的那一侧——
+     * 已配对时点开仍然一次码都不发（`pairedNow() > 0` 那条分支）。没配上时那张码就是这一屏
+     * 唯一的内容，发它不算消耗，不发才是让人多点一次那颗注定要点一次的按钮。
+     *
+     * `POST /pairing/new` 是幂等的：码还活着就还是那一张，所以下面这句在"重复点开"时
+     * 不会把 pending 表堆成一串码。
      */
-    view = { kind: 'info' }
-    paint()
+    if (pairedNow() > 0) {
+      view = { kind: 'info' }
+      paint()
+    } else {
+      void requestPairing()
+    }
     try {
       panel.focus()
     } catch {

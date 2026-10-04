@@ -243,18 +243,15 @@ async function flush(): Promise<void> {
 }
 
 /**
- * 走"点开 → 再按发码那颗"这两步。
+ * **未配对时点一下那颗 pill 就够了**（2026-10-04 改的）：直接进二维码页，
+ * 中间那一屏"先按一颗「生成配对码」才出码"已经删掉。
  *
- * 第二步是**这条用例存在的原因**：点开那颗 pill 只给状态，发码必须人再按一次，
- * 所以任何"看 QR / 看 6 位码 / 看倒计时"的断言都得先按这一下。少按一下就等于在断言
- * "面板停在信息上"，那条就会假绿。
+ * 所以这个 helper 现在只做一件事：点开 + 让那次自动发码的回答落地。
+ * 它仍然必须 `await flush()`——不 flush 就是在断言"面板停在 loading 上"，
+ * 那条会让所有"看 QR / 看 6 位码 / 看倒计时"的断言假绿。
  */
 async function openPairing(root: FakeElement): Promise<void> {
   root.find('drc-pill')!.emit('click')
-  await flush()
-  const button = root.find('drc-btn')
-  assert.ok(button, `面板里必须有一颗能按的按钮：${root.allText()}`)
-  button!.emit('click')
   await flush()
 }
 
@@ -588,7 +585,16 @@ test('页面不可见时不轮状态（Electron 里窗口在后台是常态）',
   )
 })
 
-test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文就是中继/状态/版本三行', async () => {
+/**
+ * 面板的两屏（2026-10-04 定形）：**未配对点开就是二维码页，已配对点开只给状态。**
+ *
+ * 原来这里是"未配对点开只给状态 + 一颗「生成配对码」"，那一屏被删掉了：没配上时面板上
+ * 没有任何别的东西可看，多点一次只换到一次"啊，原来在这儿"。
+ * 2026-10-03 那条取舍守的东西没有作废，只是挪了位置——**它现在守已配对那一侧**：
+ * 配上了之后点开仍然一次码都不发（见下面那条 paired 的用例），因为那时点开的第一预期
+ * 确实是"看一眼连得怎么样"，而一张码是有寿命的 pending 资源。
+ */
+test('未配对点开直接就是二维码页：发一次码、图与 6 位码都在，那颗按钮叫「刷新」', async () => {
   const harness = load({ react: FAKE_REACT, slots: true })
   const root = harness.mountPill()
   await flush()
@@ -596,16 +602,51 @@ test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文�
   await flush()
 
   assert.ok(root.find('drc-panel'), '面板要弹出来')
+  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
+  assert.ok(root.find('drc-qr'), `未配对点开就该在二维码页上，实际：${root.allText()}`)
+  assert.ok(root.find('drc-code'), '6 位码要单独印一行（QR 扫不出来时那是唯一退路）')
+  assert.equal(
+    harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    1,
+    '点开要发**且只发一次**码：这条路由幂等，但一次点开排两次是白耗中继的 pending 表',
+  )
+  assert.equal(root.find('drc-btn')!.textContent, '刷新', '没配上时那颗按钮的身份就是"再要一张码"')
+  // 正文那几行在未配对这一屏也要在场：它回答的是"连的哪一台 / 连没连上 / 跑的是哪一版"。
+  const rows = root
+    .findAll('drc-info')
+    .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
+  // 夹具里 `waiting: 0`，所以"待处理"那一行自己不占地方，正文就是这三行（次序也是判据）。
+  assert.deepEqual(rows, [
+    ['中继', 'relay.example.com:443'],
+    ['状态', '已连接'],
+    ['版本', '0.0.0-test'],
+  ])
+  assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
+  // 已删掉的说法（这一轮又少了两个）：本机名、台数、再配一台、换一张、生成配对码。
+  const flat = root.allText()
+  for (const gone of ['本机', '已配对', '再配一台', '换一张', '生成配对码']) {
+    assert.ok(!flat.includes(gone), `删掉的说法不该再出现：「${gone}」在 ${flat}`)
+  }
+})
+
+test('已配对点开只给状态，一次码都不发；正文就是中继/状态/版本三行', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1 } })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
     0,
-    '点开就发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
+    '配上之后点开还发码 = 每次"看一眼"都可能向中继申请一张新的挂在 pending 表里',
   )
-  // 抬头那句状态与那颗 pill 同一个来源：面板开着时也读它。
-  assert.equal(root.find('drc-head-label')!.textContent, '未配对')
-  const rows = root.findAll('drc-info')
+  assert.equal(root.find('drc-head-label')!.textContent, '已配对')
+  assert.ok(!root.find('drc-qr'), '已配对那一屏不该有二维码')
+  const rows = root
+    .findAll('drc-info')
+    .map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent])
   assert.deepEqual(
-    rows.map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent]),
+    rows,
     [
       ['中继', 'relay.example.com:443'],
       ['状态', '已连接'],
@@ -613,14 +654,6 @@ test('点开只给状态 + 右上角那颗按钮，不许顺手发码；正文�
     ],
     `正文就那三行、按这个次序：${root.allText()}`,
   )
-  assert.ok(!root.allText().includes('wss://'), `面板里不许出现完整 URI：${root.allText()}`)
-  // 这一轮真正删掉的说法：本机名、台数、再配一台、换一张。`状态` 与 `版本` 是**这一轮补回来的**，
-  // 所以它们不在禁列里（上一版那条禁令在这两处会假红）。
-  const flat = root.allText()
-  for (const gone of ['本机', '已配对', '再配一台', '换一张']) {
-    assert.ok(!flat.includes(gone), `这一轮删掉的说法不该再出现：「${gone}」在 ${flat}`)
-  }
-  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
 })
 
 /**
@@ -809,7 +842,10 @@ test('已经配上时右上角那颗是"退出配对"，按下就打 POST /unpai
   )
   // 乐观翻面：不用等下一次 2 秒轮询，抬头与那颗按钮当场就变。
   assert.equal(root.find('drc-head-label')!.textContent, '未配对')
-  assert.equal(root.find('drc-btn')!.textContent, '生成配对码')
+  // 退完之后不再是"先按一颗生成配对码"那一屏：**没配上就直接在二维码页上**，
+  // 那颗按钮的身份同时翻成 `刷新`（要再换一张码还是它）。
+  assert.equal(root.find('drc-btn')!.textContent, '刷新')
+  assert.ok(root.find('drc-qr'), `退出配对之后面板该停在二维码页，实际：${root.allText()}`)
 })
 
 test('退出配对那条断了：面板不白屏、抬头仍按乐观结果翻面，并且留下一行 warn', async () => {
