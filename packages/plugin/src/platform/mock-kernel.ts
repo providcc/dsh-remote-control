@@ -61,6 +61,16 @@ function defaultHistory(sessionId: string): KernelEvent[] {
     { kind: 'delta', sessionId, messageId: 'mock_h3', text: '结构清楚了。', role: 'assistant', done: true },
     { kind: 'delta', sessionId, messageId: 'mock_h4', text: '再跑一遍测试', role: 'user', done: true },
     { kind: 'delta', sessionId, messageId: 'mock_h5', text: '测试全过。', role: 'assistant', done: true },
+    // 2026-10-05 补：待办快照也进历史页（wire 1.5.0）。放在最后——一页里最后一条
+    // 就是那一页截止时的清单，本地全链路要真的走到这条路径，而不是只在单测里摆帧。
+    {
+      kind: 'todo',
+      sessionId,
+      todos: [
+        { content: '复现用户报的问题', status: 'completed' },
+        { content: '改完跑一遍本地全链路', status: 'in_progress' },
+      ],
+    },
   ]
 }
 
