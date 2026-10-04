@@ -544,6 +544,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     return {
       relay: relay ? relayState() : 'idle',
       paired: relay?.clientCount ?? 0,
+      // 配对簿里几条会话 = 配对还在不在。为什么必须与 paired 分开：pair-store 之后
+      // 配对按 D3 长存、落盘，手机退后台只是 socket 断——只用 clientCount 回答 配没配上，
+      // 用户把小程序放进后台的每一分钟，桌面那颗 pill 都会说 未配对，点开还会烧一张
+      // 不需要的新码（2026-10-04 用户报的误解）。
+      pairings: relay?.conversationCount ?? 0,
       serverUrl: config.serverUrl,
       version: PLUGIN_VERSION,
       waiting: waiting.count,

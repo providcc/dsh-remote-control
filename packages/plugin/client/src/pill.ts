@@ -72,6 +72,7 @@ export type CreateElement = (type: unknown, props: Record<string, unknown>) => u
 interface StatusAnswer {
   relay?: unknown
   paired?: unknown
+  pairings?: unknown
   serverUrl?: unknown
   version?: unknown
   waiting?: unknown
@@ -134,8 +135,10 @@ export type PanelView =
  *
  * 抬头那句只说**结论**，不说数量也不说进度：`已连 N 台` 在那一排被压窄时会竖着断行（真屏幕
  * 踩过，见 CSS），而"配对中"这种中间态写在抬头上没人看得懂——码是不是还在、还剩几秒，
- * 点进去的弹窗里都有（面板抬头读的就是这一句，同一份来源）。所以未配上的两种情形
+ * 点进去的弹窗里都有（面板抬头读的就是这一句，同一份来源）。所以"没配上"的两种情形
  * （没有效码 / 有码还没人扫）合成一句 `未配对`，灯跟着走灰色：灰色才是"还没配上"的颜色。
+ * 2026-10-04 添了第三种：**手机离线**（簿里还有会话、一台都没连着）——配对按 D3 长存，
+ * 那不是"没配上"（见下面那一支）。
  *
  * 四种 tone 就是四种颜色：`off` 灰（未启动 / 未配对）、`wait` 黄（连接中）、`on` 绿（已配对）、
  * `error` 红（已断开连接）。2026-10-03 用户按真屏幕要的：断链必须红，不能和"没配上"同一个灰。
@@ -157,6 +160,11 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
     if (waiting > 0) return { text: `等 ${waiting} 件事`, tone: 'wait' }
     return { text: '已配对', tone: 'on' }
   }
+  // 一台都没连着、但密钥簿里还有会话 = **配过对，手机只是不在线**（小程序退后台、手机关屏）。
+  // 配对按 D3 长存且 pair-store 落盘，手机回前台自动重连——这不是「没配上」：
+  // 那一态说「未配对」是让用户去扫一个不需要扫的码（2026-10-04 用户报的误解）。
+  // 灯走黄（wait）：不是故障，也不是「可以用了」，是「等它自己回来」。
+  if (pairingCount(status) > 0) return { text: '手机离线', tone: 'wait' }
   return { text: '未配对', tone: 'off' }
 }
 
@@ -164,6 +172,18 @@ export function pillLabel(status: StatusAnswer | undefined): { text: string; ton
 export function waitingCount(status: StatusAnswer | undefined): number {
   const count = status?.waiting
   return typeof count === 'number' && count > 0 ? Math.min(Math.floor(count), 99) : 0
+}
+
+/**
+ * 密钥簿里还有几条会话 = 「配对还在不在」。
+ *
+ * 与 `paired`（此刻有几台手机连着）是两件事：手机关了小程序只是 socket 断，
+ * 簿还在、回前台自动重连（pair-store，D3）。老版路由没这个字段时算 0——
+ * 那一态退回「未配对」：宁可把「没配上」说轻，也不把「没配上」说成「配上了」。
+ */
+export function pairingCount(status: StatusAnswer | undefined): number {
+  const count = status?.pairings
+  return typeof count === 'number' ? count : 0
 }
 
 /** `37 秒` / `4 分 12 秒` / `12 分`。十分钟以上不再报秒——这行是扫一眼的，不是秒表。 */
@@ -409,7 +429,13 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   let disposed = false
 
   /** 面板上那颗按钮的文案要跟着抬头那句走，所以这里读的是同一份轮询结果。 */
-  const pairedNow = (): number => (typeof lastStatus?.paired === 'number' ? lastStatus.paired : 0)
+  /**
+   * 「配没配上」读的是**密钥簿**（pairings），不是此刻有几台手机连着（paired）。
+   * 2026-10-04 改的：pair-store 之后配对按 D3 长存，手机退后台只是 socket 断——
+   * 用 paired 判断「配没配上」，用户把小程序放进后台的每一分钟，这四处
+   * （抬头、按钮身份、点开发不发码、配好后翻不翻面）全都会说「未配对」。
+   */
+  const pairingNow = (): number => pairingCount(lastStatus)
 
   const write = (): void => {
     const next = pillLabel(lastStatus)
@@ -459,10 +485,17 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     head.appendChild(stateText)
     const actions = doc.createElement('div')
     actions.className = 'drc-actions'
-    const action = pairedNow() > 0 ? { label: '退出配对', run: requestUnpair } : { label: '刷新', run: requestPairing }
+    const action = pairingNow() > 0 ? { label: '退出配对', run: requestUnpair } : { label: '刷新', run: requestPairing }
     actions.appendChild(buttonOf(action.label, () => void action.run()))
     head.appendChild(actions)
     return head
+  }
+
+  /** 「手机离线」那一屏的解释行；不是那个状态时返回 null（不占地方）。 */
+  const offlineNote = (): HTMLElement | null => {
+    if (!lastStatus) return null
+    if (pillLabel(lastStatus).text !== '手机离线') return null
+    return text('p', 'drc-note', '配对还在：小程序回前台会自动重连，不用重新扫码。')
   }
 
   /** 正文那几行（待处理 / 中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
@@ -521,6 +554,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       panel.appendChild(note)
     }
     for (const row of infoRows()) panel.appendChild(row)
+    // 手机离线那一屏要说清「不用重新扫码」：配对簿还在，小程序回前台自动重连。
+    // 不说这句，用户看到「手机离线」会去扫一个不需要扫的码（2026-10-04 用户提的误解）。
+    const note = offlineNote()
+    if (note) panel.appendChild(note)
   }
 
   const closePanel = (): void => {
@@ -597,7 +634,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       warn('退出配对请求失败（面板会靠下一次轮询对账）', error)
     }
     if (disposed || !panel) return
-    if (lastStatus) lastStatus = { ...lastStatus, paired: 0 }
+    // 配对簿同时清零：`POST /unpair` 作废的就是全部通道（会话簿里一条不剩），
+    // 只把 paired 归零会让抬头掉进"手机离线"——那是 2026-10-04 新加的第三态，
+    // 此刻真正的事实是"没配上了"。
+    if (lastStatus) lastStatus = { ...lastStatus, paired: 0, pairings: 0 }
     // 退完配对这一刻就"没配上"了，而没配上时这一屏唯一的内容就是下一张码（见 `openPanel` 那条分支）：
     // 直接进二维码页，不让用户退完之后再去别处找发码的入口——那个入口已经删掉了。
     //
@@ -626,13 +666,14 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
      *
      * 这一条把 2026-10-03 那次"点开不发码"的取舍**反转了一半**：当时守的是
      * "看一眼不该消耗一张有寿命的 pending 码"，现在守的是同一件事，但只守**配上了**的那一侧——
-     * 已配对时点开仍然一次码都不发（`pairedNow() > 0` 那条分支）。没配上时那张码就是这一屏
+     * 已配对时点开仍然一次码都不发（`pairingNow() > 0` 那条分支：读的是密钥簿，
+     * 手机退后台离线时也算「配上了」——不放码，那一屏只有正文）。没配上时那张码就是这一屏
      * 唯一的内容，发它不算消耗，不发才是让人多点一次那颗注定要点一次的按钮。
      *
      * `POST /pairing/new` 是幂等的：码还活着就还是那一张，所以下面这句在"重复点开"时
      * 不会把 pending 表堆成一串码。
      */
-    if (pairedNow() > 0) {
+    if (pairingNow() > 0) {
       view = { kind: 'info' }
       paint()
     } else {
@@ -690,7 +731,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
        * 那一张码配上之后就没用了，继续占着面板会让人以为"还没成功、再扫一次"，而且抬头那句
        * 已经翻成 `已配对`、右上角那颗也该换成 `退出配对` 了（2026-10-03 用户按真屏幕要的）。
        */
-      if (view.kind === 'qr' && pairedNow() > 0) {
+      if (view.kind === 'qr' && pairingNow() > 0) {
         view = { kind: 'info' }
         if (countTimer !== undefined) {
           clearInterval(countTimer)

@@ -506,8 +506,8 @@ test('pill 那四条挂上去的就是带守卫的那四条（接线，不是又
     const shown = JSON.parse(status.body) as Record<string, unknown>
     assert.deepEqual(
       Object.keys(shown).sort(),
-      ['paired', 'relay', 'serverUrl', 'version', 'waiting', 'waitingOldestSec'],
-      '状态路由多出字段就是要重新审一遍（这六个全是非凭据；本机名 2026-10-03 撤了）',
+      ['paired', 'pairings', 'relay', 'serverUrl', 'version', 'waiting', 'waitingOldestSec'],
+      '状态路由多出字段就是要重新审一遍（这七个全是非凭据；本机名 2026-10-03 撤了）',
     )
     assert.ok(shown.relay === 'offline' || shown.relay === 'connecting', `relay 取值：${String(shown.relay)}`)
     assert.equal(shown.paired, 0)
