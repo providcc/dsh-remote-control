@@ -15,6 +15,7 @@
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { defaultPairStoreFile } from './pair-store.js'
 
 export interface PluginConfig {
   enabled: boolean
@@ -32,18 +33,21 @@ export interface PluginConfig {
   pairOnStartSec: number
   /** 向中继申请 PSK 有效期；服务端权威值会覆盖它（见 transport/relay.ts）。 */
   pairTtlMs: number
-  /** 是否把配对二维码写成 PNG（默认**开**：文本二维码在 DSH 命令卡里扫不出来，见下方默认值注释）。 */
-  qrImage: boolean
-  qrOpen: boolean
-  /** 是否给文本二维码套 ANSI 反色。默认关：宿主按纯文本渲染时会把转义序列打成乱码。 */
-  qrAnsi: boolean
-  qrStyle: 'ascii' | 'block' | 'half'
   /** 强 carrier 未到时，等多久才落到弱 carrier。 */
   carrierGraceMs: number
-  /** 提问接管：会剥夺桌面 UI 的提问能力，所以默认关（见 core/runtime.ts）。 */
-  takeOverQuestions: boolean
   approvalTimeoutSec: number
   listingRefreshSec: number
+  /**
+   * 状态栏那颗 pill（**配对的唯一入口**）。
+   *
+   * 2026-10-03 这一半原来是"右栏自动弹码"（独立 cordis 条目，键名
+   * `sidebarQr`，带 `imageFile`/`refreshMs` 两个落盘参数）。那套删了之后 pill 不需要任何
+   * 宿主侧节拍与落盘——它要图的时候自己发请求。剩下的唯一开关就是"挂不挂那四条路由"。
+   *
+   * ⚠️ 这里的键**绝不能是 error 级**：error 会让主插件整个不启动，那等于把一个界面功能
+   * 变成配对链路的单点。同理 `pill.enabled:false` 的代价要能被查见（见 index.ts 的 problems）。
+   */
+  pill: { enabled: boolean }
   /**
    * 一条配对通道多久没有任何收发就可以被剪掉（秒）。
    *
@@ -52,8 +56,50 @@ export interface PluginConfig {
    * 每天配一次对的主机两周就能攒两百多条密钥，且每次广播都对它们逐个密封一遍。
    * 剪枝一定同时发 `session-leave`，所以手机不会因此静默转圈——它撞上的是
    * 中文的"会话已失效，请重新配对"。
+   *
+   * ⚠️ **这一条不作用于从盘上恢复的会话**（见 `ConversationBook.restore`）：
+   * 那条走 `restoredIdleTtlSec`，默认与中继对齐到 7 天。
    */
   conversationIdleTtlSec: number
+  /**
+   * **从盘上恢复的**会话多久没有任何收发可以被剪掉（秒）。
+   *
+   * 为什么要与上面那条分开：恢复出来的会话不是"新配了却没人用"，
+   * 而是"用户早就配好了、只是主机重启了"。按 24 小时剪它，
+   * 等于主机每次长假后一启动就把唯一那条通道清掉——免扫码重连白做。
+   *
+   * 默认值 7 天，与中继的 `DRC_CONV_IDLE_TTL_MS` 对齐：**中继忘掉它的那一天，
+   * 本来就是手机必须重扫的那一天**，主机提前剪只是把同一次重扫提前到用户还没察觉的时刻。
+   * 别把这个值调到比中继的空闲 TTL 更长——那样主机会在中继已经/routes 不到之后
+   * 还留着 PSK，白占一份密钥材料。
+   */
+  restoredIdleTtlSec: number
+  /**
+   * 密钥簿落盘路径。
+   *
+   * 三种取值，刻意用字符串而不是布尔开关（布尔表达不了"跟着 statusFile 走"这个默认）：
+   * - `''`（默认）= **自动**：`status.json` 同目录下的 `conversations-<hostId>.json`；
+   * - `'off'` = 关掉落盘，等价于旧行为（每次重启都要重新扫码）；
+   * - 其它 = 显式路径，相对路径按 `statusFile` 所在目录解析。
+   *
+   * 文件里有全部历史会话的 PSK，因此固定 0600 + 原子写，详见 `shell/pair-store.ts`。
+   */
+  pairStoreFile: string
+  /**
+   * 图片附件的落盘目录。`''` = 自动：`status.json` 同目录下的 `uploads/`。
+   *
+   * 为什么要有这么一项：手机发图时内核端口只收文本（见 `shell/uploads.ts` 的头注），
+   * 主机把图存成文件、把路径写进正文。目录里会积累用户发过的每一张图，
+   * 所以要能被配置指向一个有清理策略的位置（比如 tmp），默认值偏向"找得到"而不是"省地方"。
+   */
+  uploadDir: string
+  /** 单张图片的体积上限（字节）。默认 4MB：协议层只校"是不是 jpeg、几张"，校不了字节数。 */
+  maxImageBytes: number
+  /**
+   * 新建会话使用的项目目录。空 = 跟着最近一条会话走（见 carrier-services 的 newSession）。
+   * 不给这条出路的话只剩"宿主进程 cwd"这个黑洞：真机上就是 `/`。
+   */
+  newSessionCwd: string
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -69,26 +115,58 @@ export const DEFAULT_CONFIG: PluginConfig = {
   unarchiveOnPrompt: true,
   pairOnStartSec: 0,
   pairTtlMs: 120_000,
-  // **默认走图片**。2026-10-02 取证推翻了原判断（原判断：文本二维码在任何等宽渲染器下
-  // 都能扫，图片是可有可无的旁路）：
-  //   · DSH 命令卡的等宽输出块是 `white-space: pre` + `line-height: 1.6`（app bundle 里
-  //     的那条规则，实测行间留白约占行高 37%），每两行模块之间被塞进一条整行宽的缝隙，
-  //     半块二维码被横切成条。
-  //   · 用用户真机贴出来的那段输出做受控实验：把字号行距调到 1.0 时 zxing 解得出来，
-  //     调到 ≥1.15 就扫不出来；而 DSH 固定 1.6。也就是说"文本码能扫"在**唯一宿主**上不成立。
-  //   · 而 ANSI 反色救不了：TerminalBlock 把每行渲染成内联 span，背景只覆盖字形盒，
-  //     不覆盖行间留白（见 dsh-client-ui-primitives 的 parseAnsiLines/renderLine）。
-  // 图片是自包含位图矩阵，跟宿主的行高、字体、配色都无关——这才是"扫得出来"的那条路。
-  qrImage: true,
-  // 写图片 ≠ 替用户打开查看器：仍然默认关（原话「不要用打开一个图片的方式」）。
-  qrOpen: false,
-  qrAnsi: false,
-  qrStyle: 'half',
   carrierGraceMs: 5000,
-  takeOverQuestions: false,
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
+  // 恢复出来的会话按 7 天剪，与中继的 DRC_CONV_IDLE_TTL_MS 对齐（理由见该字段注释）。
+  restoredIdleTtlSec: 604_800,
+  // 密钥簿落盘：默认跟着 statusFile 走（见 `resolvePairStoreFile`）。
+  pairStoreFile: '',
+  // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
+  uploadDir: '',
+  maxImageBytes: 4 * 1024 * 1024,
+  newSessionCwd: '',
+  // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
+  // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
+  pill: { enabled: true },
+}
+
+/** `pairStoreFile: 'off'` —— 关掉落盘的哨兵值。用字符串而不是布尔，因为它要能和路径共存。 */
+const PAIR_STORE_OFF = 'off'
+
+/**
+ * 落盘路径解析：`''` 走默认（同目录 + hostId 命名），`'off'` 关掉，其余按 `statusFile`
+ * 所在目录解析相对路径。
+ *
+ * **返回空串就是"这次不落盘"**，调用方必须照此跳过 —— 写进 `~/.dsh` 之外的路径是用户
+ * 明确要求的，不该被我们因为"目录不存在"就静默改道（那会让用户以为已经配好了）。
+ */
+export function resolvePairStoreFile(config: PluginConfig, hostId: string): string {
+  if (config.pairStoreFile === PAIR_STORE_OFF) return ''
+  const configured = config.pairStoreFile.trim()
+  if (!configured) return defaultPairStoreFile(config.statusFile, hostId)
+  if (configured.startsWith('/')) return configured
+  if (!config.statusFile) return configured
+  return path.join(path.dirname(config.statusFile), configured)
+}
+
+/**
+ * 图片附件落盘目录解析：与 `resolvePairStoreFile` 同一套规矩（`''` 走默认、
+ * 相对路径按 statusFile 所在目录解析），但没有 off 档——这一项没有"关掉"的语义，
+ * 想不落盘就把手机那侧的入口关掉（mp 只在上传成功后才会发带图的 prompt）。
+ */
+export function resolveUploadDir(config: PluginConfig): string {
+  const configured = config.uploadDir.trim()
+  if (!configured) {
+    const base = config.statusFile
+      ? path.dirname(config.statusFile)
+      : path.join(homedir(), '.dsh', 'dsh-remote-control')
+    return path.join(base, 'uploads')
+  }
+  if (configured.startsWith('/')) return configured
+  if (!config.statusFile) return configured
+  return path.join(path.dirname(config.statusFile), configured)
 }
 
 const loopback = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/
@@ -128,24 +206,21 @@ export function readConfig(
     ...DEFAULT_CONFIG,
     ...(injected ?? {}),
     keepAwake: { ...DEFAULT_CONFIG.keepAwake, ...(injected?.keepAwake ?? {}) },
+    // 逐键合并：patch 里只写 `pill.enabled` 时不能把整个对象覆盖掉（虽然它现在只有一个键，
+    // 但"注入对象整体替换默认对象"这个形状在 keepAwake 上已经坑过一次）。
+    pill: { ...DEFAULT_CONFIG.pill, ...(injected?.pill ?? {}) },
   }
   const fromEnv = (name: string): string | undefined => env[name]
   if (fromEnv('DRC_SERVER_URL')) merged.serverUrl = env.DRC_SERVER_URL as string
   if (fromEnv('DRC_HOST_LABEL')) merged.hostLabel = env.DRC_HOST_LABEL as string
   if (fromEnv('DRC_HOST_ID')) merged.hostId = env.DRC_HOST_ID as string
   if (fromEnv('DRC_PAIR_ON_START_SEC')) merged.pairOnStartSec = envSeconds(env.DRC_PAIR_ON_START_SEC)
-  // 这两个开关默认就是关的，所以环境变量只用于**打开**（`=1`）；
-  // 仍然接受 `=0` 显式关闭，覆盖 patch 里开的情况。
-  if (fromEnv('DRC_QR_IMAGE')) merged.qrImage = envFlag(env.DRC_QR_IMAGE, merged.qrImage)
-  if (fromEnv('DRC_QR_OPEN')) merged.qrOpen = envFlag(env.DRC_QR_OPEN, merged.qrOpen)
-  if (fromEnv('DRC_QR_ANSI')) merged.qrAnsi = envFlag(env.DRC_QR_ANSI, merged.qrAnsi)
-  if (fromEnv('DRC_QR_STYLE')) {
-    const style = env.DRC_QR_STYLE as PluginConfig['qrStyle']
-    // 不猜：值不认识就保留上层（patch 或默认）的值，并由 validateConfig 负责 warn。
-    if (['ascii', 'block', 'half'].includes(style)) merged.qrStyle = style
-  }
+  // 界面那一半的开关：live 取证要"只验配对链路、不要弹图"时用它。与其余开关同样是
+  // 1/0/true/false，其余值不猜、退回上层。
+  if (fromEnv('DRC_PILL')) merged.pill.enabled = envFlag(env.DRC_PILL, merged.pill.enabled)
   if (fromEnv('DRC_MOCK_BRIDGE') === '1') merged.mockBridge = true
-  if (fromEnv('DRC_TAKE_OVER_QUESTIONS') === '1') merged.takeOverQuestions = true
+  // 新建会话的项目目录：给运维一个不改 yaml 的口子（空 = 跟着最近一条会话走）。
+  if (fromEnv('DRC_NEW_SESSION_CWD')) merged.newSessionCwd = env.DRC_NEW_SESSION_CWD as string
   // token 只从环境变量取：patch 文件是 600 权限的 yaml，但把凭据写在配置文件里
   // 比留在环境变量里更容易被顺手提交或贴进工单。
   if (merged.hostTokenEnv) merged.hostToken = env[merged.hostTokenEnv] ?? merged.hostToken
@@ -200,22 +275,6 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
     problems.push({ level: 'warn', field: 'pairOnStartSec', message: '必须是非负的有限秒数，已折回 0（关闭自动发码）' })
     config.pairOnStartSec = 0
   }
-  if (config.qrOpen && !config.qrImage) {
-    problems.push({
-      level: 'warn',
-      field: 'qrOpen',
-      message:
-        'qrOpen 需要 qrImage=true 才会写图片文件；现在只出文本二维码（文本码在 DSH 命令卡里扫不出来，见 config.ts 默认值注释）',
-    })
-  }
-  if (!['ascii', 'block', 'half'].includes(config.qrStyle)) {
-    problems.push({
-      level: 'warn',
-      field: 'qrStyle',
-      message: `qrStyle 只认 ascii/block/half，收到 ${JSON.stringify(config.qrStyle)}，已退回 half`,
-    })
-    config.qrStyle = 'half'
-  }
   if (!secondsSchema.safeParse(config.conversationIdleTtlSec).success || config.conversationIdleTtlSec <= 0) {
     // 0 或非法值**不表示"永不剪枝"**：永不剪枝就是那条无界的密钥簿。夹回默认值并说明。
     problems.push({
@@ -224,6 +283,15 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
       message: '必须是正数秒；这里不接受"永不剪枝"（无界的 PSK 簿是复核 🟡8 的原始缺陷），已夹回 86400',
     })
     config.conversationIdleTtlSec = 86_400
+  }
+  if (!secondsSchema.safeParse(config.restoredIdleTtlSec).success || config.restoredIdleTtlSec <= 0) {
+    // 同上：0 不是"永不剪"，恢复出来的通道同样不许无界。
+    problems.push({
+      level: 'warn',
+      field: 'restoredIdleTtlSec',
+      message: '必须是正数秒；这里不接受"永不剪枝"（无界的 PSK 簿是复核 🟡8 的原始缺陷），已夹回 604800',
+    })
+    config.restoredIdleTtlSec = 604_800
   }
   if (config.pairOnStartSec > 0) {
     problems.push({
@@ -235,21 +303,11 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
   if (!config.statusFile) {
     problems.push({ level: 'warn', field: 'statusFile', message: '为空将关闭状态快照；GUI 宿主里这是唯一的排错入口' })
   }
-  if (config.takeOverQuestions) {
-    problems.push({
-      level: 'warn',
-      field: 'takeOverQuestions',
-      message:
-        '提问接管会**取代桌面 UI 的提问能力**（ctx.userQuestions 只允许一个活跃 provider）；手机端不在线时提问会直接失败',
-    })
-  }
   return problems
 }
 
 /** 令牌脱敏：日志与 status.json 里都只允许出现这个形态。 */
-export function redactSecret(value: string): string {
+export function redact(value: string): string {
   if (value.length <= 8) return '****'
   return `${value.slice(0, 4)}…${value.slice(-2)}(${value.length})`
 }
-
-export { redactSecret as redact }

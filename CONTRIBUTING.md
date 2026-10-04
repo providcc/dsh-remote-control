@@ -5,8 +5,10 @@
 
 ## 本仓的基本规则
 
-这是一个**宿主侧插件** monorepo。`packages/plugin` 发 npm（`dsh-remote-control`），
-`packages/presentation` 是 `private`、随本仓 bundle 安装（**不发 npm**）。最重要的几条：
+本仓**只有一个包**：`packages/plugin` 发 npm（`dsh-remote-control`），一次构建产出两半产物
+（宿主侧 `dist/bundle/index.js` + 浏览器面 `dist/bundle/client.cjs`），两半都随
+`scripts/install-to-profile.sh` 装进 profile。界面上那一半原来是**第二个 cordis 条目**，
+2026-10-03 折进插件包并删除（隔离改由 `src/pill/start.ts` 的软探测提供）。最重要的几条：
 
 1. **凭据绝不落盘、绝不入日志。** `hostToken` 只从环境变量读；任何打印路径都要过 `redactSecret`。
    提交前自查一遍你的 diff 里没有真实 token / PSK / 配对码。
@@ -26,8 +28,8 @@ pnpm install
 pnpm test
 ```
 
-要求 Node.js ≥ 20 与 pnpm 11（见 `.nvmrc`）。协议层 `dsh-remote-wire` 以 npm 依赖引入（首次
-`pnpm install` 前需该包已发布到 npm——引导顺序见 README「前置条件」）。
+要求 Node.js ≥ 20 与 pnpm 11（见 `.nvmrc`）。协议层 `dsh-remote-wire` 以 npm 依赖引入
+（`^1.0.0`，已发布；`pnpm-lock.yaml` 已提交，CI 用 `--frozen-lockfile`，升版流程见 README「前置条件」）。
 
 ## 开发流程
 

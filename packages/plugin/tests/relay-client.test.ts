@@ -9,8 +9,13 @@
  *    手机端表现为"配对显示成功，但会话列表永远空白"。
  * 2. `peer-joined.pairingToken` 是唯一合法的取密钥依据。多码并存时取"最新那一张"
  *    就是当初那起事故（每一帧都解不开，且没有任何提示）。
- * 3. 中继重启（generation 变化）后旧配对全部作废；客户端断连（`peer-left`）时
- *    会话**必须留着**（D3），否则手机每次回前台都要重新扫码。
+ * 3. 客户端断连（`peer-left`）时会话**必须留着**（D3），否则手机每次回前台都要重新扫码。
+ *
+ * 2026-10-04：第 3 条的旧版（「中继重启即作废全部旧代配对」）已经翻转。
+ * 主机侧**分不出中继重启与自己重启**，而清空必然误伤后者 —— 于是每次主机重启
+ * 都自毁全部配对，自举迭代改一次代码就要人回到机器前重扫一次。
+ * 现在重连一律保留会话，`generation` 只喂给发码窗口（「中继的 pending-pair 表清空了没有」）。
+ * 三条对应的新判据：重连保留会话、恢复出来的密钥可用、结构性变化触发落盘。
  *
  * 说明：`RelayClient` 自己 `new WebSocket(...)`，源码里没有 socket 注入点，
  * 也没有可注入的时钟以外的握手缝。所以这里用白盒方式把一只假 socket 接到
@@ -82,6 +87,8 @@ interface Harness {
   readonly left: Array<{ conversationId: string; clientId: string }>
   readonly commands: Array<{ conversationId: string; cmd: CmdPayload; clientId?: string }>
   readonly states: Array<{ relay: string; problem?: string; conversations: number; generation: number }>
+  /** 会话簿**结构性**变化（新配对 / 作废）的次数：落盘由它驱动。 */
+  readonly structural: number[]
   readonly logs: string[]
 }
 
@@ -94,6 +101,7 @@ function harness(): Harness {
   const left: Harness['left'] = []
   const commands: Harness['commands'] = []
   const states: Harness['states'] = []
+  const structural: number[] = []
   const logs: string[] = []
   const client = new RelayClient({
     url: 'ws://127.0.0.1:1',
@@ -116,6 +124,7 @@ function harness(): Harness {
       if (!slots.applyServerTtl(token, ttlMs)) logs.push(`pair-ready for an unknown token ${token}`)
     },
     onState: (info) => states.push(info),
+    onStructuralChange: () => structural.push(structural.length),
   })
   attachSocket(client, socket)
   const out = (): Array<Record<string, unknown>> =>
@@ -134,6 +143,7 @@ function harness(): Harness {
     left,
     commands,
     states,
+    structural,
     logs,
   }
 }
@@ -185,7 +195,7 @@ test('pair-ready 的 ttlMs 必须改写本地过期：忘了这一步就是"配�
 
   feed({ t: 'peer-joined', sessionId: 'c_aaa111222333', clientId: 'k_mp', pairingToken: slot.token })
   assert.equal(joined.length, 1, 'peer-joined 取不到 PSK 被静默丢弃 → 手机显示配对成功、会话列表却是空的')
-  assert.equal(client.hasPeer('c_aaa111222333'), true, '会话没建起来：后续每一条下行都返回 false')
+  assert.equal(client.hasClient('c_aaa111222333'), true, '会话没建起来：后续每一条下行都返回 false')
 })
 
 test('peer-joined 缺 pairingToken 时不建会话（那是重连通知，不是新客户端加入）', () => {
@@ -194,7 +204,7 @@ test('peer-joined 缺 pairingToken 时不建会话（那是重连通知，不是
   feed({ t: 'peer-joined', sessionId: 'c_bbb111222333', clientId: 'k_mp' })
   assert.equal(joined.length, 0, '没有 token 也建了会话：那是拿"最新那张码"的 PSK 猜密钥（多码事故的形状）')
   assert.equal(client.conversationCount, 0, `凭空建了 ${client.conversationCount} 条会话`)
-  assert.equal(client.hasPeer('c_bbb111222333'), false, 'hasPeer 谎报有对端')
+  assert.equal(client.hasClient('c_bbb111222333'), false, 'hasPeer 谎报有对端')
 })
 
 test('多码并存时按手机实际使用的那张码取 PSK：用 A 码建的会话必须用 A 的密钥（旧事故回归）', async () => {
@@ -278,7 +288,7 @@ test('MAC 校验通过但载荷不是任何一条已定义命令：不进 runtim
     logs.some((line) => line.includes('failed cmd schema')),
     '拒收必须留痕：否则"手机点了没反应"没有答案',
   )
-  assert.equal(client.hasPeer('c_dtd111222333'), true, '形状错不是密钥错，不该计入"连续两次解不开就作废"')
+  assert.equal(client.hasClient('c_dtd111222333'), true, '形状错不是密钥错，不该计入"连续两次解不开就作废"')
 
   // 同一条通道上的合法命令仍然进得来（这次拒收没有把通道打死）。
   feed({
@@ -312,32 +322,94 @@ test('enc-batch 逐项解密并保持数组顺序（F12/T3：客户端没有排�
   )
 })
 
-test('hello-ok 之后 generation 递增：旧代配对全部作废并通知上层（中继重启后旧 convId 没人路由了）', () => {
+test('重连不再清会话：hello-ok 之后 resync 必须仍然声明着这些 convId（免扫码重连的第一半）', () => {
   const { client, slots, feed, gone, outOf } = harness()
   feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
   assert.equal(client.conversationCount, 0, '夹具自检：新连接还没有会话')
 
   const slot = slots.create(120_000)
   feed({ t: 'peer-joined', sessionId: 'c_fff111222333', clientId: 'k_mp', pairingToken: slot.token })
-  assert.equal(client.hasPeer('c_fff111222333'), true, '夹具自检：会话已建立')
+  assert.equal(client.hasClient('c_fff111222333'), true, '夹具自检：会话已建立')
 
-  // 中继重启：第二次 hello-ok 意味着新的代次。
+  // 第二次 hello-ok = 又连上了。这在旧实现里等于 `closeBefore` 清空全部会话，
+  // 而它清掉的理由是"中继重启过，它手里的 convId 全没了"—— 但主机侧分辨不出
+  // 「中继重启」与「主机自己重启」，于是**每次主机重启都自毁全部配对**（自举迭代要命的正是这条）。
   feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
   assert.equal(
     client.conversationCount,
-    0,
-    `代次变了还留着旧会话（${client.conversationCount} 条）：主机对着一个不存在的通道发密文`,
+    1,
+    `重连一次就只剩 ${client.conversationCount} 条会话：手机必须重新扫码，而触发它的只是主机重启`,
   )
-  assert.deepEqual(gone, ['c_fff111222333'], '没有通知上层作废：手机端的"会话已失效，请重新配对"中文提示就发不出去')
-  assert.equal(
-    client.send('c_fff111222333', { t: PAYLOAD_TYPES.evRunState, sessionId: 'ses_x', state: 'running' } as EvPayload),
-    false,
-    '旧会话还能发出去',
-  )
+  assert.deepEqual(gone, [], '没有通知上层作废：手机端的"会话已失效，请重新配对"提示会凭空弹出来')
 
   const resync = outOf('resync')
-  assert.ok(resync.length >= 1, '鉴权成功后没发 resync：中继不知道该保留哪些会话（复核 R1 的恢复路径）')
-  assert.deepEqual((resync[0] as { sessionIds: string[] }).sessionIds, [], 'resync 应该只列出本端仍持有密钥的会话')
+  assert.ok(resync.length >= 2, '鉴权成功后没发 resync：中继不知道该保留哪些会话（复核 R1 的恢复路径）')
+  const last = resync[resync.length - 1] as { sessionIds: string[] }
+  assert.deepEqual(
+    last.sessionIds,
+    ['c_fff111222333'],
+    `resync 声明的是 ${JSON.stringify(last.sessionIds)}：中继会照着删掉没被声明的通道，手机下次发帧就撞 unknown_session`,
+  )
+  assert.equal(
+    client.send('c_fff111222333', { t: PAYLOAD_TYPES.evRunState, sessionId: 'ses_x', state: 'running' } as EvPayload),
+    true,
+    '重连后这条会话发不出去了：主机重启一次就断链一次',
+  )
+})
+
+test('代次仍然每次 hello-ok 递增：发码窗口靠它判断中继的 pending-pair 表是不是清空了', () => {
+  const { feed, states } = harness()
+  feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
+  const first = states.at(-1)
+  assert.ok(first !== undefined, '一次状态都没回调：代次无处可读')
+  assert.equal(first.generation, 1, '第一次连上时代次必须是 1：PairingWindow 用它认领当前挂出的码')
+  feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
+  const second = states.at(-1)
+  assert.ok(second !== undefined, '夹具自检：第二次连接也该有状态回调')
+  assert.equal(
+    second.generation,
+    2,
+    '代次没推进：挂在屏幕上的那张码在中继重启后成了死码，而窗口以为它还能用（用户扫了必失败）',
+  )
+})
+
+test('恢复出来的会话：密钥可用、resync 声明它、成员表从空开始（免扫码重连的第二半）', () => {
+  const { client, feed, outOf } = harness()
+  const psk = 'AgAAAAAAAAAAAAAAAAAAAA=='
+  const convId = 'c_restore01aaaa'
+  client.restoreConversations([{ id: convId, psk, seqHost: 3, createdAt: 1_000, lastActivityAt: 2_000 }])
+  assert.equal(client.conversationCount, 1, '恢复出来的会话没进簿：resync 会声明空列表，中继把这条通道删掉')
+  assert.equal(client.clientCount, 0, '恢复阶段就报"有手机连着"：此刻主机刚起来，没有任何客户端连着')
+  assert.equal(client.hasClient(convId), false, 'hasClient 谎报有对端 → broadcast 会往没人收的通道发帧')
+
+  feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
+  const resync = outOf('resync').at(-1) as { sessionIds: string[] }
+  assert.deepEqual(resync.sessionIds, [convId], 'resync 没声明恢复出来的会话：中继据此删除它，免扫码重连失败')
+
+  // 手机回来的第一帧：解得开 + 把 clientId 登记进成员表。
+  const phoneKeys = derivePskKey(psk, 'c2h', convId)
+  const record = seal(phoneKeys, { t: 'cmd.list_sessions', cmdId: 'cmd_after_restart' })
+  feed({ t: 'enc', sessionId: convId, clientId: 'k_mp', ciphertext: record.ciphertext })
+  assert.equal(client.clientCount, 1, '手机回来了却没被算成连着：此后每一帧 broadcast 都被闸门挡掉，手机界面永远不动')
+  assert.equal(client.hasClient(convId), true, '成员表没登记：状态栏显示未配对，而用户明明连着')
+})
+
+test('会话簿的结构性变化必须立刻通知上层落盘：崩了也不能丢（新配对那一秒最脆弱）', () => {
+  const { client, slots, feed, structural } = harness()
+  feed({ t: 'hello-ok', role: 'host', hostId: 'h_test' })
+  const before = structural.length
+
+  const slot = slots.create(120_000)
+  feed({ t: 'peer-joined', sessionId: 'c_newpair01aa', clientId: 'k_mp', pairingToken: slot.token })
+  assert.equal(
+    structural.length,
+    before + 1,
+    '新配对没有触发落盘：用户刚扫完码的那几秒里崩机，下次就要重新扫码——而重扫要人回到机器前',
+  )
+
+  const afterPair = structural.length
+  client.voidConversation('c_newpair01aa')
+  assert.equal(structural.length, afterPair + 1, '作废一条会话没触发落盘：盘上还留着已经作废的密钥')
 })
 
 test('连续两次解不开同一会话就主动作废：对称于手机端"两帧解不开就丢配对"', () => {
@@ -348,7 +420,7 @@ test('连续两次解不开同一会话就主动作废：对称于手机端"两�
   // 一条形状合法（标准 base64）、MAC 解不开的密文——像是手机端密钥已经被换掉。
   const junk = Buffer.alloc(24 + 16 + 4, 7).toString('base64')
   feed({ t: 'enc', sessionId: 'c_000111222333', ciphertext: junk })
-  assert.equal(client.hasPeer('c_000111222333'), true, '一次解不开就丢配对太激进：小程序自己也给两帧机会')
+  assert.equal(client.hasClient('c_000111222333'), true, '一次解不开就丢配对太激进：小程序自己也给两帧机会')
   assert.equal(gone.length, 0, '第一次就通知作废了')
 
   feed({ t: 'enc', sessionId: 'c_000111222333', ciphertext: junk })
@@ -373,7 +445,7 @@ test('解不开计数在一帧成功解密后清零：偶发噪声不该攒成�
   })
   feed({ t: 'enc', sessionId: 'c_111222333444', ciphertext: junk })
   assert.equal(gone.length, 0, '中间成功过一帧，却被当成连续两次解不开而废弃：会话被误删，手机要重新扫码')
-  assert.equal(client.hasPeer('c_111222333444'), true, '会话不该被误废')
+  assert.equal(client.hasClient('c_111222333444'), true, '会话不该被误废')
 })
 
 test('base64 字符集不合法的密文只被拒收，不计入解不开次数（严进但不能因此丢配对）', () => {
@@ -388,7 +460,7 @@ test('base64 字符集不合法的密文只被拒收，不计入解不开次数�
     0,
     `形状非法的帧被计成了"解不开"并导致废弃配对（gone=${JSON.stringify(gone)}）：中继早就该拦下它`,
   )
-  assert.equal(client.hasPeer('c_222333444555'), true, '会话必须还在')
+  assert.equal(client.hasClient('c_222333444555'), true, '会话必须还在')
   assert.ok(logs.length >= 0, '夹具自检：日志通道可用')
 })
 
@@ -404,10 +476,16 @@ test('peer-left 只摘掉那个客户端，会话与密钥必须留着（D3：�
     [{ conversationId: 'c_333444555666', clientId: 'k_mp' }],
     '离开通知没交给上层：runtime 不知道该推一次列表',
   )
-  assert.equal(
-    client.hasPeer('c_333444555666'),
-    true,
+  // 两个概念必须分开断言，这正是这次改动的全部要点：
+  // **会话与密钥留着**（手机回前台不用重新扫码），但**成员表要摘干净**（没人能收了）。
+  assert.ok(
+    client.conversationIds().includes('c_333444555666'),
     '客户端一走就把会话删了 → 手机切后台再回来必须重新扫码（旧实现的产品缺陷）',
+  )
+  assert.equal(
+    client.hasClient('c_333444555666'),
+    false,
+    'peer-left 之后成员表还留着它 → 本端以为有人能收，广播与审批都会发进一条空会话',
   )
   assert.equal(
     client.conversations.get('c_333444555666')?.psk,
@@ -420,12 +498,32 @@ test('peer-left 只摘掉那个客户端，会话与密钥必须留着（D3：�
     '不该因为 peer-left 就主动退出会话',
   )
 
-  const sent = client.send('c_333444555666', {
+  // 空会话不再出站（真机后果：手机走了之后主机每 15 秒还往里发三帧，
+  // 中继每一帧计一次丢帧，`droppedFrames` 被这一路噪声主导——实测 45 秒涨 9）。
+  const sentWhileEmpty = client.send('c_333444555666', {
     t: PAYLOAD_TYPES.evRunState,
     sessionId: 'ses_x',
     state: 'running',
   } as EvPayload)
-  assert.equal(sent, true, '会话还在却发不出去：出站路径被 peer-left 悄悄断了')
+  assert.equal(sentWhileEmpty, false, '没人连着还照样加密外发：中继只会把它计成丢帧')
+
+  // 上面那条**不是**"出站路径被 peer-left 断了"——D3 要保的恰恰是这条能恢复：
+  // 手机回前台时中继发一条**不带 pairingToken** 的重连通知，成员表必须因此重新长出来。
+  feed({ t: 'peer-joined', sessionId: 'c_333444555666', clientId: 'k_mp' })
+  assert.equal(
+    client.hasClient('c_333444555666'),
+    true,
+    '重连通知没登记成员：手机回前台之后、在它第一次发东西之前，本端一直以为这条会话没人',
+  )
+  assert.equal(
+    client.send('c_333444555666', {
+      t: PAYLOAD_TYPES.evRunState,
+      sessionId: 'ses_x',
+      state: 'running',
+    } as EvPayload),
+    true,
+    '重连之后仍然发不出去：手机切个后台就再也收不到更新，只能杀掉小程序重进',
+  )
 })
 
 test('主动作废已知会话：发 session-leave + 通知上层，且同一条通道只声明一次', () => {
@@ -485,7 +583,7 @@ test('enc 打到一个本端不认识的 convId：立刻作废并声明，而不
 
   assert.equal(outOf('session-leave').length, 1, '解不开又不声明：手机对着一个不存在密钥的通道说话')
   assert.deepEqual(gone, ['c_ffffffff0000'], '上层没被告知这条通道作废')
-  assert.equal(client.hasPeer('c_ffffffff0000'), false, '不该顺手把陌生 convId 建成本端会话')
+  assert.equal(client.hasClient('c_ffffffff0000'), false, '不该顺手把陌生 convId 建成本端会话')
 })
 
 test('pair-fail 与未知帧名都要留痕：中继侧加一个名字，主机不许永远是哑的（F1）', () => {
@@ -550,6 +648,14 @@ test('broadcast 只对活着的会话计数：断连期间不许假装"已发送
 
   client.voidConversation('c_777888999aaa')
   assert.equal(client.broadcast(payload), 1, '作废之后广播数没降下来：调用方以为还有人在听')
+
+  // 真机那一幕：剩下这条会话的**手机退到后台**了（会话与密钥都还在，D3 要它活着）。
+  // 原来 `hasPeer` 答的是"有没有密钥"，于是主机每 15 秒照发三帧，
+  // 中继每一帧计一次丢帧——`droppedFrames` 被这一路噪声主导（实测 45 秒涨 9）。
+  feed({ t: 'peer-left', sessionId: 'c_666777888999', clientId: 'k1' })
+  assert.equal(client.broadcast(payload), 0, '没人连着的那条会话仍然被广播：白加密 + 中继计丢帧')
+  feed({ t: 'peer-joined', sessionId: 'c_666777888999', clientId: 'k1' })
+  assert.equal(client.broadcast(payload), 1, '手机回前台之后广播必须恢复（重连通知也要登记成员）')
 })
 
 test('畸形帧与未知帧名一律静默忽略且绝不抛：一条坏帧不该打断消息处理链', () => {
@@ -580,7 +686,7 @@ test('error 帧只进日志与状态，不主动清会话：清不清由 enc 路
   feed({ t: 'peer-joined', sessionId: 'c_888999aaabbb', clientId: 'k_mp', pairingToken: slot.token })
   feed({ t: 'error', code: 'bad_token', message: 'token 不对' })
   assert.equal(gone.length, 0, '一条 error 帧就把配对清了：手机上表现为"莫名其妙要重新扫码"')
-  assert.equal(client.hasPeer('c_888999aaabbb'), true, '会话必须还在')
+  assert.equal(client.hasClient('c_888999aaabbb'), true, '会话必须还在')
   assert.ok(
     logs.some((line) => line.includes('bad_token')),
     '中继错误要进日志：否则"为什么没反应"没有答案（status.json 的 relayProblem 同源）',
@@ -691,12 +797,12 @@ test('空闲超时的通道被剪掉时必须发 session-leave 并通知上层�
   const pruned = client.pruneConversations()
 
   assert.deepEqual(pruned, ['c_old000000001'], `剪掉的应该是那条一天没动静的，实际剪了 ${JSON.stringify(pruned)}`)
-  assert.equal(client.hasPeer('c_old000000001'), false, '剪了内存却没关通道')
+  assert.equal(client.hasClient('c_old000000001'), false, '剪了内存却没关通道')
   assert.deepEqual(gone, ['c_old000000001'], '上层不知道：status.json 与自动补发都不会动')
   const leave = outOf('session-leave')
   assert.equal(leave.length, 1, '没发 session-leave：中继会继续把手机的密文转给一条已经没有钥匙的通道')
   assert.equal((leave[0] as { sessionId: string }).sessionId, 'c_old000000001')
-  assert.equal(client.hasPeer('c_new000000002'), true, '刚有收发的通道被顺手剪了')
+  assert.equal(client.hasClient('c_new000000002'), true, '刚有收发的通道被顺手剪了')
 })
 
 test('条数上界是真上界：超出后从最不活跃的开始剪，而不是拒绝新建', () => {
@@ -730,7 +836,7 @@ test('条数上界是真上界：超出后从最不活跃的开始剪，而不�
     `必须按"最后活动"从最不活跃开始剪（刚有收发的 c_cap0 必须留下），实际剪了 ${JSON.stringify(pruned)}`,
   )
   assert.equal(client.conversationCount, 3)
-  assert.equal(client.hasPeer('c_cap0'), true, '刚发过数据的通道被剪：手机会突然撞上"会话已失效"')
+  assert.equal(client.hasClient('c_cap0'), true, '刚发过数据的通道被剪：手机会突然撞上"会话已失效"')
 })
 
 test('停机时 socket 还停在 CONNECTING：close() 的异步 error 不许升级成 uncaughtException', async () => {

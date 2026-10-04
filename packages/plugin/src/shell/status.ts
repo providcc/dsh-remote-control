@@ -15,15 +15,11 @@
  *    "年龄 < 25s 且本轮未用过"的配对码（取证 HANDOFF.md §4.5 第 3 条）。
  */
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Clock, StatusSink } from '../ports/index.js'
 
-type StatusValue = unknown
-
 export class StatusFile implements StatusSink {
   private timer: unknown
-  private lastWritten = 0
 
   constructor(
     private readonly file: string,
@@ -45,7 +41,6 @@ export class StatusFile implements StatusSink {
         },
       )
       renameSync(tmp, this.file)
-      this.lastWritten = this.clock.now()
     } catch {
       // 快照写失败绝不能影响主流程；排错入口没了是遗憾，插件崩了是事故。
     }
@@ -79,45 +74,5 @@ export class StatusFile implements StatusSink {
       this.clock.clearTimeout(this.timer)
       this.timer = undefined
     }
-  }
-
-  /** 此刻是否在按节拍刷新（测试与 status 自身的 `refreshing` 字段读它）。 */
-  get refreshing(): boolean {
-    return this.timer !== undefined
-  }
-
-  get path(): string {
-    return this.file
-  }
-}
-
-/**
- * 配对二维码 PNG 的落点（0600）：**当前会话的工作区**下的 `.dsh/pairing-qr.png`。
- *
- * 2026-10-02 用户拍板改的落点（原话「要保存到工作区的 .dsh 不是 home 下的 .dsh」）：
- * 二维码属于"这次配对属于哪个项目"这件事，跟着会话的工作区走比跟着 home 走更符合直觉，
- * 也不会在用户机器上多出一个与项目无关的固定文件。
- *
- * `workspaceDir` 解析不出来时退回 `~/.dsh/pairing-qr.png`（配置目录根部）——**不是**退回
- * 与 status.json 同目录：PNG 是给用户/扫码器看的东西，不该埋进 `~/.dsh/dsh-remote-control/`
- * 这个实现目录里。
- *
- * statusFile 只当开关用——空串表示这一行没配过，此时返回空串，调用方据此退回文本码
- * （空串路径绝不能去 `path.join`，否则 PNG 会写到进程 CWD）。
- */
-export function pairingImagePath(statusFile: string, workspaceDir?: string): string {
-  if (!statusFile) return ''
-  if (workspaceDir) return path.join(workspaceDir, '.dsh', 'pairing-qr.png')
-  return path.join(homedir(), '.dsh', 'pairing-qr.png')
-}
-
-export function writePrivateFile(file: string, data: Buffer | string): boolean {
-  if (!file) return false
-  try {
-    mkdirSync(path.dirname(file), { recursive: true })
-    writeFileSync(file, data, { mode: 0o600 })
-    return true
-  } catch {
-    return false
   }
 }

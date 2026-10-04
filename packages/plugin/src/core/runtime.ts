@@ -19,16 +19,29 @@
  *   由 `outbound.ts` 的构造器产出，参数表里就没有 sessionId。
  */
 import { randomUUID } from 'node:crypto'
-import type { AnswerItem, CmdPayload, EvPayload, HistoryItem, QuestionItem, SessionSummary } from 'dsh-remote-wire'
+import type {
+  AnswerItem,
+  CmdPayload,
+  EvPayload,
+  HistoryItem,
+  ImageAttachment,
+  QuestionItem,
+  SessionSummary,
+} from 'dsh-remote-wire'
+import { appendImageNote, saveImageAttachments } from '../shell/uploads.js'
 import {
   keepAwakeState,
   messageDelta,
+  model,
   permissionRequest,
+  permissionResolved,
   questionRequest,
+  questionResolved,
   result as resultOf,
   runState,
   sessionChanged,
   sessionHistory,
+  todoList,
   toolEvent,
 } from 'dsh-remote-wire/outbound'
 import type { ApprovalDecision, AskUserQuestionAnswerValue, KernelEvent, KernelPort } from '../ports/index.js'
@@ -43,7 +56,7 @@ export interface RuntimeTransport {
   /** 发给所有已配对的会话（会话列表、防休眠状态这类广播）。返回**收到这条广播的会话数**，0 表示没发出去。 */
   broadcast(payload: EvPayload): number
   /** 此刻是否有能收这条会话消息的对端（审批要不要认领的判据）。 */
-  hasPeer(conversationId: string): boolean
+  hasClient(conversationId: string): boolean
   /** 当前活跃的配对会话 id。 */
   conversationIds(): string[]
   /** 把一条会话标为不可用（复核 R1：解不开/没人接时主动作废）。 */
@@ -60,8 +73,18 @@ export interface RuntimeOptions {
   questionTimeoutMs: number
   /** 发指令前自动恢复归档会话。关掉它就要接受"归档会话被宿主 gate 直接拒掉"。 */
   unarchiveOnPrompt: boolean
+  /** 图片附件落盘目录（`shell/uploads.ts`）；空串时该模块自己退化成"不落盘、拒收图片"。 */
+  uploadDir: string
+  /** 单张图片字节上限（协议层只校张数与类型，校不了字节）。 */
+  maxImageBytes: number
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
 }
+
+/**
+ * 这次等待是**被谁**收的场。只有不是手机收的场才需要给 `settle()` 传它——
+ * 一传就意味着手机上那张卡在本侧已经作废，得当场把它收掉（见 `voidStaleCard`）。
+ */
+type VoidReason = 'desktop' | 'withdrawn' | 'timeout'
 
 interface PendingInteraction {
   conversationId: string
@@ -70,6 +93,10 @@ interface PendingInteraction {
   timer: unknown
   /** 审批/提问各自的选项表，用于把手机回传的 id 翻回平台要的词汇。 */
   options?: QuestionItem[]
+  /** 哪一类等待。桌面那颗 pill 的抬头要说"等 N 件事"，两类都算。 */
+  kind: 'approval' | 'question'
+  /** 发出去的时刻（`clock.now()`），用来算"最久的那件已经等了多久"。 */
+  askedAt: number
 }
 
 const APPROVAL_OPTIONS = [
@@ -83,6 +110,10 @@ const DEFAULTS: RuntimeOptions = {
   approvalTimeoutMs: 180_000,
   questionTimeoutMs: 300_000,
   unarchiveOnPrompt: true,
+  // 图片附件：默认**不收**（uploadDir 空 = 拒收）。要放开必须在插件配置里显式
+  // 给一个目录——落盘是往用户磁盘写文件，不该由库默认值悄悄代劳。
+  uploadDir: '',
+  maxImageBytes: 4 * 1024 * 1024,
 }
 
 /** 一次列表最多给手机多少条会话（与中继侧的会话上限同源，取证 §5.3）。 */
@@ -154,7 +185,7 @@ export class HostRuntime {
       this.clock.clearTimeout(this.mergeTimer)
       this.mergeTimer = undefined
     }
-    for (const [id, item] of [...this.pending]) this.settle(id, undefined)
+    for (const [id] of [...this.pending]) this.settle(id, undefined)
   }
 
   /** 手机发来的命令。`conversationId` 是配对通道 id，与载荷里的 sessionId 不是一回事（F3）。 */
@@ -177,7 +208,35 @@ export class HostRuntime {
               return
             }
           }
-          const sent = await this.kernel.sendPrompt(cmd.sessionId, cmd.text)
+          // 图片附件：内核端口只收文本，所以主机先把图落盘、把路径写进正文
+          // （为什么必须落盘、三条纪律见 shell/uploads.ts 头注）。落盘失败 =
+          // 整条 prompt 失败：用户的意图包含这些图，少发几张比明确失败更难查。
+          let text = cmd.text
+          const images: ImageAttachment[] = Array.isArray(cmd.images) ? cmd.images : []
+          if (images.length > 0) {
+            if (!this.options.uploadDir) {
+              reply(false, { message: '这台主机没配图片落盘目录（uploadDir），收不了图片附件' })
+              return
+            }
+            const saved = saveImageAttachments({
+              images,
+              dir: this.options.uploadDir,
+              sessionId: cmd.sessionId,
+              maxBytesPerImage: this.options.maxImageBytes,
+            })
+            if (!saved.ok) {
+              reply(false, { message: saved.message })
+              return
+            }
+            this.options.log?.('图片附件落盘', {
+              sessionId: cmd.sessionId,
+              images: saved.saved.length,
+              bytes: saved.saved.reduce((sum, img) => sum + img.bytes, 0),
+              dir: saved.dir,
+            })
+            text = appendImageNote(text, saved.saved)
+          }
+          const sent = await this.kernel.sendPrompt(cmd.sessionId, text)
           reply(sent.ok, sent.message ? { message: sent.message } : {})
           if (sent.ok) {
             this.sleep.markActive()
@@ -277,6 +336,26 @@ export class HostRuntime {
     return { ...this.outboundCount }
   }
 
+  /**
+   * 有几件事正挂在手机上等回答，以及**最久的那件已经等了多久**（秒）。
+   *
+   * 为什么这条要出到界面上（而不只是内部状态）：一张挂起的审批阻塞着远端一条正在跑的回合，
+   * 而回合阻塞着用户的下班时间。桌面那颗 pill 原来在"已配对 + 有东西在等"时仍然只说
+   * `已配对`——那是这整条链上唯一看得见它的地方，等于没有。判据见伞仓 docs/PRODUCT.md §3。
+   *
+   * `oldestSec` 用 `clock.now()` 而不是 `Date.now()`： FakeClock 要能演"等了 4 分钟"，
+   * 否则这条时长在测试里永远是 0，也就永远不会红。
+   */
+  get waiting(): { count: number; oldestSec: number } {
+    const now = this.clock.now()
+    let oldest = 0
+    for (const item of this.pending.values()) {
+      const age = Math.max(0, Math.floor((now - item.askedAt) / 1000))
+      if (age > oldest) oldest = age
+    }
+    return { count: this.pending.size, oldestSec: oldest }
+  }
+
   private countOutbound(payload: EvPayload, sent?: boolean): void {
     const key = payload.t.replace(/^ev\./, '')
     this.outboundCount[key] = (this.outboundCount[key] ?? 0) + 1
@@ -318,6 +397,14 @@ export class HostRuntime {
         this.broadcast(runState(event))
         if (event.state === 'running') this.sleep.markActive()
         void this.pushSessions('run-state')
+        return
+      case 'todo':
+        // 与 tool 同一纪律：先 flush 同会话的文本缓冲，再广播整份快照。
+        // 不做合并窗口——一轮 todo 也就十几条，逐条发手机也渲染得动；合并反而会让
+        // "最后那份清单"晚到，而顶部那颗条子要的就是此刻。
+        this.window.flushSession(event.sessionId)
+        this.broadcast(todoList({ todos: event.todos, sessionId: event.sessionId }))
+        this.sleep.markActive()
         return
       case 'title':
         void this.pushSessions('title')
@@ -371,7 +458,41 @@ export class HostRuntime {
     }
     this.broadcast(sessionChanged(this.sessions, reason))
     this.broadcast(keepAwakeState(this.sleep.snapshot()))
+    this.broadcastModel()
     return this.sessions
+  }
+
+  /**
+   * 广播当前模型。
+   *
+   * 跟着 `pushSessions` 一起发而不是单独起一条：模型与防休眠都是**全局状态**，
+   * 而 `pushSessions` 已经是"状态变了就推一次"的唯一入口，另开一条推送路径
+   * 必然出现「会话更新了但模型没更新」这种半同步状态。
+   *
+   * **读不到就不发**（而不是发一个 `model: ''`）：`ev.model` 的 `model` 是必填的
+   * 非空串，硬塞空串会让手机把「不知道用什么模型」显示成「模型名为空」——
+   * 后者看起来像 bug，前者只是没显示。内核缺 `currentSelection` 时真机上是常态
+   * （见 carrier 的 modelFace 探测）。
+   */
+  private broadcastModel(): void {
+    let selection: { provider: string; model: string } | undefined
+    try {
+      selection = this.kernel.modelSelection?.()
+    } catch {
+      return
+    }
+    if (!selection?.model) return
+    // 能不能切由端口回答（它才看得见内核服务对象），core 不猜。
+    const face = this.kernel.modelOptions?.()
+    this.broadcast(
+      model({
+        model: selection.model,
+        provider: selection.provider,
+        canSwitch: Boolean(face?.canSwitch),
+        options: face?.options,
+        reason: face?.canSwitch ? undefined : (face?.reason ?? '主机内核未提供切换模型的能力'),
+      }),
+    )
   }
 
   private refreshLoop(): void {
@@ -389,6 +510,10 @@ export class HostRuntime {
    * **没有在线对端就返回 `'decline'`**，让适配器去调平台的 `next()` 把决定权交还桌面 UI；
    * 超时同样返回 `'decline'`（我们已经把卡片发出去了，但手机迟迟没点，
    * 与其替用户决定，不如让桌面去决定）。
+   *
+   * 返回值只说明"手机这一侧算出了什么"，**不代表这张卡是手机答掉的**：
+   * 桌面与手机是同时被问的（见 `carrier-services.ts` 的 `participate`），
+   * 所以收尾时要按"有没有真的有人在手机上点过"决定要不要把卡收回去。
    */
   private async onApprovalRequest(info: {
     sessionId: string
@@ -397,21 +522,29 @@ export class HostRuntime {
     signal?: AbortSignal
   }): Promise<ApprovalDecision> {
     const conversationId = this.pickConversation(info.sessionId)
-    if (!conversationId || !this.transport.hasPeer(conversationId)) return 'decline'
+    if (!conversationId || !this.transport.hasClient(conversationId)) return 'decline'
     const id = `ap_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     const answered = await new Promise<ApprovalDecision>((resolve) => {
       const timer = this.clock.setTimeout(() => {
-        this.pending.delete(id)
-        resolve('decline')
+        this.settle(id, 'decline', 'timeout')
       }, this.options.approvalTimeoutMs)
       this.pending.set(id, {
         conversationId,
         sessionId: info.sessionId,
         resolve: (value) => resolve(value === undefined ? 'decline' : (value as ApprovalDecision)),
         timer,
+        kind: 'approval',
+        askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, 'cancelled'), { once: true })
+      // `reason` 是 `carrier-services.participate()` 打的标记：'desktop' = 桌面先答了，
+      // 其余（'platform'）是宿主自己把这次请求撤了。两种都要让手机把卡收掉，
+      // 但说出来的话不一样。
+      info.signal?.addEventListener(
+        'abort',
+        () => this.settle(id, 'cancelled', info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+        { once: true },
+      )
       this.replyTo(
         conversationId,
         permissionRequest({
@@ -420,12 +553,16 @@ export class HostRuntime {
           action: info.action,
           ...(info.reason === undefined ? {} : { reason: info.reason }),
           options: APPROVAL_OPTIONS,
+          expiresAt: new Date(Date.now() + this.options.approvalTimeoutMs).toISOString(),
         }),
       )
     })
     this.sleep.releaseHold(id)
     // 结算点（settleApproval）已经把手机的 'approve'/'reject' 翻成平台词汇了，
     // 这里不再翻第二次——两处映射表迟早会分叉。
+    //
+    // 手机没被点过（超时、桌面先答、平台撤回）时那张卡的作废在 `settle()` 里就发了，
+    // 不用在这里补第二次：那一处同时管审批与提问两类卡。
     return answered
   }
 
@@ -435,13 +572,12 @@ export class HostRuntime {
     signal?: AbortSignal
   }): Promise<AskUserQuestionAnswerValue | null> {
     const conversationId = this.pickConversation(info.sessionId)
-    if (!conversationId || !this.transport.hasPeer(conversationId)) return null
+    if (!conversationId || !this.transport.hasClient(conversationId)) return null
     const id = `q_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     const answer = await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
       const timer = this.clock.setTimeout(() => {
-        this.pending.delete(id)
-        resolve(null)
+        this.settle(id, null, 'timeout')
       }, this.options.questionTimeoutMs)
       this.pending.set(id, {
         conversationId,
@@ -449,14 +585,24 @@ export class HostRuntime {
         resolve: (value) => resolve((value as AskUserQuestionAnswerValue | undefined) ?? null),
         timer,
         options: info.questions,
+        kind: 'question',
+        askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, null), { once: true })
+      // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
+      info.signal?.addEventListener(
+        'abort',
+        () => this.settle(id, null, info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+        { once: true },
+      )
       this.replyTo(
         conversationId,
         questionRequest({
           requestId: id,
           sessionId: info.sessionId,
           questions: info.questions,
+          // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
+          // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
+          expiresAt: new Date(Date.now() + this.options.questionTimeoutMs).toISOString(),
         }),
       )
     })
@@ -495,12 +641,54 @@ export class HostRuntime {
     return true
   }
 
-  private settle(id: string, value: unknown): void {
+  private settle(id: string, value: unknown, voidAs?: VoidReason): void {
     const item = this.pending.get(id)
     if (!item) return
     this.pending.delete(id)
     this.clock.clearTimeout(item.timer)
+    // 只有"不是手机自己点的"才需要作废：那种情况下手机上那张卡还亮着，而它已经没用了。
+    if (voidAs) this.voidStaleCard(id, item, voidAs)
     item.resolve(value)
+  }
+
+  /**
+   * 让手机上那张已经作废的卡片**当场**收掉：先按 `requestId` 发一条精确帧，
+   * 再补一帧 `ev.run_state` 兜住"手机上装的是老版小程序"这一档。
+   *
+   * 为什么要两条而不是一条：`ev.permission_resolved` / `ev.question_resolved` 是按
+   * `requestId` 收单的（一次答完不会误收别的会话、别的请求那张卡），这是**正路**——
+   * mp 1.0.1 起就认这两帧（`pages/chat/chat.js` 的 `_onPermissionResolved` /
+   * `_onQuestionResolved`）。而 `ev.run_state` 是它从第一版就认的粗粒度信号
+   * （整会话两张卡一起收），发它只为兜住 **1.0.1 以前**的安装存量——那一档小程序
+   * 的分发是一串 `if (p.t === …)`，认不出来的 `t` 静默忽略。
+   * （`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
+   * 并停掉那条还在走的本地倒数）。所以两条都发：新版手机收到精确帧就精收一张，
+   * 老版手机靠 `run_state` 也能当场收卡，不用等用户重新上传小程序。
+   *
+   * 内核**不会**为"审批/提问被别人答掉了"发状态跳变（这一回合自始至终是 running），
+   * 所以这一帧只能由我们补发；补的是**当前真相**而不是硬编码 `running`——
+   * 手机上那个"思考中"跟着这一帧走，发错方向会一直错到下一次真实跳变。
+   * 读不到真相时退回缓存快照，再退 `idle`：宁可少一个转圈，不能凭空多一个转圈。
+   */
+  private voidStaleCard(requestId: string, item: PendingInteraction, reason: VoidReason): void {
+    // `by` 说的是"谁收的场"，不是答案本身：手机只按"要不要收掉这张卡"读它。
+    const by = reason === 'desktop' ? 'desktop' : 'cancelled'
+    this.replyTo(
+      item.conversationId,
+      item.kind === 'approval'
+        ? permissionResolved({ requestId, sessionId: item.sessionId, by })
+        : questionResolved({ requestId, sessionId: item.sessionId, by }),
+    )
+    const emit = (running: boolean): void => {
+      this.broadcast(runState({ sessionId: item.sessionId, state: running ? 'running' : 'idle' }))
+      this.log('pending card voided', { requestId, reason, kind: item.kind, state: running ? 'running' : 'idle' })
+    }
+    void this.kernel
+      .runState(item.sessionId)
+      .then((truth) => emit(truth.running))
+      .catch(() => {
+        emit(this.sessions.some((session) => session.id === item.sessionId && session.running === true))
+      })
   }
 
   /**
@@ -514,7 +702,7 @@ export class HostRuntime {
   private pickConversation(_sessionId: string): string | undefined {
     const ids = this.transport.conversationIds()
     if (ids.length === 0) return undefined
-    return ids.find((id) => this.transport.hasPeer(id)) ?? ids[0]
+    return ids.find((id) => this.transport.hasClient(id)) ?? ids[0]
   }
 
   private log(message: string, fields?: Record<string, string | number | boolean | undefined>): void {

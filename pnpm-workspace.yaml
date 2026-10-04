@@ -8,5 +8,19 @@ packages:
 allowBuilds:
   esbuild: true
 
+# pnpm 11 默认有 minimumReleaseAge（新发布的包要等一段时间才允许装），而 `dsh-remote-wire`
+# 是本家协议包、发布后立刻要被消费仓装上，所以这条防线对本家包放行。
+#
+# ⚠️ **只认包名，不认 `包名@版本`**：2026-10-04 实测——`pnpm add` 自己往这里写的
+# `dsh-remote-wire@1.1.0` / `@1.2.0` 两条，`pnpm install --frozen-lockfile` 照样报
+# `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`（那条校验走的是 lockfile 复核路径，它只按名字匹配），
+# 换成裸包名 `dsh-remote-wire` 才过。所以以后协议升版**不用**再往这里加新版本号，
+# 也别信 pnpm 自动加进去的那几条——它们在这条路径上根本不生效。
+#
+# 范围说清楚：这只对本家那一个包名关掉"发布年龄"这道闸门，不是对整个生态关掉；
+# 真伪仍由 provenance/OIDC 那条把关（见 .github/workflows/release.yml）。
+minimumReleaseAgeExclude:
+  - dsh-remote-wire
+
 onlyBuiltDependencies:
   - esbuild

@@ -9,11 +9,29 @@
  * 2. **`peer-joined` 里的 `pairingToken` 是唯一合法的取密钥依据**。
  *    多张码同时挂着时按"手机实际用的那张"取 PSK；取不到就拒绝这条配对，
  *    绝不退化成"取最新的一个"（那正是当初的 bug）。
- * 3. **中继重启（generation 变化）后旧配对全部作废**：PSK 是主机在内存里发的，
- *    中继的会话表一清空，这些 convId 就再也没人路由了。
+ * 3. **中继重启后，本地会话会变成"有密钥但没人路由"的孤儿**。
+ *    这条**不是靠"收到 hello-ok 就清空"来处理的** —— 见下面「generation 现在只喂给发码窗口」：
+ *    主机侧分不出"中继重启"与"自己重启"，而清空是误伤更贵的那一侧（要用户重扫）。
+ *    孤儿会话由既有的「只允许一台」策略回收（新配对时作废其余通道），
+ *    手机侧则早已撞上 `unknown_session` → needs-pair，两边都有出口。
  *
  * 方向约定：主机用 `h2c` 密钥**加密下行**、用 `c2h` 密钥**解密上行**；
  * 与小程序侧正好互为镜像，两把密钥由同一 PSK + convId 派生（冻结项 B5）。
+ *
+ * ## `hello-ok` 里的 generation 现在只喂给发码窗口（2026-10-04）
+ *
+ * 它**不再**用来清会话。原来这里是"每次收到 hello-ok 就 +1，然后 `closeBefore` 把全部会话丢掉"，
+ * 而 `generation` 其实是**主机进程内的自增计数器**——于是**主机自己重启**也被当成"中继重启"，
+ * 每次重启都自毁全部配对，手机必须重新扫码（那正是本文件要修的东西）。
+ *
+ * 判据换成两条真正有信息的：
+ * - **结构性变化（新配对 / 作废）立刻落盘**（`onStructuralChange`），崩了也不丢；
+ * - `generation` 只回答"中继的 pending-pair 表是不是被清空了"——它是内存态，中继一重启就空，
+ *   于是挂在屏幕上的那张码成了死码，`PairingWindow` 必须换一张。**它管的是码，不是会话。**
+ *
+ * 中继重启后残留的会话（密钥还在、中继表里已经没有路由）由既有的「只允许一台」策略回收：
+ * 新配对一发生，`onPeerJoined` 就把新通道以外的全部作废（见 index.ts）。
+ * 手机那边则早就撞上 `unknown_session` → needs-pair（e2e restart-resume 的 (b) 用例锁着这条）。
  */
 import { WebSocket } from 'ws'
 import { randomBytes } from 'node:crypto'
@@ -65,6 +83,21 @@ export interface RelayClientOptions {
   handshakeTimeoutMs?: number
   /** 配对通道的剪枝策略（不传用默认：空闲 24h 或超过 64 条）。 */
   prunePolicy?: PrunePolicy
+  /**
+   * 会话簿发生了**结构性**变化（新配对建立 / 会话被作废或剪掉）：调用方要立刻落盘。
+   *
+   * 为什么单独一条而不是复用 `onState`：`seqHost` 与 `lastActivityAt` 每广播一次就变，
+   * 挂在状态回调上等于每 3 秒写一次盘；而新配对这种只发生一次的事绝不能等到下一次 tick。
+   */
+  onStructuralChange?: () => void
+  /**
+   * 只改了 `seqHost` / `lastActivityAt` 之类的高频变动：调用方**只标脏、别写盘**。
+   *
+   * 为什么要与 `onStructuralChange` 分开：这两件事每次广播 / 每条上行帧都会发生，
+   * 挂上去等于每十几秒写一次盘。而它们丢了无所谓——`seqHost` 只是本地编号（客户端从不读，
+   * F13），`lastActivityAt` 差几秒不影响剪枝判定。批量落在 status 的 3 秒 tick 上做。
+   */
+  onBookActivity?: () => void
 }
 
 export interface RelayStateInfo {
@@ -84,6 +117,14 @@ const VOIDED_MAX = 256
 export class RelayClient {
   readonly conversations = new ConversationBook()
   private socket: WebSocket | undefined
+  /**
+   * **主机侧连接代号**：每收到一次 `hello-ok` 就 +1。
+   *
+   * 它现在**只**喂给 `PairingWindow`（"中继的 pending-pair 表是不是清空了"），
+   * 绝不用来清会话 —— 理由见文件头。它递增本身没有权威性（中继不回代次），
+   * 所以配对窗口用它判"换码"是保守正确的：中继真重启时代次一定变了，
+   * 中继没重启时多换一张码的代价只是浪费一个 6 位码。
+   */
   private generation = 0
   private attempts = 0
   private stopped = false
@@ -99,6 +140,42 @@ export class RelayClient {
   /** 已配对的会话数（`status.json` 与"有没有人能收"的判据都读它）。 */
   get conversationCount(): number {
     return this.conversations.size
+  }
+
+  /**
+   * 当前连着的**手机台数**（去重的 clientId）。
+   *
+   * 与 `conversationCount` 分开是因为「解除配对 → 重新配对」会开一条新会话，
+   * 手机却还是那一台：拿会话数当手机数报，用户解完配对看到数字变大，
+   * 会以为解配没生效。
+   */
+  get clientCount(): number {
+    return this.conversations.clientCount()
+  }
+
+  /** 本轮已连上的中继代号（`status.json` 与配对窗口都读它）。 */
+  get relayGeneration(): number {
+    return this.generation
+  }
+
+  /**
+   * 恢复上次进程留下的会话（密钥来自 `pair-store`）。
+   *
+   * **恢复出来的会话里 `clientIds` 是空的**（见 `ConversationBook.restore`），所以
+   * `conversationCount > 0` 而 `clientCount === 0` 是这一阶段的正常形态：
+   * 密钥还在、手机还没回来。调用方据此知道**不能**等 `onPeerJoined` 才启动内核订阅
+   * —— 否则主机重启后手机能连上、主机却不订阅任何事件，表现与配对丢失一模一样。
+   */
+  restoreConversations(records: Parameters<ConversationBook['restore']>[0]): string[] {
+    const restored = this.conversations.restore(records, this.options.clock.now())
+    if (restored.length > 0) {
+      this.options.log('conversations restored from disk', {
+        count: restored.length,
+        // 记一下有没有手机已经登记进来了：恢复阶段应当恒为 0。
+        clients: this.conversations.clientCount(),
+      })
+    }
+    return restored
   }
 
   connect(): void {
@@ -181,25 +258,42 @@ export class RelayClient {
     return dropped
   }
 
-  /** 向一条配对会话发一条载荷；返回 false = 这条会话已经没了或没人接。 */
+  /** 向一条配对会话发一条载荷；返回 false = 这条会话已经没了，或**现在没有活着的客户端**。 */
   send(conversationId: string, payload: EvPayload): boolean {
     const conversation = this.conversations.get(conversationId)
     if (!conversation) return false
+    // 有密钥 ≠ 有人能收到。手机退到后台/断开时会话要留着（D3 靠它重建路由），
+    // 但往一条空会话发帧只有两个后果：中继计一次丢帧，和本地白做一次加密。
+    if (conversation.clientIds.size === 0) return false
     const record = seal(conversation.kH2C, payload)
     conversation.lastActivityAt = this.options.clock.now()
+    this.options.onBookActivity?.()
     return this.raw({ t: 'enc', sessionId: conversationId, seq: ++conversation.seqHost, ciphertext: record.ciphertext })
   }
 
   broadcast(payload: EvPayload): number {
     let sent = 0
     for (const id of this.conversations.ids()) {
+      // 没有活客户端的会话**不上线**：手机不在的时候主机照样每 15 秒产生一轮状态，
+      // 以前每一帧都会被中继计成一次丢帧（真机实测 45 秒涨 9，`droppedFrames` 就一直是
+      // 这一路噪声主导）。跳过之后调用方仍会把这次记成 `*_no_peer`——那是本地计数，
+      // 说的是"主机想发、当时没人听"，与"帧上了线又被丢"是两件事，前者不该污染后者。
+      if (!this.conversations.hasClient(id)) continue
       if (this.send(id, payload)) sent += 1
     }
     return sent
   }
 
-  hasPeer(conversationId: string): boolean {
-    return this.conversations.has(conversationId)
+  /**
+   * 这条会话**现在**有没有能收到东西的手机。
+   *
+   * 原来这个方法叫 `hasPeer`、答的是"我手里有没有这条通道的密钥"——两者在手机上线时恰好
+   * 同真，所以错误一直藏着：手机断开后审批仍然"发得出去"（发进一条空会话），
+   * 桌面那一半要等满 180 秒才拿到决定权。名字换成 `hasClient` 是为了让下一次
+   * 想写 `conversations.has()` 的人当场看见这两个概念不是一回事。
+   */
+  hasClient(conversationId: string): boolean {
+    return this.conversations.hasClient(conversationId)
   }
 
   conversationIds(): string[] {
@@ -227,6 +321,8 @@ export class RelayClient {
     this.voided.add(conversationId)
     this.undecryptable.delete(conversationId)
     this.conversations.close(conversationId)
+    // 作废是一条通道的消失，属于结构性变化：立刻落盘，别等下一次 tick。
+    this.options.onStructuralChange?.()
     this.raw({ t: 'session-leave', sessionId: conversationId })
     this.options.onConversationGone(conversationId)
   }
@@ -251,13 +347,24 @@ export class RelayClient {
     }
     switch (frame.t) {
       case 'hello-ok': {
+        // **这里曾经有一行 `closeBefore` 把全部会话清掉**，理由写的是"中继重启过：
+        // 它手里的 convId 全没了，本地留着也只会解不开"。但 `this.generation` 是
+        // **主机进程内的自增计数器**，中继重启与主机重启在这里长得一模一样——
+        // 于是每次主机重启（自举迭代、改配置、崩溃重启）都自毁全部配对，
+        // 手机只能重新扫码。详见文件头。
+        //
+        // 现在只推进连接代号（喂给发码窗口），会话一律留着。
         this.generation += 1
-        // 中继重启过：它手里的 convId 全没了，本地留着也只会解不开。
-        const dropped = this.conversations.closeBefore(this.generation)
-        for (const id of dropped) this.options.onConversationGone(id)
         this.emitState('online')
+        // `resync` 声明的是"本端**仍持有密钥**的会话"。恢复出来的会话必须列进去，
+        // 否则中继的 resync 会把它们当成主机已经放弃的通道删掉，
+        // 手机下次发帧就撞 `unknown_session`（= 免扫码重连失败的典型症状）。
         this.raw({ t: 'resync', sessionIds: this.conversations.ids() })
-        this.options.log('relay online', { generation: this.generation, conversations: this.conversations.size })
+        this.options.log('relay online', {
+          generation: this.generation,
+          conversations: this.conversations.size,
+          clients: this.conversations.clientCount(),
+        })
         return
       }
       case 'pair-ready':
@@ -265,7 +372,15 @@ export class RelayClient {
         return
       case 'peer-joined': {
         // 只有带 pairingToken 的那一条才是"新客户端加入"；重连通知没有 token（客户端的 id 填在 clientId 位）。
-        if (!frame.pairingToken) return
+        if (!frame.pairingToken) {
+          // **重连也要登记成员。** 成员表原来只靠"收到过这台手机的 enc 帧"长出来
+          // （见 onEncrypted），于是手机回前台之后、在它第一次发东西之前，本端以为
+          // "这条会话没人"——任何以"有没有活客户端"为准的判断（要不要广播、
+          // 审批该不该交还桌面、status.json 里那台数）都会错一拍。
+          const conversation = this.conversations.get(frame.sessionId)
+          if (conversation && frame.clientId) conversation.clientIds.add(frame.clientId)
+          return
+        }
         const slot = this.options.lookupPairingSlot(frame.pairingToken)
         if (!slot) {
           this.options.log('peer-joined without a known pairing token', { sessionId: frame.sessionId })
@@ -274,9 +389,15 @@ export class RelayClient {
         this.conversations.open({
           id: frame.sessionId,
           psk: slot.psk,
-          generation: this.generation,
           now: this.options.clock.now(),
         })
+        // **新通道立刻落盘**：配对成功这一刻是用户刚扫完码的那几秒，
+        // 此时崩了而没落盘，用户看到的下一次表现是"手机还在说已连接、主机却不理它"，
+        // 而按键重新配对的成本远高于每秒写一次盘。
+        this.options.onStructuralChange?.()
+        // 新通道同样立刻记成员：这一帧就带着 clientId，等它发第一帧才记会让"刚配好的手机"
+        // 在头几秒里被当成没连着。
+        if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.add(frame.clientId)
         // 这条通道现在又有密钥了：清掉"已声明作废"的记号，否则下次真要作废时发不出去。
         this.voided.delete(frame.sessionId)
         this.raw({ t: 'resync', sessionIds: this.conversations.ids() })
@@ -289,6 +410,10 @@ export class RelayClient {
         // 手机回前台时用同一个 convId 回来，成员表还在，路由就能重建。
         // 反过来，发给客户端的 peer-left 只有一个合法触发（主机离开），
         // 那由中继侧保证，本端不猜。
+        // 成员表要在这里摘掉这个 clientId：会话留着 ≠ 这台手机还连着。
+        // 不摘的话，一部解了配的手机在 status.json 里仍然算"已连接"，
+        // 而它再也不会回来 —— 那个状态没有任何东西会清掉。
+        if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.delete(frame.clientId)
         this.options.onClientLeft(frame.sessionId, frame.clientId)
         this.emitState('online')
         return
@@ -323,13 +448,23 @@ export class RelayClient {
     }
   }
 
-  private onEncrypted(frame: { sessionId: string; ciphertext?: string; items?: Array<{ ciphertext: string }> }): void {
+  private onEncrypted(frame: {
+    sessionId: string
+    clientId?: string
+    ciphertext?: string
+    items?: Array<{ ciphertext: string }>
+  }): void {
     const conversation = this.conversations.get(frame.sessionId)
     if (!conversation) {
       // 本端已经没有这把钥匙：留着通道只会让手机对着一个听不见的对端说话。
       this.voidConversation(frame.sessionId)
       return
     }
+    // 登记这台手机。**必须在这里记，不能只在 open() 时记**：open() 那一刻
+    // 成员表是空的（配对刚发生），此后进来的每一帧才带得上 clientId。
+    // 漏了这一步的话 `clientCount()` 恒为 0，status.json 里"有几台手机"
+    // 永远是 0 —— 那不是"没人连"，是没人记。
+    if (frame.clientId) conversation.clientIds.add(frame.clientId)
     const records = frame.items ?? (frame.ciphertext === undefined ? [] : [{ ciphertext: frame.ciphertext }])
     let decryptedAny = false
     for (const record of records) {
@@ -353,8 +488,11 @@ export class RelayClient {
       this.options.onCommand(frame.sessionId, cmd, (frame as { clientId?: string }).clientId)
     }
     // 有实际收发就不算"闲置"：剪枝看的是最后活动时刻，不是创建时刻。
-    if (decryptedAny) conversation.lastActivityAt = this.options.clock.now()
-    if (decryptedAny) this.undecryptable.delete(frame.sessionId)
+    if (decryptedAny) {
+      conversation.lastActivityAt = this.options.clock.now()
+      this.options.onBookActivity?.()
+      this.undecryptable.delete(frame.sessionId)
+    }
   }
 
   /** 两次解不开就作废（与手机端"两帧解不开就丢配对"对称，避免一端永久静默）。 */
@@ -402,7 +540,10 @@ export class RelayClient {
     this.options.onState({
       relay,
       ...(problem === undefined ? {} : { problem }),
-      clients: this.conversations.size,
+      // 之前这里写的是 `conversations.size`，把"会话数"顶替成了"客户端数"：
+      // 一部手机解配再重配就多一条会话，于是这个字段会**变大** ——
+      // 拿它回答"现在有几台手机连着"会得出相反的结论。
+      clients: this.conversations.clientCount(),
       conversations: this.conversations.size,
       generation: this.generation,
     })

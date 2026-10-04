@@ -18,15 +18,7 @@
  *    平台对象一律在适配器里折叠完再出来。这样协议层的 `SessionSummary` 与内核
  *    代际变化之间有一层可测的翻译，而不是满屏 `as any`。
  */
-import type { AnswerItem, QuestionItem, SessionSummary } from 'dsh-remote-wire'
-
-/** 插件端口只需要四个方法形状的 socket，方便用内存替身测试。 */
-export interface PeerSink {
-  /** 向某个会话的所有在线客户端发一条已加密载荷；返回是否有活客户端。 */
-  broadcast(payload: unknown): boolean
-  /** 单播到某个客户端（用于只回给发起者）。 */
-  toClient(clientId: string, payload: unknown): boolean
-}
+import type { ModelOption, QuestionItem, SessionSummary } from 'dsh-remote-wire'
 
 /** 内核报告的一条会话在插件内部的形状（还没变成线格式）。 */
 export interface KernelSession {
@@ -58,6 +50,13 @@ export type KernelEvent =
       resultPreview?: string
     }
   | { kind: 'run-state'; sessionId: string; state: 'running' | 'idle'; detail?: string }
+  | {
+      /** 待办清单全量快照（内核 `todo/write`）。
+       * 单条上限由 carrier-services 的映射函数夹：content ≤ 200 字、整份 ≤ 50 条。 */
+      kind: 'todo'
+      sessionId: string
+      todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[]
+    }
   | { kind: 'title'; sessionId: string; title: string }
   | { kind: 'sessions-changed'; reason?: string }
 
@@ -93,15 +92,6 @@ export interface PendingApproval {
 
 /** 平台词汇（`@deepseek-ai/dsh-user-approval` 的 `ApprovalOutcome`）。 */
 export type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
-
-/** 一次待答提问。选项用 label 与平台交换，`id` 只在插件与手机之间使用。 */
-export interface PendingQuestion {
-  id: string
-  sessionId: string
-  questions: QuestionItem[]
-  settle(answer: AskUserQuestionAnswerValue): void
-  cancel(): void
-}
 
 /** 平台侧的答案形状（`selected` 装的是**选项 label**，不是我们的 id）。 */
 export interface AskUserQuestionAnswerValue {
@@ -185,28 +175,21 @@ export interface KernelPort {
 
   /** 冷会话续跑（归档/未加载的会话发指令前需要）。 */
   ensureRunnable?(sessionId: string): Promise<{ ok: boolean; message?: string }>
-  /**
-   * 一条会话的工作区目录（会话头里的 `cwd`）。
-   *
-   * **可选**：宿主代际不同，能拿到 `cwd` 的面也不同。只查**活会话**（`sessions.get(id)`，
-   * 同步、零成本）——用到它的两个调用点（`/drc pair` 与右栏那条路由）都发生在用户正在
-   * 那条会话里操作的时刻，活会话这条足以覆盖；查不到就返回 undefined，调用方退回
-   * `~/.dsh/` 并在卡片上如实显示那个路径。
-   *
-   * 返回值必须是绝对路径（会话头里的 `cwd` 被内核校验为绝对路径），调用方直接当目录用。
-   */
-  sessionWorkspace?(sessionId: string): string | undefined
   /** 当前模型选择，仅用于展示与"没模型就拒绝"的前置判断。 */
   modelSelection?(): { provider: string; model: string } | undefined
+  /**
+   * 可切换的模型清单与**能不能切**这件事的答案。
+   *
+   * 为什么单独一个端口而不是让 `modelSelection` 一起返回：读当前值几乎每个代际都有，
+   * 而「能不能列候选、能不能写」是代际差异最大的部分（实测 `agentDefaultModel`
+   * 上只有 `currentSelection`）。合成一个返回值会让调用方分不清
+   * 「拿不到清单」与「主机根本不能切」——手机上这两种必须表现不同。
+   *
+   * 缺这个方法 = 只读（core 会下发 `canSwitch: false` 并给出理由）。
+   */
+  modelOptions?(): { canSwitch: boolean; options?: ModelOption[]; reason?: string }
   /** 诊断：内核服务实际暴露了哪些成员，出错时打出来。 */
   describe(): Record<string, string | number | boolean>
-}
-
-/** 传输端口：core 通过它发消息，不关心 socket。 */
-export interface TransportPort {
-  /** 有没有能收这条会话消息的对端（决定审批要不要自己认领）。 */
-  hasPeer(sessionId: string): boolean
-  broadcast(payload: unknown, sessionId?: string): void
 }
 
 /** 防休眠后端端口。 */

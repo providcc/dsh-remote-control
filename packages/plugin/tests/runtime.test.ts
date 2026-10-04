@@ -10,6 +10,9 @@
  * 判据编号对应 docs/DESIGN.md §2.2：F7（updatedAt 只能是 ISO 字符串）、
  * F8（列表推送义务）、F9（done 帧不可丢）、F10（decision 逐字）、F11（两个无会话归属的载荷）。
  */
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { CmdPayload, EvPayload, SessionSummary } from 'dsh-remote-wire'
@@ -63,7 +66,7 @@ class FakeTransport implements RuntimeTransport {
     return this.peers.size > 0 ? this.peers.size : 0
   }
 
-  hasPeer(conversationId: string): boolean {
+  hasClient(conversationId: string): boolean {
     return this.peers.has(conversationId)
   }
 
@@ -106,6 +109,13 @@ interface FakeKernel extends KernelPort {
   failList: boolean
   throwOnSend: boolean
   rejectSendFor: string | undefined
+  /**
+   * 非空时 `runState()` 回它。**作废卡片那一帧发的是内核真相**（见 runtime 的
+   * `voidStaleCard`），所以这里必须能演"回合还在跑"与"已经停了"两种收场。
+   */
+  runStateFor: { sessionId: string; running: boolean } | undefined
+  /** true 时 `runState()` 抛：用来证明"读不到真相就退回缓存快照"那条退路。 */
+  failRunState: boolean
   /** 非空时替代 SESSIONS 作为列表内容：用来证明"尾随推送带的是最新快照"。 */
   listing: SessionSummary[] | undefined
   ensureRunnableImpl: ((sessionId: string) => Promise<{ ok: boolean; message?: string }>) | undefined
@@ -122,6 +132,8 @@ function makeKernel(): FakeKernel {
     failList: false,
     throwOnSend: false,
     rejectSendFor: undefined,
+    runStateFor: undefined,
+    failRunState: false,
     listing: undefined,
     ensureRunnableImpl: undefined,
     async listSessions(limit: number) {
@@ -130,7 +142,12 @@ function makeKernel(): FakeKernel {
       const source = kernel.listing ?? SESSIONS
       return source.slice(0, limit).map((summary) => ({ summary, live: summary.state === 'running' }))
     },
-    async runState() {
+    async runState(sessionId: string) {
+      if (kernel.failRunState) throw new Error('内核读不到运行态')
+      const override = kernel.runStateFor
+      if (override !== undefined && override.sessionId === sessionId) {
+        return { running: override.running, state: (override.running ? 'running' : 'idle') as SessionSummary['state'] }
+      }
       return { running: false, state: 'idle' as const }
     },
     async sendPrompt(sessionId: string, text: string) {
@@ -227,6 +244,8 @@ interface Fixture {
   sleepPort: FakeSleepPort
   runtime: HostRuntime
   logs: string[]
+  /** 只 push message 的 `logs` 读不到"为什么"，所以带字段的每一次留痕另存一份在这里。 */
+  events: Array<{ message: string; fields?: Record<string, string | number | boolean | undefined> }>
 }
 
 /**
@@ -240,14 +259,18 @@ function fixture(options: Partial<ConstructorParameters<typeof HostRuntime>[4]> 
   const sleepPort = new FakeSleepPort()
   const sleep = new SpyKeepAwake(sleepPort, clock, { tickMs: 60_000, pendingRefreshMs: 60_000 })
   const logs: string[] = []
+  const events: Array<{ message: string; fields?: Record<string, string | number | boolean | undefined> }> = []
   const runtime = new HostRuntime(kernel, transport, sleep, clock, {
     listingRefreshMs: 3_600_000,
     approvalTimeoutMs: 5_000,
     questionTimeoutMs: 5_000,
-    log: (message) => logs.push(message),
+    log: (message, fields) => {
+      logs.push(message)
+      events.push({ message, fields })
+    },
     ...options,
   })
-  return { clock, kernel, transport, sleep, sleepPort, runtime, logs }
+  return { clock, kernel, transport, sleep, sleepPort, runtime, logs, events }
 }
 
 /** 把 async 桩里的 Promise 链跑完（handleCommand 与 pushSessions 都是纯微任务）。 */
@@ -257,6 +280,26 @@ async function settle(times = 12): Promise<void> {
 
 function cmd(t: string, extra: Record<string, unknown>): CmdPayload {
   return { t, cmdId: `cmd_${t}`, ...extra } as unknown as CmdPayload
+}
+
+/** 最后一条广播出去的 `ev.run_state`（手机上"挂着的卡片作废"那一帧）。 */
+function lastRunState(transport: FakeTransport): Extract<EvPayload, { t: 'ev.run_state' }> | undefined {
+  const beats = transport.ofType(PAYLOAD_TYPES.evRunState) as Extract<EvPayload, { t: 'ev.run_state' }>[]
+  return beats[beats.length - 1]
+}
+
+/** 这一步**不许**有作废帧：断言"没有"比断言条数更直白，也更不容易被别的帧混进来。 */
+function expectNoVoidBeat(transport: FakeTransport): void {
+  const beats = transport.ofType(PAYLOAD_TYPES.evRunState)
+  assert.equal(beats.length, 0, `不该补的帧补了 ${beats.length} 条：手机上那个"思考中"会被拨错方向`)
+}
+
+/** 最近一次"卡片作废"留痕里的那个 reason（'desktop' / 'withdrawn' / 'timeout'）。 */
+function voidReason(events: Fixture['events']): unknown {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i]?.message === 'pending card voided') return events[i]?.fields?.reason
+  }
+  return undefined
 }
 
 test('cmd.list_sessions 必须额外推一条 ev.session_changed：ev.result.data.sessions 手机根本不看（F8）', async () => {
@@ -487,7 +530,7 @@ test('审批超时返回 decline 并配对释放锁：手机迟迟不点时不�
 })
 
 test('手机平台撤销审批（AbortSignal）时结论是 cancelled，并且同样释放挂锁', async () => {
-  const { runtime, kernel, transport, sleep } = fixture()
+  const { runtime, kernel, transport, sleep, events } = fixture()
   runtime.start()
   await settle()
   transport.pair('c_eeeeeeeeeeee')
@@ -497,6 +540,291 @@ test('手机平台撤销审批（AbortSignal）时结论是 cancelled，并且�
   controller.abort()
   assert.equal(await kernelSide, 'cancelled', '平台撤销必须转成 cancelled，不能继续挂着')
   assert.equal(sleep.liveHolds.size, 0, '撤销路径也必须释放挂锁（hold 与 release 一一对应）')
+  await settle()
+  assert.ok(lastRunState(transport) !== undefined, '平台撤了而手机那张卡不作废：手机上还在等一个已经没人要的决定')
+  assert.equal(
+    voidReason(events),
+    'withdrawn',
+    'reason 不是平台撤回的那一支：' + String(voidReason(events)) + '（桌面先答与平台撤回在现场是两件事）',
+  )
+})
+
+/**
+ * 「任意一端答完，其他端的弹窗要当场关掉」里**手机上**那一半。
+ *
+ * 判据是 `ev.run_state`：小程序把它当成"挂着的审批/提问卡作废"的唯一信号
+ * （`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
+ * 并停掉那条本地倒数）。而内核**不会**为"审批被别人答掉了"发状态跳变——
+ * 这一回合自始至终是 running——所以这一帧只能由我们在结算点补发。
+ */
+test('桌面先答时必须给手机补一帧 ev.run_state，把那张作废的审批卡当场收掉', async () => {
+  const { runtime, kernel, transport, logs, events } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_g1a')
+  kernel.runStateFor = { sessionId: 'ses_live', running: true }
+  const controller = new AbortController()
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  expectNoVoidBeat(transport)
+
+  // 桌面先答 = `carrier-services.participate()` 用 reason 'desktop' 撤销我们这条 signal。
+  controller.abort('desktop')
+  assert.equal(await kernelSide, 'cancelled')
+  await settle()
+  const beat = lastRunState(transport)
+  assert.ok(beat !== undefined, '桌面答完了而手机没收到作废帧：手机上那张卡要继续亮到它自己的倒计时走完')
+  assert.equal(beat.state, 'running', '补发的那一帧必须是内核当前的真相（回合还在跑）')
+  assert.equal(beat.sessionId, 'ses_live', '作废帧没有会话归属就会关掉别的会话那张卡')
+  assert.equal(voidReason(events), 'desktop', '这一场是桌面先答的，留痕要说成桌面先答（同一个信号还有别的来源）')
+  assert.ok(logs.includes('pending card voided'), '结算点没留痕：现场分不清"没发"与"发了没人收"')
+})
+
+test('审批超时时同样补这一帧（主机已经不等了，卡片不该还亮着）', async () => {
+  const { runtime, kernel, transport, clock, events } = fixture({ approvalTimeoutMs: 1_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_g1b')
+  kernel.runStateFor = { sessionId: 'ses_live', running: false }
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  await clock.advance(1_001)
+  assert.equal(await kernelSide, 'decline')
+  await settle()
+  const beat = lastRunState(transport)
+  assert.ok(beat !== undefined, '超时后手机那张卡会一直亮着，而主机这边早就把它判掉了')
+  assert.equal(beat.state, 'idle', '内核说这一回合已经停了，就不能硬发 running（手机上会凭空多一个转圈）')
+  assert.equal(voidReason(events), 'timeout', '超时收的场要写成 timeout：与"桌面先答"混在一起就没法解释卡片为什么没了')
+})
+
+test('手机自己点掉时不许补这一帧：那一侧的卡由手机自己清，多发一帧会把运行态拨错方向', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_g1c')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  expectNoVoidBeat(transport)
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, { sessionId: 'ses_live', requestId: card.requestId, decision: 'approve' }),
+    'c_g1c',
+  )
+  assert.equal(await kernelSide, 'allowed-once')
+  await settle()
+  expectNoVoidBeat(transport)
+})
+
+test('读不到内核真相时退回缓存快照；快照里也没有这条会话时报 idle', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_g1d')
+  kernel.failRunState = true
+  const controller = new AbortController()
+  // ses_live 在缓存快照里是 running:true（夹具的 SESSIONS）。
+  const live = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  controller.abort('desktop')
+  assert.equal(await live, 'cancelled')
+  await settle()
+  assert.equal(lastRunState(transport)?.state, 'running', '读不到真相时要认缓存快照，不能一口咬定空闲')
+
+  const controller2 = new AbortController()
+  const unknown = kernel.sink?.approval({ sessionId: 'ses_不在列表', action: 'bash', signal: controller2.signal })
+  await settle()
+  controller2.abort('desktop')
+  assert.equal(await unknown, 'cancelled')
+  await settle()
+  const beats = transport.ofType(PAYLOAD_TYPES.evRunState) as Extract<EvPayload, { t: 'ev.run_state' }>[]
+  const last = beats[beats.length - 1]
+  assert.equal(last?.sessionId, 'ses_不在列表')
+  assert.equal(last?.state, 'idle', '两处都不知道这一回合在不在跑时报 idle：宁可少一个转圈，不能凭空多一个')
+})
+
+test('提问被撤回或超时时也要补同一帧（同一处结算点管两类卡片）', async () => {
+  const { runtime, kernel, transport, clock } = fixture({ questionTimeoutMs: 1_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_g1e')
+  const controller = new AbortController()
+  const asked = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+    signal: controller.signal,
+  })
+  await settle()
+  controller.abort('desktop')
+  assert.equal(await asked, null)
+  await settle()
+  assert.ok(
+    lastRunState(transport) !== undefined,
+    '提问被撤回而手机那张提问卡不作废：手机上会一直等一个已经没人要的答案',
+  )
+
+  const asked2 = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  await clock.advance(1_001)
+  assert.equal(await asked2, null)
+  await settle()
+  const beats = transport.ofType(PAYLOAD_TYPES.evRunState) as Extract<EvPayload, { t: 'ev.run_state' }>[]
+  assert.equal(beats.length, 2, `提问的超时也要补帧，实际一共 ${beats.length} 帧`)
+})
+
+/** 最近一条**回给某个对端**的帧（作废帧是 reply 不是 broadcast，它按 requestId 收单）。 */
+function lastReplyOf(transport: FakeTransport, type: string): Record<string, unknown> | undefined {
+  const hits = transport.replies.map((item) => item.payload).filter((payload) => payload.t === type)
+  return hits[hits.length - 1] as Record<string, unknown> | undefined
+}
+
+/**
+ * 精确作废帧这一组：`ev.permission_resolved` / `ev.question_resolved` 按 `requestId` 收单，
+ * 而 `ev.run_state` 是"这一会话的卡片全收"。两条一起发：精确帧是正路（mp 1.0.1 起认），
+ * run_state 只为兜住 1.0.1 以前的存量安装（那一档的分发是 `if (p.t === …)`，认不出静默忽略）。
+ */
+test('桌面先答时两条都要发：按 requestId 的精确作废帧，加上老版手机认的 ev.run_state', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1a')
+  const controller = new AbortController()
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  controller.abort('desktop')
+  assert.equal(await kernelSide, 'cancelled')
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)
+  assert.ok(resolved !== undefined, '只发了粗收单那一帧：新版手机收不到"是哪一张卡作废"')
+  assert.equal(resolved?.requestId, card.requestId, '作废帧必须对得上那张卡的 requestId')
+  assert.equal(resolved?.sessionId, 'ses_live', '缺了 sessionId，手机无从判断该不该在这条会话的页面上收卡')
+  assert.equal(resolved?.by, 'desktop', '桌面先答要说成 desktop，手机端才有得显示')
+  assert.ok(lastRunState(transport) !== undefined, '老版手机只认 ev.run_state，这一帧不能省')
+})
+
+test('超时与平台撤回都发 by=cancelled：by 说的是"谁收的场"，不是答案', async () => {
+  const { runtime, kernel, transport, clock } = fixture({ approvalTimeoutMs: 1_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1b')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await clock.advance(1_001)
+  assert.equal(await kernelSide, 'decline')
+  await settle()
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by,
+    'cancelled',
+    '主机自己不等了就要说 cancelled：写成 desktop 会让人以为有人在桌面上答过',
+  )
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.requestId, card.requestId)
+
+  const controller = new AbortController()
+  const withdrawn = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  controller.abort('platform')
+  assert.equal(await withdrawn, 'cancelled')
+  await settle()
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by, 'cancelled', '平台撤回同样是 cancelled')
+})
+
+test('手机自己答完不许发作废帧：那张卡是手机自己收的，再发一次等于告诉它"你没答"', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1c')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, { sessionId: 'ses_live', requestId: card.requestId, decision: 'approve' }),
+    'c_h1c',
+  )
+  assert.equal(await kernelSide, 'allowed-once')
+  await settle()
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evPermissionResolved).length,
+    0,
+    '手机答完还发作废帧：手机上刚收起的卡会被再收一次，而第二次收的是别的请求',
+  )
+})
+
+test('ev.question_request 必须带 expiresAt：那张卡以前没有任何倒计时，而主机 300 秒就判没答上', async () => {
+  const { runtime, kernel, transport } = fixture({ questionTimeoutMs: 60_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1d')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(card !== undefined, '没推出提问卡')
+  assert.equal(typeof card.expiresAt, 'string', '缺了 expiresAt，手机上那张卡就是"看不见什么时候作废"')
+  const left = Date.parse(card.expiresAt ?? '') - Date.now()
+  assert.ok(left > 50_000 && left <= 60_000, `到期时刻要落在配置的超时窗口里，实际还剩 ${Math.round(left / 1000)} 秒`)
+})
+
+test('提问收场发 ev.question_resolved：审批那两条不能顺手把提问卡也标成已答', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1e')
+  const controller = new AbortController()
+  const asked = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+    signal: controller.signal,
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved),
+    undefined,
+    '提问挂着一张卡却发的是审批那两条帧：手机会收错那张',
+  )
+  controller.abort('desktop')
+  assert.equal(await asked, null)
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evQuestionResolved)
+  assert.ok(resolved !== undefined, '提问卡没人收：手机上它会一直亮着，而主机早判没答上')
+  assert.equal(resolved?.requestId, card.requestId)
+  assert.equal(resolved?.by, 'desktop')
 })
 
 test('stop() 结算所有挂起交互：返回 decline 并释放每一次挂锁', async () => {
@@ -1283,4 +1611,104 @@ test('cmd.new_session：创建炸了也回执失败，且不推列表（手机�
     0,
     '没造出会话却推列表 = 让手机去刷新一个没变的东西',
   )
+})
+
+/* ── 图片附件：落盘 + 正文增补（wire 1.3.0 的 cmd.send_prompt.images）────────── */
+
+/** 回给手机的那条 ev.result 串成字符串，断言拒绝原因时用。 */
+const lastReplyText = (transport: FakeTransport): string => JSON.stringify(transport.replies.at(-1)?.payload ?? {})
+
+test('send_prompt 带图片：落盘后把路径写进正文，kernel 收到的是纯文本', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff20')
+  // 一张真 jpeg 的头（SOI + APP0 + 一点内容），落盘模块验的就是这个魔数
+  const jpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x02, 0x03, 0x04, 0xff, 0xd9,
+  ])
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张报错',
+      images: [{ name: 'shot.jpg', mediaType: 'image/jpeg', data: jpeg.toString('base64'), width: 1170, height: 800 }],
+    }),
+    'c_ffffffff20',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 1, '落盘成功就必须把指令送进去')
+  const sent = f.kernel.calls.sendPrompt[0]!
+  assert.equal(sent.sessionId, 'ses_img')
+  assert.match(sent.text, /^看这张报错/, '用户打的字在前')
+  assert.match(sent.text, /\[图片附件 1 张，已存到本机\]/, '正文要说明有几张、存在哪')
+  assert.match(
+    sent.text,
+    new RegExp(path.join(dir, 'ses_img', 'shot.jpg').replace(/[.]/g, '\\.') + '$'),
+    '路径要写进正文，且是绝对路径',
+  )
+  const saved = fs.readdirSync(path.join(dir, 'ses_img'))
+  assert.deepEqual(saved, ['shot.jpg'], '文件名按手机给的收敛后落盘')
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'ses_img', 'shot.jpg')), jpeg, '落盘内容与收到的逐字节相同')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('send_prompt 带图片但主机没配 uploadDir：拒收且不发给内核', async () => {
+  const f = fixture() // 默认 uploadDir 空 = 不收
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff21')
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张',
+      images: [
+        { name: 'a.jpg', mediaType: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0x00]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff21',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '没收图的许可就不该把这条指令发进去')
+  assert.match(lastReplyText(f.transport), /uploadDir/, '拒绝原因要原样回到手机上：用户得知道改哪')
+})
+
+test('send_prompt 带假 jpeg / 超上限：协议层之外主机再拒一道，kernel 不收到半截消息', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
+  const f = fixture({ uploadDir: dir, maxImageBytes: 16 })
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff22')
+  // 内容其实是 png（魔数对不上）：mediaType 说谎也要拒
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        { name: 'a.png', mediaType: 'image/jpeg', data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64') },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '文件头对不上的 jpeg 必须被拒')
+  // 真 jpeg 但超过字节上限
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: 'x',
+      images: [
+        {
+          name: 'b.jpg',
+          mediaType: 'image/jpeg',
+          data: Buffer.from([0xff, 0xd8, 0xff, ...Array.from({ length: 20 }, (_, i) => i)]).toString('base64'),
+        },
+      ],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '超上限同样拒')
+  const left = fs.readdirSync(dir)
+  assert.ok(
+    left.every((d) => fs.readdirSync(path.join(dir, d)).length === 0),
+    '被拒的批次不许在磁盘上留下任何文件',
+  )
+  fs.rmSync(dir, { recursive: true, force: true })
 })
