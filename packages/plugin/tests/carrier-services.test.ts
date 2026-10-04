@@ -244,8 +244,19 @@ test('人工交互两面的登记结果必须能从 status.json 读出来（审�
     { global: true, prepend: true },
     'approval/request 没带 {global:true, prepend:true}：前者会被 cordis 过滤掉，后者会排在桌面 UI 后面永远轮不到',
   )
-  // 提问默认不接管（`ctx.userQuestions` 是单提供者，接管会剥夺桌面 UI 的提问能力）。
-  assert.equal(described.questionsFace, 'not-taken-over', '默认就该是 not-taken-over，否则桌面端问不了问题')
+  // 提问那条**也是参与者**（2026-10-04 改的）：以前它走 `userQuestions.registerProvider`
+  // 那个单提供者口——那一代宿主上根本没有这个成员，而且"接管"意味着桌面问不了问题。
+  // 现在它和审批共用同一条参与式实现，所以两个名字都要登记上、选项也要一模一样。
+  assert.ok(
+    listeners['user-questions/request'],
+    '没有登记 user-questions/request 参与者：手机上永远不会有提问卡，而桌面的提问能力也不该被顶掉',
+  )
+  assert.equal(described.questionsFace, 'registered', `提问面登记状态读不出真值：${String(described.questionsFace)}`)
+  assert.deepEqual(
+    listenerOptions['user-questions/request'],
+    { global: true, prepend: true },
+    'user-questions/request 没带同一组选项：提问那条也是按 scopeTarget(agent, agent) 派发的，少了 global 就收不到',
+  )
   detach()
 })
 
@@ -600,36 +611,156 @@ test('请求对象的 signal 不可写时不许抛：换不出去就退回"卡�
   assert.equal((kernel.describe() as Record<string, unknown>).approvalDesktopVoided, 0)
 })
 
-test('takeOverQuestions=true 时才注册提问提供者；没有那个服务要说得出来', () => {
+/**
+ * 提问那条 waterfall 的四条判据（形状与审批那组一一对应，但**每条都有自己的坑**）。
+ *
+ * 原来这里测的是 `userQuestions.registerProvider`——那条口在这一代宿主上不存在
+ * （服务里 provider 一词零命中），而且"注册一个提供者"是单提供者语义：接管 = 桌面问不了问题。
+ * 现在提问和审批共用同一条参与式实现，所以这里钉的是"两端同弹、谁先答谁算、两个方向都能收卡"。
+ */
+test('提问：手机先答时把答案对象原样交回瀑布，并撤销交给桌面那份 signal', async () => {
   const f = fixture()
   const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
   services.on = (name: string, listener: (...args: unknown[]) => void) => {
-    void name
-    void listener
+    listeners[name] = listener
     return () => {}
   }
-  let registered = 0
-  services.userQuestions = {
-    registerProvider: () => {
-      registered += 1
-      return () => {}
+  const kernel = f.kernel(services)
+  const asked: string[] = []
+  kernel.attachInteractionSink!({
+    approval: async () => 'decline',
+    question: async (info: { sessionId: string; questions: unknown[] }) => {
+      asked.push(`${info.sessionId}/${(info.questions as { id: string }[]).map((q) => q.id).join(',')}`)
+      return { answers: [{ id: 'q_env', selected: ['预发'] }] }
     },
+  })
+  const request: { agent: { session: { id: string } }; questions: unknown[]; signal?: AbortSignal } = {
+    agent: { session: { id: 'ses_live' } },
+    questions: [{ id: 'q_env', question: '部署到哪个环境？', options: [{ label: '预发' }, { label: '线上' }] }],
   }
-  const clock = new FakeClock()
-  const kernel = createServicesKernel(services, { clock, takeOverQuestions: true, log: () => {} })
-  kernel.attachInteractionSink!({ approval: async () => 'allowed-once', question: async () => null })
-  assert.equal(registered, 1, '开了接管却没注册提供者：手机端永远收不到提问，桌面端也问不了')
-  assert.equal((kernel.describe() as Record<string, unknown>).questionsFace, 'registered')
+  let downstream: AbortSignal | undefined
+  const outcome = await listeners['user-questions/request']!(request, () => {
+    downstream = request.signal
+    // 桌面上一直没人点：手机答完之后这张卡靠我们那一下撤销来收。
+    return new Promise<never>(() => {})
+  })
+  assert.deepEqual(
+    outcome,
+    { answers: [{ id: 'q_env', selected: ['预发'] }] },
+    '手机的答案没被原样交回：宿主那边会把这次提问判成"没人答"',
+  )
+  assert.deepEqual(asked, ['ses_live/q_env'], '交给 runtime 的会话与题号不对：提问卡会问错东西')
+  assert.equal(downstream?.aborted, true, '手机先答却没撤销下游：桌面 composer 里那张提问卡会继续挂着')
+  const described = kernel.describe() as Record<string, unknown>
+  assert.equal(described.questionsCalls, 1, '提问派发次数没进 status.json')
+  assert.equal(described.questionsLast, 'answered-by-phone(1 项)', `落点读不出来：${String(described.questionsLast)}`)
+  assert.equal(described.questionsSignalHandoff, 'fused')
+  assert.equal(described.questionsDesktopVoided, 1, '这一次撤销没进 status.json：线上只能靠屏幕猜')
+  // 答案正文**不进** status.json（`answered-by-phone(1 项)` 只报题数）：那是端到端加密要守的边界。
+  assert.equal(JSON.stringify(described).includes('预发'), false, 'status.json 里出现了用户答的内容')
+})
 
-  const noService = fixture()
-  const bare = noService.bundle({ live: true })
-  bare.on = () => () => {}
-  delete bare.userQuestions
-  const kernel2 = createServicesKernel(bare, { clock, takeOverQuestions: true, log: () => {} })
-  kernel2.attachInteractionSink!({ approval: async () => 'allowed-once', question: async () => null })
-  const face = String((kernel2.describe() as Record<string, unknown>).questionsFace)
-  assert.match(face, /no registerProvider/, '接管失败要说清是缺服务还是这一代换了 API 名字')
-  assert.match(face, /keys=/, '必须把服务实际暴露的成员报出来：真机上就是靠这个判断"这一代宿主没有注册口"')
+test('提问：桌面先答时手机那一侧要被撤回（reason desktop），落点记 answered-by-desktop', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let phoneSignal: AbortSignal | undefined
+  kernel.attachInteractionSink!({
+    approval: async () => 'decline',
+    question: async (info: { signal?: AbortSignal }) => {
+      phoneSignal = info.signal
+      // 手机没人点：桌面答完之后这一侧必须被叫醒，而不是挂到 300s 超时。
+      return new Promise<null>((resolve) => {
+        info.signal?.addEventListener('abort', () => resolve(null), { once: true })
+      })
+    },
+  })
+  const pending = listeners['user-questions/request']!(
+    { agent: { session: { id: 'ses_live' } }, questions: [{ id: 'q1', question: '要哪个？' }] },
+    async () => ({ answers: [{ id: 'q1', selected: ['甲'] }] }),
+  )
+  assert.deepEqual(await pending, { answers: [{ id: 'q1', selected: ['甲'] }] }, '桌面答了却被我们吞掉')
+  assert.equal(phoneSignal?.aborted, true, '桌面先答却没撤回手机那一侧：runtime 不知道要作废，手机上那张卡会继续挂着')
+  assert.equal(String(phoneSignal?.reason), 'desktop', 'reason 必须是 desktop：runtime 靠它分"桌面先答"与"平台撤回"')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).questionsLast,
+    'answered-by-desktop(1 项)',
+    '落点要分得清是手机答的还是桌面答的',
+  )
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).questionsDesktopVoided,
+    0,
+    '这一场不是手机答的，那颗计数器不该动',
+  )
+})
+
+test('提问：两边都没答时必须把链子末端那个 rejection 原样抛回去（吞成 undefined 会冲掉整条链）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.attachInteractionSink!({ approval: async () => 'decline', question: async () => null })
+  // 宿主那条链的末端是 `noAnswerer()`：它**抛** NO_PROVIDER，而不是回一个值。
+  const nobody = (): Promise<unknown> => {
+    throw new Error('no user-questions answerer accepted the request')
+  }
+  // 测试夹具里 `listeners` 的声明是"订阅者返回 void"（emit-mode 的形状），
+  // 而参与者**必须返回值**，所以这里按参与者形状窄化一次再断言。
+  const ask = listeners['user-questions/request'] as unknown as (
+    request: unknown,
+    next: () => Promise<unknown>,
+  ) => Promise<unknown>
+  await assert.rejects(
+    () =>
+      ask({ agent: { session: { id: 'ses_live' } }, questions: [{ id: 'q1', question: '要哪个？' }] }, () => nobody()),
+    /no user-questions answerer/,
+    '把"没人答"吞成 undefined：那是把内核整条 turn 搞崩的形状（见 guard.ts 里那条红线）',
+  )
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).questionsLast,
+    'no-answer',
+    '没人答这条也要留落点，否则现场只能看到"手机上没弹"这一半',
+  )
+})
+
+test('提问：没有会话 id 时完整交还桌面，且不问手机（插件不抢答）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let sinkCalls = 0
+  kernel.attachInteractionSink!({
+    approval: async () => 'decline',
+    question: async () => {
+      sinkCalls += 1
+      return { answers: [] }
+    },
+  })
+  const outcome = await listeners['user-questions/request']!(
+    { questions: [{ id: 'q1', question: '要哪个？' }] },
+    async () => ({ answers: [{ id: 'q1', selected: ['甲'] }] }),
+  )
+  assert.deepEqual(outcome, { answers: [{ id: 'q1', selected: ['甲'] }] }, '没有会话 id 却自己答了：会抢掉桌面的提问')
+  assert.equal(sinkCalls, 0, '没有会话 id 还去问手机')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).questionsLast,
+    'handed-back(no phone target)',
+    '交还原因没进 status.json',
+  )
 })
 
 test('未知事件类型不映射但要在 kernel.unmappedEventTypes 里看得见', () => {

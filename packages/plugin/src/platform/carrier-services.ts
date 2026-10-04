@@ -61,20 +61,22 @@ export interface ServicesBundle {
   /**
    * cordis 的事件注册口；对 waterfall 是**参与式**监听。
    *
-   * 第三个参数是 `EventOptions`（`{ global?, prepend? }`）。审批那条**必须带 `global: true`**，
-   * 理由见 `APPROVAL_SUBSCRIBE_OPTIONS`。
+   * 第三个参数是 `EventOptions`（`{ global?, prepend? }`）。两条参与面（审批与提问）
+   * 都**必须带 `global: true`**，理由见 `PARTICIPATE_OPTIONS`。
    */
   on?(name: string, listener: (...args: unknown[]) => void, options?: unknown): unknown
   off?(name: string, listener: (...args: unknown[]) => void): unknown
 }
 
 /**
- * `ctx.on('approval/request', …)` 的第三个参数。两个选项各治一种"卡没弹"，**缺一不可**。
+ * `ctx.on('<那条 waterfall>', …)` 的第三个参数，审批与提问两条共用。
+ * 两个选项各治一种"卡没弹"，**缺一不可**。
  *
  * ### `global: true` —— 不被作用域过滤掉
  *
  * 派发方是 `ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, next)`
- * （桌面 asar 里 `ApprovalService.decide`），而 cordis 的 `dispatch()` 判据是
+ * （桌面 asar 里 `ApprovalService.decide`；提问那条是 `UserQuestionService.ask()` 用同一个
+ * `scopeTarget(agent, agent)` 派发同一个形状的请求），而 cordis 的 `dispatch()` 判据是
  * `hook.global || !filter || filter.call(thisArg, hook.ctx)`；`scopeTarget` 的 filter 只放行
  * "未打作用域标签的上下文"与"派发键的**祖先**作用域"，原文注释写着
  * 'A tag BELOW the dispatch key stays excluded — events flow up the chain, never down'。
@@ -98,7 +100,25 @@ export interface ServicesBundle {
  * 所以这里没有东西被跳过；哪天接上 Auto，这一行要重新审——正确做法大概是"先让自动审阅跑完，
  * 再同时问桌面与手机"，而不是继续抢在最外层。
  */
-const APPROVAL_SUBSCRIBE_OPTIONS = { global: true, prepend: true } as const
+const PARTICIPATE_OPTIONS = { global: true, prepend: true } as const
+
+/**
+ * 要**参与**的两条 waterfall：审批与提问。
+ *
+ * 为什么提问也走参与而不是"注册一个提供者"：宿主自己的提问服务末端就是
+ * `ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', {...request, agent}, noAnswerer)`
+ * （取证 `@deepseek-ai/dsh-user-questions/lib/index.js` 的 `ask()`），桌面那一位是网关转发的
+ * `$on("user-questions/request", function(request, next) …)`（`dsh-client-ui-user-questions`）。
+ * 而 `userQuestions.registerProvider` **在这一代宿主上不存在**（整个服务里 provider 零命中），
+ * 何况"注册提供者"本来就是单提供者语义——接管会让桌面问不了问题，那是插件在改变宿主的行为。
+ *
+ * 两条的差别只在"没人答"怎么表达：审批那条链末端 resolve `'unavailable'`，
+ * 提问那条是 `noAnswerer()` **抛出** `NO_PROVIDER`。所以参与者必须留一份原始 rejection 可复述，
+ * 不能把它吞成 undefined（见 `participate` 末尾那条分支）。
+ */
+const PARTICIPATED_EVENTS = ['approval/request', 'user-questions/request'] as const
+
+type ParticipatedEvent = (typeof PARTICIPATED_EVENTS)[number]
 
 /**
  * 把"平台的中断"与"这次审批已经结算"并成一条 signal，交给链子下游的应答者。
@@ -221,34 +241,44 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   /** 事件回调里抛过的错（按类型计数）。没有这一条，"回合跑到一半没声音"就只能靠猜。 */
   const listenerErrors = new Map<string, number>()
   /**
-   * 人工交互两面的登记结果，进 status.json。
-   * 真机上"审批卡为什么没弹"有三种原因（宿主策略根本没问 / 我们没登记上 /
-   * 登记了但此刻没有已配对的手机），没有这两个字段就只能猜。
-   */
-  let approvalFace = 'not-attached'
-  let questionsFace = 'pending'
-  /**
-   * 审批那条 waterfall 的监听器**被调用了几次**，以及最后一次走到了哪一步（进 status.json）。
+   * 两条 waterfall 参与面的现场读数（都进 status.json）。
    *
-   * 为什么必须有：`approvalFace='registered'` 只证明"我们把自己挂上去了"，
-   * 一点都不能证明"挂的地方收得到"——cordis 的 waterfall 按作用域过滤派发，
-   * 挂错作用域的监听器登记成功、永不触发（见 `APPROVAL_SUBSCRIBE_OPTIONS`）。
-   * 真机上那一次"审批卡没弹"就是靠这两个字段定位的：`approvalCalls=0` 直接排除了
+   * 真机上"卡为什么没弹"有三种原因（宿主策略根本没问 / 我们没登记上 / 登记了但此刻
+   * 没有已配对的手机），没有这些字段就只能猜。
+   *
+   * `registered` 只证明"我们把自己挂上去了"，一点都不能证明"挂的地方收得到"——
+   * cordis 的 waterfall 按作用域过滤派发，挂错作用域的监听器登记成功、永不触发
+   * （见 `PARTICIPATE_OPTIONS`）。真机那一次"审批卡没弹"就是靠 `calls=0` 排除了
    * "我们抢答了又丢掉"，把问题钉在派发那一步。
    */
-  let approvalCalls = 0
-  let approvalLast = 'not-called'
-  /**
-   * 手机先答之后，我们把下游那份 signal 撤销掉了几次（进 status.json）。
-   *
-   * 这一颗计数器是"桌面那张卡该消失"这一半唯一的**现场证据**：撤销发出去之后
-   * 宿主的 api-gateway 会向每个渲染端推 `{type:'cancel', eventId}`，卡片由宿主自己收。
-   * 屏幕上看不见那张卡到底收没收，就看这个数加没加——它加了而卡还在，问题在渲染端；
-   * 它没加，问题在我们这一侧（换 signal 那一步没生效）。
-   */
-  let approvalDesktopVoided = 0
-  /** 参与者能不能把可撤销的 signal 交给下游（`request.signal` 不可写时是 false，进 status.json）。 */
-  let approvalSignalHandoff = 'unknown'
+  interface ParticipantFace {
+    /** 登记结果：`registered` / `not-attached` / `refused by guard` / `no on()` / `failed: …`。 */
+    registered: string
+    /** 监听器被派发几次。 */
+    calls: number
+    /** 最后一次走到了哪一步。 */
+    last: string
+    /** 手机先答之后撤销了几次下游 signal（= 桌面那张卡的关闭句柄被按下去几次）。 */
+    desktopVoided: number
+    /** 能不能把可撤销的 signal 交给下游（`request.signal` 不可写时是 failed/ignored）。 */
+    handoff: string
+  }
+  const faces: Record<ParticipatedEvent, ParticipantFace> = {
+    'approval/request': {
+      registered: 'not-attached',
+      calls: 0,
+      last: 'not-called',
+      desktopVoided: 0,
+      handoff: 'unknown',
+    },
+    'user-questions/request': {
+      registered: 'not-attached',
+      calls: 0,
+      last: 'not-called',
+      desktopVoided: 0,
+      handoff: 'unknown',
+    },
+  }
   /**
    * 内核自己报出来的审批审计：**问过几次**与**最后一次是怎么收的场**（进 status.json）。
    *
@@ -779,72 +809,40 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     sink = next
     const disposers: Array<() => void> = []
     const on = services.on
-    if (typeof on === 'function') {
-      const name = 'approval/request'
-      if (canParticipate(name)) {
-        // **参与**这条 waterfall：必须返回 outcome 或调用 next()，返回 undefined 会冲掉整条链。
-        const listener = (...args: unknown[]): Promise<string> => participate(args)
-        try {
-          const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
-            services,
-            name,
-            listener,
-            APPROVAL_SUBSCRIBE_OPTIONS,
-          )
-          // 这条登记要进 status.json：真机上审批卡"为什么没弹"分三种原因
-          // （策略根本没问 / 没登记上 / 登记了但没配对的手机），没有这个字段就只能猜。
-          approvalFace = 'registered'
-          disposers.push(() => {
-            if (typeof disposer === 'function') (disposer as () => void)()
-            else if (typeof services.off === 'function') services.off(name, listener)
-          })
-        } catch (error) {
-          approvalFace = `failed: ${messageOf(error)}`.slice(0, 80)
-          log('approval/request participation failed', { message: messageOf(error) })
-        }
-      } else {
-        approvalFace = 'refused by guard'
+    if (typeof on !== 'function') {
+      for (const name of PARTICIPATED_EVENTS) faces[name].registered = 'no on()'
+      return () => {
+        sink = undefined
       }
-    } else {
-      approvalFace = 'no on()'
     }
-    const questions = services.userQuestions as LooseObject | undefined
-    if (!options.takeOverQuestions) {
-      // 默认关：`ctx.userQuestions` 只允许一个活跃提供者，接管就意味着桌面 UI 不再问。
-      questionsFace = 'not-taken-over'
-    } else if (!questions || typeof questions.registerProvider !== 'function') {
-      // 把服务实际暴露的成员一起报出来：真机上这一代宿主没有 `registerProvider`，
-      // 只写"没有提供者"就分不清是"服务不在"还是"这一代的 API 换了名字"。
-      questionsFace = `no registerProvider (keys=${questions ? shapeOf(questions) : 'service absent'})`.slice(0, 120)
-    }
-    if (options.takeOverQuestions && questions && typeof questions.registerProvider === 'function') {
-      const provider = {
-        ask: async (request: LooseObject) => {
-          const agent = request.agent as { session?: { id?: string } } | undefined
-          const sessionId = String(agent?.session?.id ?? request.sessionId ?? '')
-          const items = Array.isArray(request.questions) ? (request.questions as LooseObject[]) : []
-          const mapped: QuestionItem[] = items.map((item, index) => mapQuestion(item, index))
-          const answer = await sink?.question({
-            sessionId,
-            questions: mapped,
-            ...(request.signal ? { signal: request.signal as AbortSignal } : {}),
-          })
-          if (!answer) {
-            // 提问服务没有 next() 可交还（单提供者），所以这里必须明确失败，
-            // 绝不能静默挂着——那会把整个 agent 卡死。
-            throw new Error('手机端未应答这次提问（未配对、不在线或已超时）')
-          }
-          return { answers: answer.answers }
-        },
+    for (const name of PARTICIPATED_EVENTS) {
+      const face = faces[name]
+      if (!canParticipate(name)) {
+        // 名单是 guard 里那份极窄的显式清单。走到这里说明有人改了名单却没同步这里——
+        // 宁可这条面不接，也不要悄悄订阅一条 waterfall。
+        face.registered = 'refused by guard'
+        continue
       }
+      // **参与**这条 waterfall：必须返回真答案或调用 `next()`；返回 undefined 会冲掉整条链
+      // （那是"每个 turn 都崩"的形状，见 guard.ts）。
+      const listener = (...args: unknown[]): Promise<unknown> => participate(name, args)
       try {
-        const dispose = (questions.registerProvider as (p: unknown) => unknown).call(questions, provider)
-        if (typeof dispose === 'function') disposers.push(dispose as () => void)
-        questionsFace = 'registered'
-        log('question provider taken over from the desktop UI')
+        const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
+          services,
+          name,
+          listener,
+          PARTICIPATE_OPTIONS,
+        )
+        // 这条登记要进 status.json：真机上"卡为什么没弹"分三种原因（宿主没问 / 没登记上 /
+        // 登记了但没有配对的手机），没有这个字段就只能猜。
+        face.registered = 'registered'
+        disposers.push(() => {
+          if (typeof disposer === 'function') (disposer as () => void)()
+          else if (typeof services.off === 'function') services.off(name, listener)
+        })
       } catch (error) {
-        questionsFace = `failed: ${messageOf(error)}`.slice(0, 80)
-        log('question provider registration failed', { message: messageOf(error) })
+        face.registered = `failed: ${messageOf(error)}`.slice(0, 80)
+        log(`${name} participation failed`, { message: messageOf(error) })
       }
     }
     return () => {
@@ -859,38 +857,64 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
   }
 
-  /** `approval/request(this, req, next)`：req 是只读审批问题，next 交还给其他应答者。 */
   /**
-   * `approval/request` 的参与者：**同时**问手机和桌面，谁先给出真实决定谁算。
+   * 一条被参与的 waterfall 的处理器：`<event>(this, req, next)`。
+   * **同时**问手机和桌面，谁先给出真实决定谁算——审批与提问共用这一份实现。
    *
    * 为什么不能抢答（2026-10-04 真机踩过，用户当场指出来）：waterfall 是"外层不调 `next()`
    * 内层就永远轮不到"，而我们为了排到桌面前面用了 `prepend`——结果**桌面那一半整个不弹了**。
    * 那是插件在改变宿主自己的行为，红线。所以一进这个函数就要立刻把 `next()` 叫起来
    * （桌面照常弹、照常等它的人），手机这一侧并行问，两边赛跑。
    *
-   * "谁先答谁算"里的"答"要收紧：**手机超时（`'decline'`）、手机侧被我们撤回（`'cancelled'`）、
-   * 链子末端没人应答（`'unavailable'`）都不算答案**。把它们当答案的后果很具体：
+   * "谁先答谁算"里的"答"要收紧：审批那条的 `'decline'`（手机超时）/`'cancelled'`（被我们撤回）/
+   * `'unavailable'`（链子末端没人应答）都不算；提问那条的 `null` 同样不算。把它们当答案的后果很具体：
    * 手机没电了会变成"自动拒绝"，而桌面上暂时没人会变成"手机还没点就失败"。
    *
-   * 桌面先答时我们会 `abort` 自己那条信号，`runtime` 收到之后向手机补一帧把卡收回去。
+   * 桌面先答时我们 `abort` 给 runtime 那条信号（reason `'desktop'`），`runtime` 收到之后
+   * 向手机发精确作废帧 + 补一帧 `ev.run_state` 把卡收回去。
    *
    * **反方向也收得掉**（2026-10-04 补上这条，此前那段注释写的是"收不了"，那是没读到
    * cordis `waterfall` 与 api-gateway `startRemoteEvent` 之前的结论）：手机先答之后我们
    * 撤销交给下游的那份 signal，宿主的网关便向每个渲染端发 cancel，桌面那张卡按宿主
-   * 自己的代码消失。判据是 `approvalDesktopVoided` 这颗计数器——它加了而屏幕上卡还在，
-   * 问题就在渲染端；没加就是这一侧没换成功（`approvalSignalHandoff` 会说为什么）。
+   * 自己的代码消失。判据是这条面上的 `desktopVoided` 计数器——它加了而屏幕上卡还在，
+   * 问题就在渲染端；没加就是这一侧没换成功（`handoff` 会说为什么）。两条 waterfall 在网关
+   * 那边是同一条转发路径（客户端都是 `$on(名字, function(request, next) …)`），所以这招不必
+   * 为提问重写一遍。
+   *
+   * 两条唯一的实质差别是"没人答"怎么表达：审批那条链末端 resolve `'unavailable'`，
+   * 提问那条是 `noAnswerer()` **抛出** `NO_PROVIDER`。所以最后那条分支必须把原始 rejection
+   * 复述回去，而不是吞成 `undefined`——那正是"把内核每个 turn 都搞崩"的形状（见 guard.ts）。
    */
-  async function participate(args: unknown[]): Promise<string> {
-    approvalCalls += 1
+  async function participate(event: ParticipatedEvent, args: unknown[]): Promise<unknown> {
+    const isApproval = event === 'approval/request'
+    const face = faces[event]
+    face.calls += 1
+    // 请求对象就是 args 里形状对得上的那一个：审批认 `toolName`，提问认 `questions`。
     const request = args.find(
-      (arg) => arg && typeof arg === 'object' && typeof (arg as { toolName?: unknown }).toolName === 'string',
-    ) as { agent?: { session?: { id?: string } }; toolName?: string; reason?: string; signal?: AbortSignal } | undefined
+      (arg) =>
+        Boolean(arg) &&
+        typeof arg === 'object' &&
+        (isApproval
+          ? typeof (arg as { toolName?: unknown }).toolName === 'string'
+          : Array.isArray((arg as { questions?: unknown }).questions)),
+    ) as
+      | {
+          agent?: { session?: { id?: string } }
+          toolName?: string
+          reason?: string
+          questions?: LooseObject[]
+          signal?: AbortSignal
+        }
+      | undefined
     const next = args.find((arg) => typeof arg === 'function') as (() => Promise<unknown>) | undefined
     const sessionId = String(request?.agent?.session?.id ?? '')
     if (!sink || !sessionId || !servicesPeers()) {
       // 压根没有能收消息的手机 → 一行都不弹，完整交还桌面。这一步是"插件不抢答"的关键。
-      approvalLast = 'handed-back(no phone target)'
-      return String((await next?.()) ?? 'unavailable')
+      // 这里**不 catch**：提问那条没人答时宿主本来就是抛 `NO_PROVIDER`，
+      // 把它吞成值会改变宿主的错误形状（未配对的手机上"提问"就变成了一次空答案）。
+      face.last = 'handed-back(no phone target)'
+      const value = await next?.()
+      return isApproval ? String(value ?? 'unavailable') : value
     }
     const controller = new AbortController()
     // 平台自己撤回这次请求时（回合被取消等）也必须让手机把卡收掉，所以把它的 signal 接回
@@ -910,54 +934,77 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         const fused = fuseSignals(platform, canceller.signal)
         request.signal = fused
         handedOff = request.signal === fused
-        approvalSignalHandoff = handedOff ? 'fused' : 'ignored'
+        face.handoff = handedOff ? 'fused' : 'ignored'
       } catch (error) {
         // 请求对象被冻结时赋值会抛（ESM 一律严格模式）。这里退回"桌面那张卡等它自己的
         // 工具调用生命周期"——那是换 signal 之前的老行为，少收一张卡不至于更糟。
-        approvalSignalHandoff = `failed: ${messageOf(error)}`.slice(0, 80)
+        face.handoff = `failed: ${messageOf(error)}`.slice(0, 80)
       }
     }
     /** 结算之后一律撤销：手机先答时它是"关掉桌面那张卡"的那一下，其余分支只是 release。 */
     const finish = (reason: string) => {
       if (!canceller.signal.aborted) canceller.abort(reason)
     }
+    type Chain = { answered: boolean; value?: unknown; error?: unknown }
     // 桌面那一半**现在就启动**，不等手机。
-    const desktop = Promise.resolve()
+    const desktop: Promise<Chain> = Promise.resolve()
       .then(() => next?.())
-      .catch(() => 'unavailable')
-    const phone = sink
-      .approval({
-        sessionId,
-        action: String(request?.toolName ?? '工具调用'),
-        ...(request?.reason ? { reason: String(request.reason) } : {}),
-        signal: controller.signal,
-      })
-      .catch(() => 'decline' as const)
+      .then(
+        (value) =>
+          // `undefined` 是"这个参与者没认领"（会把整条链冲掉），不是答案；
+          // `'unavailable'` 是审批那条链末端的"没人可问"，也不是答案。
+          value === undefined || (isApproval && value === 'unavailable')
+            ? { answered: false, value }
+            : { answered: true, value },
+        (error) => ({ answered: false, error }),
+      )
+    const asked: Promise<unknown> = isApproval
+      ? sink.approval({
+          sessionId,
+          action: String(request?.toolName ?? '工具调用'),
+          ...(request?.reason ? { reason: String(request.reason) } : {}),
+          signal: controller.signal,
+        })
+      : sink.question({
+          sessionId,
+          questions: (request?.questions ?? []).map((item, index) => mapQuestion(item, index)),
+          signal: controller.signal,
+        })
+    const phone: Promise<Chain> = asked.then(
+      (value) =>
+        // 每一支都**带着自己是谁**回来：`'rejected'` 这个词手机和桌面都可能给出，
+        // 只比数值就没法知道该收哪一张卡（第一版就是这么错的）。
+        isApproval
+          ? value === 'allowed-once' || value === 'rejected'
+            ? { answered: true, value }
+            : { answered: false, value }
+          : value === null || value === undefined
+            ? { answered: false, value }
+            : { answered: true, value },
+      // runtime 抛了（未配对、不在线、被撤）同样不算答案。
+      () => ({ answered: false }) as Chain,
+    )
     // 不算答案的那些取值换成"永远不落地"，于是 `Promise.race` 只会把真答案送出来；
     // 两边都收场了却都没有真答案时，由最后那条分支兜住（否则这里会挂死）。
-    // 每一支都**带着自己是谁**回来：`'rejected'` 这个词手机和桌面都可能给出，
-    // 只比数值就没法知道该不该收回手机那张卡（第一版就是这么错的）。
-    const pending = new Promise<never>(() => {})
+    const pending = new Promise<{ src: 'phone' | 'desktop'; chain: Chain }>(() => {})
     const winner = await Promise.race([
-      phone.then((decision) =>
-        decision === 'decline' || decision === 'cancelled'
-          ? pending
-          : { src: 'phone' as const, outcome: decision as string },
-      ),
-      desktop.then((outcome) =>
-        outcome === 'unavailable' ? pending : { src: 'desktop' as const, outcome: String(outcome) },
-      ),
-      Promise.all([phone, desktop]).then(([, outcome]) => ({
-        src: 'desktop' as const,
-        outcome: outcome === 'unavailable' ? 'unavailable' : String(outcome ?? 'unavailable'),
-      })),
+      phone.then((chain) => (chain.answered ? { src: 'phone' as const, chain } : pending)),
+      desktop.then((chain) => (chain.answered ? { src: 'desktop' as const, chain } : pending)),
+      Promise.all([phone, desktop]).then(([, chain]) => ({ src: 'desktop' as const, chain })),
     ])
-    if (winner.outcome === 'unavailable') {
-      // 两边都没答上：交还链子末端的失败闭合（宿主自己解释成"没人可问"）。
+    if (!winner.chain.answered) {
+      // 两边都没答上：手机那一侧要作废（pending 删掉、`waiting` 归零、卡片收掉）。
       controller.abort('desktop')
       finish('settled-without-answer')
-      approvalLast = 'handed-back(neither answered)'
-      return 'unavailable'
+      if (isApproval) {
+        face.last = 'handed-back(neither answered)'
+        return 'unavailable'
+      }
+      // 提问这条的"没人答"在宿主这边是一个 rejection（链子末端的 `noAnswerer()`），
+      // 所以复述它，而不是返回一个"看起来像答案"的东西。
+      face.last = 'no-answer'
+      if (winner.chain.error !== undefined) throw winner.chain.error
+      throw new Error('手机端未应答这次提问（未配对、不在线或已超时）')
     }
     // 桌面先答 → 手机那一侧要立刻作废（pending 条目删掉、`waiting` 归零、连手机上的卡一起收掉）。
     if (winner.src === 'desktop') controller.abort('desktop')
@@ -966,13 +1013,22 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       finish('answered-by-phone')
       // 只有真的把可撤销的句柄交下去了，这一笔才算"桌面那张卡由我们关掉"；
       // 没换成功时按下去也没有任何东西会断，计数器不能替我们说谎。
-      if (handedOff) approvalDesktopVoided += 1
+      if (handedOff) face.desktopVoided += 1
     } else {
       finish('answered-by-desktop')
     }
-    approvalLast =
-      winner.src === 'phone' ? `answered-by-phone(${winner.outcome})` : `answered-by-desktop(${winner.outcome})`
-    return winner.outcome
+    face.last = `${winner.src === 'phone' ? 'answered-by-phone' : 'answered-by-desktop'}(${describeOutcome(
+      isApproval,
+      winner.chain.value,
+    )})`
+    return winner.chain.value
+  }
+
+  /** 落点字符串：审批直接印 outcome 词表，提问印"答了几项"（答案正文不进 status.json）。 */
+  function describeOutcome(isApproval: boolean, value: unknown): string {
+    if (isApproval) return String(value)
+    const answers = (value as { answers?: unknown } | undefined)?.answers
+    return Array.isArray(answers) ? `${answers.length} 项` : typeof value
   }
 
   /** 有没有能收消息的对端由 runtime 判断；这里只做一个粗筛（有 sink 即可能有对端）。 */
@@ -1070,21 +1126,32 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         modelFace: modelFaceSummary(),
         workspaceRegistry: typeof services.workspaceRegistry === 'object',
         userQuestions: typeof services.userQuestions === 'object',
+        // 这个键**已经不生效**了：提问现在跟审批一样是 waterfall 参与者，两端同弹、
+        // 谁先答谁算，不再有"接管/取代桌面"这回事（那条 `registerProvider` 单提供者
+        // 路线在这一代宿主上根本不存在）。这里照实把配置值报出来，真正的状态看
+        // `questionsFace`。（删键要动 config.ts/index.ts，那两棵树此刻有并行会话在飞的改动。）
         takeOverQuestions: options.takeOverQuestions === true,
+        takeOverQuestionsInert: options.takeOverQuestions === true,
         archivedSessions: archivedIds().size,
         hasOn: typeof services.on === 'function',
         // 真机排错的第一现场：内核到底发了哪些事件类型、其中哪些我们没认。
         eventTypes: [...seenEventTypes].slice(-24).join('|'),
         unmappedEventTypes: [...unmappedEventTypes].join('|'),
         injectedUserMessages: [...injectedUserMessages].map(([kind, count]) => `${count}×${kind}`).join('|') || 'none',
-        approvalFace,
-        approvalCalls,
-        approvalLast,
+        approvalFace: faces['approval/request'].registered,
+        approvalCalls: faces['approval/request'].calls,
+        approvalLast: faces['approval/request'].last,
         approvalAsked,
         approvalDecided,
-        approvalDesktopVoided,
-        approvalSignalHandoff,
-        questionsFace,
+        approvalDesktopVoided: faces['approval/request'].desktopVoided,
+        approvalSignalHandoff: faces['approval/request'].handoff,
+        // 提问那一条与审批同构，所以读数也同一套：登记结果 / 被派发几次 / 最后走到哪一步 /
+        // 手机先答时撤销了几次下游 signal / 那份 signal 换没换成功。
+        questionsFace: faces['user-questions/request'].registered,
+        questionsCalls: faces['user-questions/request'].calls,
+        questionsLast: faces['user-questions/request'].last,
+        questionsDesktopVoided: faces['user-questions/request'].desktopVoided,
+        questionsSignalHandoff: faces['user-questions/request'].handoff,
         listenerErrors:
           [...listenerErrors]
             .slice(0, 4)

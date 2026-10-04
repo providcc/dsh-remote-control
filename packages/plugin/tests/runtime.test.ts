@@ -676,6 +676,154 @@ test('提问被撤回或超时时也要补同一帧（同一处结算点管两�
   assert.equal(beats.length, 2, `提问的超时也要补帧，实际一共 ${beats.length} 帧`)
 })
 
+/** 最近一条**回给某个对端**的帧（作废帧是 reply 不是 broadcast，它按 requestId 收单）。 */
+function lastReplyOf(transport: FakeTransport, type: string): Record<string, unknown> | undefined {
+  const hits = transport.replies.map((item) => item.payload).filter((payload) => payload.t === type)
+  return hits[hits.length - 1] as Record<string, unknown> | undefined
+}
+
+/**
+ * 精确作废帧这一组：`ev.permission_resolved` / `ev.question_resolved` 按 `requestId` 收单，
+ * 而 `ev.run_state` 是"这一会话的卡片全收"。两条一起发是因为**手机上装的那一版只认后者**
+ * （分发是一串 `if (p.t === …)`，认不出的 `t` 静默忽略）。
+ */
+test('桌面先答时两条都要发：按 requestId 的精确作废帧，加上老版手机认的 ev.run_state', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1a')
+  const controller = new AbortController()
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  controller.abort('desktop')
+  assert.equal(await kernelSide, 'cancelled')
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)
+  assert.ok(resolved !== undefined, '只发了粗收单那一帧：新版手机收不到"是哪一张卡作废"')
+  assert.equal(resolved?.requestId, card.requestId, '作废帧必须对得上那张卡的 requestId')
+  assert.equal(resolved?.sessionId, 'ses_live', '缺了 sessionId，手机无从判断该不该在这条会话的页面上收卡')
+  assert.equal(resolved?.by, 'desktop', '桌面先答要说成 desktop，手机端才有得显示')
+  assert.ok(lastRunState(transport) !== undefined, '老版手机只认 ev.run_state，这一帧不能省')
+})
+
+test('超时与平台撤回都发 by=cancelled：by 说的是"谁收的场"，不是答案', async () => {
+  const { runtime, kernel, transport, clock } = fixture({ approvalTimeoutMs: 1_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1b')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await clock.advance(1_001)
+  assert.equal(await kernelSide, 'decline')
+  await settle()
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by,
+    'cancelled',
+    '主机自己不等了就要说 cancelled：写成 desktop 会让人以为有人在桌面上答过',
+  )
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.requestId, card.requestId)
+
+  const controller = new AbortController()
+  const withdrawn = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash', signal: controller.signal })
+  await settle()
+  controller.abort('platform')
+  assert.equal(await withdrawn, 'cancelled')
+  await settle()
+  assert.equal(lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved)?.by, 'cancelled', '平台撤回同样是 cancelled')
+})
+
+test('手机自己答完不许发作废帧：那张卡是手机自己收的，再发一次等于告诉它"你没答"', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1c')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, { sessionId: 'ses_live', requestId: card.requestId, decision: 'approve' }),
+    'c_h1c',
+  )
+  assert.equal(await kernelSide, 'allowed-once')
+  await settle()
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evPermissionResolved).length,
+    0,
+    '手机答完还发作废帧：手机上刚收起的卡会被再收一次，而第二次收的是别的请求',
+  )
+})
+
+test('ev.question_request 必须带 expiresAt：那张卡以前没有任何倒计时，而主机 300 秒就判没答上', async () => {
+  const { runtime, kernel, transport } = fixture({ questionTimeoutMs: 60_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_h1d')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(card !== undefined, '没推出提问卡')
+  assert.equal(typeof card.expiresAt, 'string', '缺了 expiresAt，手机上那张卡就是"看不见什么时候作废"')
+  const left = Date.parse(card.expiresAt ?? '') - Date.now()
+  assert.ok(left > 50_000 && left <= 60_000, `到期时刻要落在配置的超时窗口里，实际还剩 ${Math.round(left / 1000)} 秒`)
+})
+
+test('提问收场发 ev.question_resolved：审批那两条不能顺手把提问卡也标成已答', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_h1e')
+  const controller = new AbortController()
+  const asked = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+    signal: controller.signal,
+  })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.equal(
+    lastReplyOf(transport, PAYLOAD_TYPES.evPermissionResolved),
+    undefined,
+    '提问挂着一张卡却发的是审批那两条帧：手机会收错那张',
+  )
+  controller.abort('desktop')
+  assert.equal(await asked, null)
+  await settle()
+  const resolved = lastReplyOf(transport, PAYLOAD_TYPES.evQuestionResolved)
+  assert.ok(resolved !== undefined, '提问卡没人收：手机上它会一直亮着，而主机早判没答上')
+  assert.equal(resolved?.requestId, card.requestId)
+  assert.equal(resolved?.by, 'desktop')
+})
+
 test('stop() 结算所有挂起交互：返回 decline 并释放每一次挂锁', async () => {
   const { runtime, kernel, transport, sleep } = fixture()
   runtime.start()

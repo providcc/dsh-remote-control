@@ -25,7 +25,9 @@ import {
   messageDelta,
   model,
   permissionRequest,
+  permissionResolved,
   questionRequest,
+  questionResolved,
   result as resultOf,
   runState,
   sessionChanged,
@@ -532,13 +534,21 @@ export class HostRuntime {
         kind: 'question',
         askedAt: this.clock.now(),
       })
-      info.signal?.addEventListener('abort', () => this.settle(id, null, 'withdrawn'), { once: true })
+      // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
+      info.signal?.addEventListener(
+        'abort',
+        () => this.settle(id, null, info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+        { once: true },
+      )
       this.replyTo(
         conversationId,
         questionRequest({
           requestId: id,
           sessionId: info.sessionId,
           questions: info.questions,
+          // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
+          // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
+          expiresAt: new Date(Date.now() + this.options.questionTimeoutMs).toISOString(),
         }),
       )
     })
@@ -583,34 +593,45 @@ export class HostRuntime {
     this.pending.delete(id)
     this.clock.clearTimeout(item.timer)
     // 只有"不是手机自己点的"才需要作废：那种情况下手机上那张卡还亮着，而它已经没用了。
-    if (voidAs) this.voidStaleCard(id, item.sessionId, voidAs)
+    if (voidAs) this.voidStaleCard(id, item, voidAs)
     item.resolve(value)
   }
 
   /**
-   * 让手机上那张已经作废的卡片**当场**收掉。
+   * 让手机上那张已经作废的卡片**当场**收掉：先按 `requestId` 发一条精确帧，
+   * 再补一帧 `ev.run_state` 兜住"手机上装的是老版小程序"这一档。
    *
-   * 为什么用 `ev.run_state` 而不是新加一帧：这条帧就是小程序认定的"挂着的审批/提问卡作废"
-   * 信号（`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
-   * 并且停掉那条还在走的本地倒数），而**用户手机上现在装的这一版就认它**——不必等重新上传小程序。
-   * 协议里那条按 requestId 精确收单的 `ev.permission_resolved` 仍是要走的终点，
-   * 但它得先有一版带它的 wire 发布（伞仓 HANDOFF §3.10）。
+   * 为什么要两条而不是一条：`ev.permission_resolved` / `ev.question_resolved` 是按
+   * `requestId` 收单的（一次答完不会误收别的会话、别的请求那张卡），但**用户手机上现在装的
+   * 那一版还不认这两帧**——小程序的分发是一串 `if (p.t === …)`，认不出来的 `t` 静默忽略。
+   * 而 `ev.run_state` 正好是它早就认的那条"挂着的审批/提问作废"信号
+   * （`pages/chat/chat.js` 的 `_onRunState` 同时清 `pendingPermission` 与 `pendingQuestion`，
+   * 并停掉那条还在走的本地倒数）。所以两条都发：新版手机收到精确帧就精收一张，
+   * 老版手机靠 `run_state` 也能当场收卡，不用等用户重新上传小程序。
    *
-   * 内核**不会**为"审批被别人答掉了"发状态跳变（这一回合自始至终是 running），
-   * 所以这一帧只能由我们补发；补发的是**当前真相**而不是硬编码 `running`——
+   * 内核**不会**为"审批/提问被别人答掉了"发状态跳变（这一回合自始至终是 running），
+   * 所以这一帧只能由我们补发；补的是**当前真相**而不是硬编码 `running`——
    * 手机上那个"思考中"跟着这一帧走，发错方向会一直错到下一次真实跳变。
    * 读不到真相时退回缓存快照，再退 `idle`：宁可少一个转圈，不能凭空多一个转圈。
    */
-  private voidStaleCard(requestId: string, sessionId: string, reason: VoidReason): void {
+  private voidStaleCard(requestId: string, item: PendingInteraction, reason: VoidReason): void {
+    // `by` 说的是"谁收的场"，不是答案本身：手机只按"要不要收掉这张卡"读它。
+    const by = reason === 'desktop' ? 'desktop' : 'cancelled'
+    this.replyTo(
+      item.conversationId,
+      item.kind === 'approval'
+        ? permissionResolved({ requestId, sessionId: item.sessionId, by })
+        : questionResolved({ requestId, sessionId: item.sessionId, by }),
+    )
     const emit = (running: boolean): void => {
-      this.broadcast(runState({ sessionId, state: running ? 'running' : 'idle' }))
-      this.log('pending card voided', { requestId, reason, state: running ? 'running' : 'idle' })
+      this.broadcast(runState({ sessionId: item.sessionId, state: running ? 'running' : 'idle' }))
+      this.log('pending card voided', { requestId, reason, kind: item.kind, state: running ? 'running' : 'idle' })
     }
     void this.kernel
-      .runState(sessionId)
+      .runState(item.sessionId)
       .then((truth) => emit(truth.running))
       .catch(() => {
-        emit(this.sessions.some((item) => item.id === sessionId && item.running === true))
+        emit(this.sessions.some((session) => session.id === item.sessionId && session.running === true))
       })
   }
 

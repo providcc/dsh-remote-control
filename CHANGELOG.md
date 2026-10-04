@@ -62,6 +62,29 @@
   （上一版 `.drc-actions` 的 `justify-content: center` 在管事）、中继那一行竖排。
   现在内容不一致就当场换掉。
 
+### 新增
+
+- **提问也问到手机了，而且不再"接管"**：`user-questions/request` 现在是第二条被**参与**的
+  waterfall（登记口与审批共用同一组 `{ global: true, prepend: true }`）。
+  原来那条路是 `ctx.userQuestions.registerProvider`——它有两个问题：①这一代宿主的服务里
+  `provider` 这个词**零命中**（成员只有 `ask / askTimed / answer / continued / releaseReply`），
+  所以开了 `takeOverQuestions` 也只是在 status.json 里多一行 `no registerProvider (keys=…)`，
+  手机上永远不会有提问卡；②就算有，"注册一个提供者"是**单提供者**语义，接管就意味着桌面问不了问题，
+  那是插件在改变宿主的行为。参与 waterfall 才是既两端同弹、又不吞掉桌面那一条的形状
+  （取证：`UserQuestionService.ask()` 末端就是 `ctx.waterfall(scopeTarget(agent, agent), …, noAnswerer)`，
+  桌面 UI 是网关转发的 `$on("user-questions/request", …)`）。
+- **`takeOverQuestions` 这个键已经不生效**（README 的配置表里标了删除线）。删掉键本体要动
+  `shell/config.ts` 与 `index.ts`，而这两棵树此刻正被另一条在飞的改动占着，所以留作单独一轮；
+  `describe()` 里 `takeOverQuestionsInert` 会把"它不再管事"说清楚，别拿 `questionsFace` 当它还在管。
+- **收回卡片改成按 `requestId` 精确收单**：结算点在补 `ev.run_state`（手机上装的那一版只认这条）
+  之外，另发 `ev.permission_resolved` / `ev.question_resolved`（`by: 'desktop' | 'cancelled'`）。
+  依赖升到 `dsh-remote-wire@1.2.0`——那两帧与提问的 `expiresAt` 都在那一版里。
+- **提问请求带上 `expiresAt`**（= `questionTimeoutMs`，默认 300 秒）。审批那条一直有，提问这条没有，
+  于是主机早就判"没答上"了而手机上那张卡看不出什么时候作废。
+- 提问面新增四条读数进 `status.json`：`questionsFace` / `questionsCalls` / `questionsLast` /
+  `questionsDesktopVoided` / `questionsSignalHandoff`，与审批面同一套。
+  落点写成 `answered-by-phone(1 项)`——**只报题数，答案正文不进 status.json**。
+
 ### 修复
 
 - **手机断开之后，主机不再往那条空会话广播**。真机实测：45 秒里中继 `droppedFrames` 涨 9，
