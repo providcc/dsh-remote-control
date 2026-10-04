@@ -15,6 +15,7 @@
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { defaultPairStoreFile } from './pair-store.js'
 
 export interface PluginConfig {
   enabled: boolean
@@ -57,8 +58,35 @@ export interface PluginConfig {
    * 每天配一次对的主机两周就能攒两百多条密钥，且每次广播都对它们逐个密封一遍。
    * 剪枝一定同时发 `session-leave`，所以手机不会因此静默转圈——它撞上的是
    * 中文的"会话已失效，请重新配对"。
+   *
+   * ⚠️ **这一条不作用于从盘上恢复的会话**（见 `ConversationBook.restore`）：
+   * 那条走 `restoredIdleTtlSec`，默认与中继对齐到 7 天。
    */
   conversationIdleTtlSec: number
+  /**
+   * **从盘上恢复的**会话多久没有任何收发可以被剪掉（秒）。
+   *
+   * 为什么要与上面那条分开：恢复出来的会话不是"新配了却没人用"，
+   * 而是"用户早就配好了、只是主机重启了"。按 24 小时剪它，
+   * 等于主机每次长假后一启动就把唯一那条通道清掉——免扫码重连白做。
+   *
+   * 默认值 7 天，与中继的 `DRC_CONV_IDLE_TTL_MS` 对齐：**中继忘掉它的那一天，
+   * 本来就是手机必须重扫的那一天**，主机提前剪只是把同一次重扫提前到用户还没察觉的时刻。
+   * 别把这个值调到比中继的空闲 TTL 更长——那样主机会在中继已经/routes 不到之后
+   * 还留着 PSK，白占一份密钥材料。
+   */
+  restoredIdleTtlSec: number
+  /**
+   * 密钥簿落盘路径。
+   *
+   * 三种取值，刻意用字符串而不是布尔开关（布尔表达不了"跟着 statusFile 走"这个默认）：
+   * - `''`（默认）= **自动**：`status.json` 同目录下的 `conversations-<hostId>.json`；
+   * - `'off'` = 关掉落盘，等价于旧行为（每次重启都要重新扫码）；
+   * - 其它 = 显式路径，相对路径按 `statusFile` 所在目录解析。
+   *
+   * 文件里有全部历史会话的 PSK，因此固定 0600 + 原子写，详见 `shell/pair-store.ts`。
+   */
+  pairStoreFile: string
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -79,9 +107,32 @@ export const DEFAULT_CONFIG: PluginConfig = {
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
+  // 恢复出来的会话按 7 天剪，与中继的 DRC_CONV_IDLE_TTL_MS 对齐（理由见该字段注释）。
+  restoredIdleTtlSec: 604_800,
+  // 密钥簿落盘：默认跟着 statusFile 走（见 `resolvePairStoreFile`）。
+  pairStoreFile: '',
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
   // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
   pill: { enabled: true },
+}
+
+/** `pairStoreFile: 'off'` —— 关掉落盘的哨兵值。用字符串而不是布尔，因为它要能和路径共存。 */
+const PAIR_STORE_OFF = 'off'
+
+/**
+ * 落盘路径解析：`''` 走默认（同目录 + hostId 命名），`'off'` 关掉，其余按 `statusFile`
+ * 所在目录解析相对路径。
+ *
+ * **返回空串就是"这次不落盘"**，调用方必须照此跳过 —— 写进 `~/.dsh` 之外的路径是用户
+ * 明确要求的，不该被我们因为"目录不存在"就静默改道（那会让用户以为已经配好了）。
+ */
+export function resolvePairStoreFile(config: PluginConfig, hostId: string): string {
+  if (config.pairStoreFile === PAIR_STORE_OFF) return ''
+  const configured = config.pairStoreFile.trim()
+  if (!configured) return defaultPairStoreFile(config.statusFile, hostId)
+  if (configured.startsWith('/')) return configured
+  if (!config.statusFile) return configured
+  return path.join(path.dirname(config.statusFile), configured)
 }
 
 const loopback = /^wss?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/
@@ -197,6 +248,15 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
       message: '必须是正数秒；这里不接受"永不剪枝"（无界的 PSK 簿是复核 🟡8 的原始缺陷），已夹回 86400',
     })
     config.conversationIdleTtlSec = 86_400
+  }
+  if (!secondsSchema.safeParse(config.restoredIdleTtlSec).success || config.restoredIdleTtlSec <= 0) {
+    // 同上：0 不是"永不剪"，恢复出来的通道同样不许无界。
+    problems.push({
+      level: 'warn',
+      field: 'restoredIdleTtlSec',
+      message: '必须是正数秒；这里不接受"永不剪枝"（无界的 PSK 簿是复核 🟡8 的原始缺陷），已夹回 604800',
+    })
+    config.restoredIdleTtlSec = 604_800
   }
   if (config.pairOnStartSec > 0) {
     problems.push({

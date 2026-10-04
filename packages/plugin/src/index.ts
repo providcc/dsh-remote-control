@@ -27,7 +27,15 @@ import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
 import { StatusFile } from './shell/status.js'
 import { resolveHostId } from './shell/host-id.js'
-import { DEFAULT_CONFIG, readConfig, redact, validateConfig, type PluginConfig } from './shell/config.js'
+import { PairStore } from './shell/pair-store.js'
+import {
+  DEFAULT_CONFIG,
+  readConfig,
+  redact,
+  resolvePairStoreFile,
+  validateConfig,
+  type PluginConfig,
+} from './shell/config.js'
 import { startPill, type PillHandle } from './pill/start.js'
 import { type LivePairing, type PillStatus } from './pill/routes.js'
 import { PLUGIN_VERSION } from './version.js'
@@ -153,7 +161,6 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * `shell/host-id.ts`）。`statusFile` 被清空（关掉快照）时不猜目录，退回一次性身份。
    */
   const hostId = resolveHostId(config.statusFile ? path.dirname(config.statusFile) : '', config.hostId)
-  const problems = validateConfig(config)
   const log = (message: string, fields: Record<string, string | number | boolean | undefined> = {}): void => {
     try {
       process.stdout.write(
@@ -163,6 +170,17 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       /* GUI 宿主里 stdout 可能不可用 */
     }
   }
+  /**
+   * 配对通道的密钥簿落盘（免扫码重连，见 `shell/pair-store.ts`）。
+   *
+   * 在 `start()` 之前建好：主机重启后要在**第一帧 resync 之前**就把会话恢复进密钥簿，
+   * 否则 resync 声明的是空列表，中继会把这些通道当成"主机已放弃"删掉，
+   * 手机下次发帧就撞 `unknown_session` —— 症状与落盘没生效一模一样。
+   */
+  const pairStoreFile = resolvePairStoreFile(config, hostId)
+  const pairStore = new PairStore({ file: pairStoreFile, hostId, log })
+  const restoredAtBoot = pairStoreFile ? pairStore.load() : []
+  const problems = validateConfig(config)
   for (const problem of problems) {
     log(`config ${problem.level}`, { field: problem.field, message: problem.message })
   }
@@ -277,7 +295,24 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       },
       // 配对通道长存（D3）之后必须自己剪枝：中继那边的空闲 TTL 是 7 天，
       // 不剪就是无界的 PSK 簿 + 每次广播对废弃通道逐个密封。
-      prunePolicy: { idleTtlMs: config.conversationIdleTtlSec * 1000, maxConversations: MAX_CONVERSATIONS },
+      // 两条 TTL 分开：新配对的按 24 小时剪，从盘上恢复的按 `restoredIdleTtlSec`
+      // （默认 7 天，与中继对齐）—— 理由见 config.ts 与 keys.ts 的 `Conversation.restored`。
+      prunePolicy: {
+        idleTtlMs: config.conversationIdleTtlSec * 1000,
+        restoredIdleTtlMs: config.restoredIdleTtlSec * 1000,
+        maxConversations: MAX_CONVERSATIONS,
+      },
+      // 结构性变化（新配对 / 作废）立刻落盘。只改了 seqHost 与 lastActivityAt 的场合
+      // 由 status 的 3 秒 tick 批量落（见下面 `pairStore.markDirty()` 那一段）——
+      // 挂在这里等于每广播一次写一次盘。
+      onStructuralChange: () => {
+        if (!pairStoreFile || !relay) return
+        pairStore.save(relay.conversations.snapshot(), clock.now())
+      },
+      onBookActivity: () => {
+        // 只标脏：真正的写盘在 status 的 3 秒 tick 上批量做。
+        pairStore.markDirty()
+      },
     })
     runtime = new HostRuntime(port, transport, sleep, clock, {
       listingRefreshMs: config.listingRefreshSec * 1000,
@@ -285,6 +320,26 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       approvalTimeoutMs: config.approvalTimeoutSec * 1000,
       log: (message, fields) => log(message, fields),
     })
+    /**
+     * **恢复必须发生在 `connect()` 之前**：`hello-ok` 一到就发 `resync`，
+     * 而 resync 声明的列表就是密钥簿当前的内容。晚一步恢复，中继已经按空列表把
+     * 这些通道删掉了 —— 表现是"落盘明明有数据，手机还是被要求重新扫码"。
+     */
+    const restoredIds = relay.restoreConversations(restoredAtBoot)
+    if (restoredIds.length > 0) {
+      /**
+       * 有恢复出来的会话就**立刻启动 runtime**，不等 `onPeerJoined`。
+       *
+       * 原来 `runtime.start()` 只写在 `onPeerJoined` 里（下面那段），那假设了
+       * "每一次有会话可用的时刻都必然伴随一次新配对"。落盘把这个假设打破了：
+       * 主机重启后手机是**恢复**而不是重配，它不会发 `pair-begin-client`，
+       * 于是 `onPeerJoined` 永远不来 —— 主机不订阅内核事件、不挂交互 sink、
+       * 不起刷新节拍，手机却已经连上并显示"在线"。那与配对丢失在用户眼里完全一样，
+       * 而且更难查（status.json 里 conversations=1、carrier 也正常）。
+       */
+      runtime.start()
+      log('runtime started from restored conversations', { conversations: restoredIds.length })
+    }
     relay.connect()
     // 自动发码走 pairingWindow，而不是启动时发一张就完事：
     // 一张码是一次性的，用完/中继重启/过半程都得换一张（判据见 core/pairing-window.ts）。
@@ -294,6 +349,13 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     status.start(() => {
       pairingWindow.tick()
       relay?.pruneConversations()
+      // `seqHost` 与 `lastActivityAt` 每次广播都变，挂在 `onStructuralChange` 上等于
+      // 每 15 秒写一次盘；所以那些变动只标脏，这里按 3 秒节拍批量落一次。
+      // 判据是 `hasPendingChanges`：**没脏就不写**，否则 status.json 的 3 秒节拍
+      // 会变成一个无条件写盘的心跳（而这个插件在 GUI 宿主里可能连开好几天）。
+      if (pairStoreFile && pairStore.hasPendingChanges && relay) {
+        pairStore.save(relay.conversations.snapshot(), clock.now())
+      }
       // 配对码簿也要剪枝，理由与上面那句完全一样：一张码是一次性的，
       // 用掉/过期之后那行 slot 只是留在 Map 里，害得 `status.json` 的
       // `pendingPairs` 只增不减（实测能涨到 5 以上），而那个数字是排障时
@@ -346,6 +408,24 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
        */
       pairedClients: relay?.clientCount ?? 0,
       pendingPairs: slots.size,
+      /**
+       * 密钥簿落盘的排障面。
+       *
+       * `restored` 是"本次启动从盘上恢复了几条会话"——它与 `conversations` 的差值
+       * 就是"落盘没生效"的判据：`conversations > 0 && restored === 0 && pairStore.enabled`
+       * 意味着这些会话是本次运行新配出来的（正常），反过来
+       * `restored > 0` 而 `conversations === 0` 才是异常。
+       *
+       * **`lastSavedAt` 与路径都不含 PSK**：这份快照会被外部脚本读，
+       * 文件路径本身也不是凭据（里面的内容才是）。
+       */
+      pairStore: {
+        enabled: pairStoreFile !== '',
+        file: pairStoreFile || undefined,
+        restored: restoredAtBoot.length,
+        lastSavedAt:
+          pairStoreFile && pairStore.lastSavedAt > 0 ? new Date(pairStore.lastSavedAt).toISOString() : undefined,
+      },
       pairing: describeActivePairing(),
       keepAwake: snapshot,
       kernel: kernel?.describe() ?? null,
@@ -881,6 +961,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // pill 那四条路由也要一起收：它是不在主链路上的旁路，所以单独一句。
       pillRoutes?.stop()
       status.stop()
+      // **停机时补一次落盘**：正常关机是唯一能保证"3 秒 tick 之前那几秒的改动也写下去"的时机。
+      // 只在有脏数据时写（`save` 内部也会因空文件路径直接返回）。
+      if (pairStoreFile && relay && pairStore.hasPendingChanges) {
+        pairStore.save(relay.conversations.snapshot(), clock.now())
+      }
       runtime?.stop()
       relay?.stop()
       sleep.stop()
