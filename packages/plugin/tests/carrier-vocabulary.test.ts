@@ -239,3 +239,132 @@ test('user/message 缺 source：按真人处理（宁可多显示一条，也不
   assert.equal(delta?.role, 'user', '缺 source 的 user/message 仍要当真人消息，否则用户发的话在手机上凭空消失')
   assert.equal(delta?.text, '旧一代的形状，没有 source')
 })
+
+// 2026-10-04 用户截图报的三件事：聊天框里的 XML / title 是 JSON / 结果是乱码
+// data 形状都从本机 session log（~/.dsh/sessions/**/session.v4.jsonl.zstd）逐字抄来。
+
+test('assistant/message：正文里的 XML 是传输副本，剥掉后只留正文', () => {
+  const xml = [
+    '<tool_call>',
+    '<function=run_code>',
+    '<parameter=command=true, description=false/>',
+    '<parameter=code>',
+    'const y = 2',
+    '</parameter>',
+    '<parameter=description>试一下</parameter>',
+    '</function>',
+    '</tool_call>',
+  ].join('\n')
+  const prose = '三个问题都收到，先定位代码路径：'
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'assistant/message',
+    seq: 429,
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '……' },
+          {
+            type: 'tool-call',
+            id: 'chatcmpl-tool-1',
+            name: 'run_code',
+            arguments: '{"code":"const x = 1","description":"试一下"}',
+          },
+          { type: 'text', text: prose + xml },
+        ],
+      },
+    },
+  })
+  const [delta] = asDelta(events)
+  assert.equal(delta?.text, prose, 'XML 没剥干净：手机上聊天框挂着一段 tool_call 原文')
+  assert.equal(delta?.text?.includes('<'), false, 'XML 的尖括号漏过来了')
+})
+test('assistant/message：整条只有一个工具调用时剥成空正文，但 messageId 还在', () => {
+  const xml = [
+    '<tool_call>',
+    '<function=run_code>',
+    '<parameter=code>',
+    'const y = 2',
+    '</parameter>',
+    '</function>',
+    '</tool_call>',
+  ].join('\n')
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'assistant/message',
+    seq: 206,
+    data: { message: { role: 'assistant', content: [{ type: 'text', text: xml }] } },
+  })
+  const [delta] = asDelta(events)
+  assert.equal(delta?.text, '', '纯工具调用剥完必须是空串：留一个换行 mp 也会建出一条空白块')
+  assert.ok(delta?.messageId, '空正文也要带 messageId，否则下一条带字的消息被挂到这一行上')
+})
+test('assistant/message：正文里提到的标签不是块，一个字都不许删', () => {
+  const OPEN = '<tool_call>'
+  const prose =
+    '插件侧根因已清楚（不过滤 tool_call XML）。桌面上出现原始 ' + OPEN + ' 标签也不该被当成块：其后这三个都要改。'
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'assistant/message',
+    seq: 499,
+    data: { message: { role: 'assistant', content: [{ type: 'text', text: prose }] } },
+  })
+  const [delta] = asDelta(events)
+  assert.equal(delta?.text, prose, '把正文里的提到当成块开头，从那儿往后的真正文被删光了')
+})
+test('assistant/message：尾部未闭合的块（流被掐断）也要剥，但不许吃掉正文', () => {
+  const cut = ['结论先说：修插件。', '<tool_call>', '<function=run_code>', '<parameter=code>', 'const z = 3'].join('\n')
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'assistant/message',
+    seq: 998,
+    data: { message: { role: 'assistant', content: [{ type: 'text', text: cut }] } },
+  })
+  const [delta] = asDelta(events)
+  assert.equal(delta?.text, '结论先说：修插件。\n', '未闭合块没剥掉，或者把块前的正文一起吞了')
+})
+test('tool/call：title 取 arguments 里的 description，不贴 455 字符 JSON', () => {
+  const args = JSON.stringify({
+    code: 'const res = await tools.bash({})\nreturn res',
+    description: '检查部署产物新鲜度与未发布提交',
+  })
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'tool/call',
+    seq: 820,
+    data: { callId: 'chatcmpl-tool-1', name: 'run_code', arguments: args },
+  })
+  const [tool] = asTool(events)
+  assert.equal(
+    tool?.title,
+    '检查部署产物新鲜度与未发布提交',
+    'title 还是整串 JSON：步骤卡片上每个 run_code 都挂着一段看不懂的参数',
+  )
+  assert.match(tool?.argsPreview ?? '', /检查部署产物新鲜度与未发布提交/, '参数预览丢了')
+  assert.equal(tool?.argsPreview?.includes('\n'), true, '参数预览是真 JSON：美化后应当有真换行')
+})
+test('tool/result：正文是 part 数组时取文本，不许 stringify 成字面量乱码', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'session-af3f',
+    type: 'tool/result',
+    seq: 821,
+    data: {
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId: 'chatcmpl-tool-1' },
+        toolCallId: 'chatcmpl-tool-1',
+        content: [{ type: 'text', text: '{\n  "kind": "foreground",\n  "stdout": { "text": "wire 1.2.0" }\n}' }],
+      },
+    },
+  })
+  const [tool] = asTool(events)
+  assert.match(tool?.resultPreview ?? '', /wire 1\.2\.0/, '结果预览丢了')
+  assert.equal(
+    tool?.resultPreview?.includes('\\n'),
+    false,
+    '还有字面量反斜杠n：手机上就是一片乱码（JSON.stringify 的痕迹）',
+  )
+  assert.equal(tool?.resultPreview?.includes('\\"'), false, '还有字面量反斜杠引号：同上')
+  assert.equal(tool?.resultPreview?.includes('[{"type"'), false, '把 part 数组的壳也贴给了用户')
+})

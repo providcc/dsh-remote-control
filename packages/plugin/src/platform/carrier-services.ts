@@ -1189,17 +1189,30 @@ export function sessionEventKernelEvents(input: {
   switch (type) {
     case 'turn/start':
       return [{ kind: 'run-state', sessionId, state: 'running' }]
-    case 'assistant/message':
+    case 'assistant/message': {
+      // 工具调用在这一代宿主里有**两条**通道：结构化的 `tool/call` 事件，以及
+      // assistant 正文里一段 XML 序列化（真机形状见 `stripToolCallXml` 的注释，
+      // 取证：本机 session log 的 assistant/message 的 `type:'text'` part）。
+      // 正文这段是同一信息的第二份副本——不剥掉它，手机上每条助手消息都挂着
+      // 一段 XML 原文（用户 2026-10-04 截图：聊天框出现原始 tool_call XML），
+      // 而结构化那条在步骤卡片里已经呈现（title 走 `argsTitle`）。
+      //
+      // 剥完之后可能是空串（整条消息只有一个工具调用）：这时**仍然发出这一帧**
+      // （空正文 + messageId）。mp 的 `_applyText` 对空正文不建块（那里的注释
+      // 记着真机上的“一排只有 padding 的空白窄条”），所以发空帧是安全的；
+      // 而 messageId 必须跟着，否则下一条带字的消息会被挂到这一行上。
+      const text = stripToolCallXml(textOf(data))
       return [
         {
           kind: 'delta',
           sessionId,
           messageId: messageIdOf(data, input.seq),
-          text: textOf(data),
+          text,
           role: 'assistant',
           done: true,
         },
       ]
+    }
     case 'user/message': {
       // **只有真人输入才算"用户消息"**。宿主往会话里塞的东西一律走 `user/message`
       // 这个事件类型，但它们的 `source.kind` 分别是 time-context / runtime-context /
@@ -1238,8 +1251,8 @@ export function sessionEventKernelEvents(input: {
           callId: String(data.callId ?? data.id ?? `tool_${input.seq ?? 0}`),
           phase: argsRaw === undefined || argsRaw === null ? 'started' : 'args',
           tool: typeof data.name === 'string' ? data.name : undefined,
-          title: typeof data.title === 'string' ? data.title : previewOf(argsRaw),
-          ...(argsRaw === undefined ? {} : { argsPreview: previewOf(argsRaw) }),
+          title: typeof data.title === 'string' ? data.title : argsTitle(argsRaw),
+          ...(argsRaw === undefined ? {} : { argsPreview: argsPreviewOf(argsRaw) }),
         },
       ]
     }
@@ -1498,9 +1511,121 @@ function messageIdOf(data: LooseObject, seq: unknown): string {
   return `msg_${String(seq ?? Date.now())}`
 }
 
-function previewOf(value: unknown): string | undefined {
+/**
+ * 剥掉 assistant 正文里的工具调用 XML。
+ *
+ * 真机形状（取证：本机 session log 的 assistant/message）：这一代宿主把工具
+ * 调用**同时**写进结构化 part（`type:'tool-call'`）和一个 `type:'text'` part
+ * 的 XML 序列化里。结构化那条由 `tool/call` 事件单独出站（title 走
+ * `argsTitle`），正文这段是同一信息的第二份副本——把它透到手机上，用户看到
+ * 的就是聊天框里一段 XML 原文（用户 2026-10-04 截图报的就是它）。
+ *
+ * 三条判别，都是被真机形状逼出来的：
+ * ① **只剥完整的块**（开标签到闭合标签），块外的正文一个字不动；
+ * ② **尾部未闭合的块也剥**（流被掐断时），但要求开标签后紧跟 function=——
+ *    否则正文里反引号包着的提到（真机上出现过：助手解释“手机上有原始
+ *    XML”这件事时自己写了那个标签）会被当成块开头，从那儿把真正的正文删光；
+ * ③ 剥完可能是空串（整条消息只有一个工具调用）——调用方按空正文发帧，
+ *    mp 侧不建块（见 `_applyText` 的“空正文不建块”注释）。
+ */
+const TOOL_CALL_BLOCK = /<tool_call>\s*<function=[\s\S]*?<\/tool_call>/g
+const TOOL_CALL_UNCLOSED = /<tool_call>\s*<function=[\s\S]*$/
+
+export function stripToolCallXml(text: string): string {
+  const stripped = text.replace(TOOL_CALL_BLOCK, '').replace(TOOL_CALL_UNCLOSED, '')
+  // 只剩空白（整条都是 XML + 换行）就归还真正的空串：mp 对空串不建块，
+  // 对一个 '\n' 却会建（真机上那是一排只有 padding 的空白窄条）。
+  return stripped.trim() === '' ? '' : stripped
+}
+
+/**
+ * 工具调用的“这一步行标题”。
+ *
+ * 真机形状：`arguments` 是一个 **JSON 串**。旧实现把它整串当 title，于是步骤
+ * 卡片上每个 run_code 都挂着一 455 字符的 JSON——用户原话“run_code 有点
+ * 看不懂”（2026-10-04 截图）。模型写工具调用时都会带 `description`（一句话
+ * 说明这一步在干什么），那才是给人看的标题。取不到的才退回整串预览。
+ */
+function argsTitle(argsRaw: unknown): string | undefined {
+  const parsed = tryParseJson(argsRaw)
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const record = parsed as LooseObject
+    for (const key of ['description', 'prompt', 'command', 'path', 'file_path', 'pattern', 'query', 'url']) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) return oneLine(value)
+    }
+  }
+  return previewOf(argsRaw)
+}
+
+/** 展开时看的参数：是 JSON 就美化（真换行、有缩进），否则原样。 */
+function argsPreviewOf(argsRaw: unknown): string | undefined {
+  const parsed = tryParseJson(argsRaw)
+  if (parsed !== undefined) {
+    try {
+      return previewOf(JSON.stringify(parsed, null, 2))
+    } catch {
+      /* 美化失败就原样，下面那句兜底 */
+    }
+  }
+  return previewOf(argsRaw)
+}
+
+function tryParseJson(value: unknown): unknown {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
+
+function oneLine(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat
+}
+
+/**
+ * 把任意内核值折成“给人看的预览文本”。
+ *
+ * 为什么不能直接 JSON.stringify：真机上 `tool/result` 的正文是
+ * `data.message.content`，一个 **part 数组**。旧实现对非字符串一律 stringify，
+ * 于是手机上每个工具结果都长这样 `[{"type":"text","text":"{\n …`——
+ * 换行是两个字面量、引号带反斜杠，markdown 渲染出来就是一片乱码
+ * （用户 2026-10-04 截图报的正是它）。所以：能取出人话就取人话，
+ * 取不到才 stringify（那是真的结构化数据）。
+ *
+ * 取不到的判定同样重要：part 数组里的非文本 part（图片等）没有 text 字段，
+ * 把它们也 stringify 进去等于把协议碎片贴给用户——跳过，只留文本。
+ */
+function readableText(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined
-  const text = typeof value === 'string' ? value : safeJson(value)
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((part) => readableText(part))
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
+    return parts.length > 0 ? parts.join('\n') : undefined
+  }
+  if (typeof value === 'object') {
+    const record = value as LooseObject
+    // 文本字段按“最像正文”的顺序找。message / result / error 是嵌套入口
+    // （真机形状：{message:{content:[...]}}、{error:{message:'...'}}）。
+    for (const key of ['content', 'text', 'output', 'stdout', 'stderr', 'message', 'result', 'error']) {
+      if (record[key] === undefined || record[key] === null) continue
+      const nested = readableText(record[key])
+      if (nested !== undefined && nested !== '') return nested
+    }
+    // 带 type 但不是文本的 part（图片、文件…）：没有可取的人话，不贴协议碎片。
+    if (typeof record.type === 'string' && record.type !== 'text') return undefined
+    return safeJson(record)
+  }
+  return safeJson(value)
+}
+
+function previewOf(value: unknown): string | undefined {
+  const text = readableText(value)
   if (!text) return undefined
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
 }
