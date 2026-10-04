@@ -95,6 +95,11 @@ export interface PluginConfig {
   uploadDir: string
   /** 单张图片的体积上限（字节）。默认 4MB：协议层只校"是不是 jpeg、几张"，校不了字节数。 */
   maxImageBytes: number
+  /**
+   * 新建会话使用的项目目录。空 = 跟着最近一条会话走（见 carrier-services 的 newSession）。
+   * 不给这条出路的话只剩"宿主进程 cwd"这个黑洞：真机上就是 `/`。
+   */
+  newSessionCwd: string
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -121,6 +126,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
   uploadDir: '',
   maxImageBytes: 4 * 1024 * 1024,
+  newSessionCwd: '',
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
   // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
   pill: { enabled: true },
@@ -213,6 +219,8 @@ export function readConfig(
   // 1/0/true/false，其余值不猜、退回上层。
   if (fromEnv('DRC_PILL')) merged.pill.enabled = envFlag(env.DRC_PILL, merged.pill.enabled)
   if (fromEnv('DRC_MOCK_BRIDGE') === '1') merged.mockBridge = true
+  // 新建会话的项目目录：给运维一个不改 yaml 的口子（空 = 跟着最近一条会话走）。
+  if (fromEnv('DRC_NEW_SESSION_CWD')) merged.newSessionCwd = env.DRC_NEW_SESSION_CWD as string
   // token 只从环境变量取：patch 文件是 600 权限的 yaml，但把凭据写在配置文件里
   // 比留在环境变量里更容易被顺手提交或贴进工单。
   if (merged.hostTokenEnv) merged.hostToken = env[merged.hostTokenEnv] ?? merged.hostToken

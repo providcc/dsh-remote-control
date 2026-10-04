@@ -624,7 +624,15 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         return
       }
       decided = true
-      start(createServicesKernel(collected as never, { log, clock }))
+      // newSessionCwd 透传：新建会话用哪个项目目录（见 carrier-services 的 newSession——
+      // 不给的话宿主用 process.cwd() 兜底，真机上是 /，会话就不在任何用户项目里）。
+      start(
+        createServicesKernel(collected as never, {
+          log,
+          clock,
+          newSessionCwd: config.newSessionCwd,
+        }),
+      )
       return
     }
     // 没有 services 载体就不启动，也不退回 apiProxy/typert：桌面态从未注册 apiProxy 服务，

@@ -39,7 +39,7 @@ interface Fixture {
   kernel(services: ServicesBundle): ReturnType<typeof createServicesKernel>
 }
 
-function fixture(): Fixture {
+function fixture(options: { newSessionCwd?: string } = {}): Fixture {
   const calls: Calls = { resume: [], unarchive: [], followup: [], steer: [], cancel: [] }
   const clock = new FakeClock()
   const liveAgent: Record<string, unknown> = {
@@ -75,7 +75,8 @@ function fixture(): Fixture {
     calls,
     liveAgent,
     bundle,
-    kernel: (services) => createServicesKernel(services, { clock, log: () => {} }),
+    kernel: (services) =>
+      createServicesKernel(services, { clock, log: () => {}, newSessionCwd: options.newSessionCwd }),
   }
 }
 
@@ -1020,10 +1021,56 @@ test('新建会话走 sessionController.commands.create({})：一个字段都不
   const kernel = f.kernel(services)
   const made = await kernel.newSession!()
   assert.deepEqual(made, { ok: true, sessionId: 'session-abc' })
-  // 空对象而不是 `{cwd: ...}` / `{sessionId: ...}`：不给 sessionId 才让内核分配新的，
-  // 不给 cwd/workspaceId 才用宿主自己的默认项目目录（两者同时给会被内核当场拒）。
+  // 永远不给 sessionId（那才会复用旧会话而不是新建）；这一版连 cwd 都不给——
+  // 一条会话都没有、配置也没点名时没有可抄的目录，交给宿主默认（2026-10-04 起
+  // cwd 是显式给的，见下面两条；空列表这一档退回旧行为）。
   assert.deepEqual(asked, [{}])
   assert.match(String((kernel.describe() as Record<string, unknown>).createFace), /commands\.create/)
+})
+
+test('新建会话带 cwd：不给的话宿主用 process.cwd() 兜底（真机上是 /），会话就不在任何用户项目里', async () => {
+  const f = fixture()
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  // 最近一条会话在 /Users/linbin/dsh-remote-control：用户在做的项目就是它。
+  services.sessionQuery = {
+    listSessions: () =>
+      Promise.resolve([
+        {
+          header: { id: 'ses_old', createdAt: 1_700_000_000_000, cwd: '/Users/linbin/dsh-remote-control' },
+        },
+      ]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-xyz' })
+      },
+    },
+  }
+  const made = await f.kernel(services).newSession!()
+  assert.equal(made.ok, true)
+  assert.deepEqual(asked, [{ cwd: '/Users/linbin/dsh-remote-control' }], '要挂在用户此刻在做的项目上')
+})
+
+test('新建会话的 cwd：配置点名优先于"跟着最近一条会话走"', async () => {
+  const f = fixture({ newSessionCwd: '/Users/linbin/other-proj' })
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () => Promise.resolve([{ header: { id: 'ses_old', createdAt: 1_700_000_000_000, cwd: '/w/stale' } }]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-pinned' })
+      },
+    },
+  }
+  await f.kernel(services).newSession!()
+  assert.deepEqual(asked, [{ cwd: '/Users/linbin/other-proj' }], '配置点名的目录优先')
 })
 
 test('新建的空会话必须出现在列表里 —— 持久化那面还没它，而它已经不是"不存在"', async () => {

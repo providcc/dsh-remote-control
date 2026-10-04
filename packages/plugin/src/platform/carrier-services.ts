@@ -161,6 +161,12 @@ export interface ServicesOptions {
   historyTimeoutMs?: number
   /** 新建会话的超时。 */
   createTimeoutMs?: number
+  /**
+   * 新建会话时显式使用的项目目录（cwd）。空 = 智能选（见 newSession 里的三级）。
+   * 为什么要有这个口子：宿主进程的 process.cwd() 是 `/`，会话挂在那儿不属于任何
+   * 用户项目，GUI 的列表按项目分组就看不见它（用户 2026-10-04 实测）。
+   */
+  newSessionCwd?: string
 }
 
 const MAX_TITLE_BATCH_DEFAULT = 25
@@ -491,10 +497,28 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       return { ok: false, message: `sessionController.commands 上没有 create()（成员：${shapeOf(commands)}）` }
     }
     try {
-      // 只传空对象：不指定 sessionId（交给内核分配）、不指定 cwd / workspaceId（用默认项目目录）。
-      // 两者同时给会被内核当场拒（`gateway/bad-request`），所以这里一个都不给。
+      // cwd 要显式给（2026-10-04 用户实测："mp 端创建的会话不会出现在 dsh 的会话列表中"）。
+      // 不给的时候内核用宿主进程的 process.cwd() 兜底——真机上 lsof 一看就是 `/`，
+      // 于是会话挂在一个不属于任何用户项目的目录里，GUI 的列表按项目分组自然看不见它
+      // （手机侧照能用，只是主机那一面"新建了却不在列表里"）。
+      //
+      // 三级取值：配置点名的 > 最近一条会话的目录（用户此刻在做的项目，列表本来就带 cwd）
+      //        > 还是不给（宿主自己安排，日志留痕）。
+      // ⚠️ 仍然永远不给 sessionId（那会让内核复用旧会话而不是新建），
+      // 也永远不与 workspaceId 同时给（两者并存会被内核当场拒 gateway/bad-request）。
+      let cwd = String(options.newSessionCwd ?? '').trim()
+      if (!cwd) {
+        try {
+          const newest = (await listSessions(1))[0]
+          cwd = String(newest?.summary?.workspace ?? '').trim()
+        } catch {
+          // 列表读失败不挡新建：退回旧行为（宿主默认目录），日志由 listSessions 自己记。
+        }
+      }
+      const request: Record<string, unknown> = cwd === '' ? {} : { cwd }
+      if (cwd === '') log('new session without explicit cwd; host default applies', {})
       const made = (await withTimeout(
-        Promise.resolve(create.call(commands, {})),
+        Promise.resolve(create.call(commands, request)),
         options.createTimeoutMs ?? CREATE_TIMEOUT_DEFAULT,
       )) as LooseObject | undefined
       const id = typeof made?.sessionId === 'string' ? made.sessionId : ''
