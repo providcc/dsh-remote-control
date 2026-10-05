@@ -74,10 +74,8 @@ export interface RuntimeOptions {
   questionTimeoutMs: number
   /** 发指令前自动恢复归档会话。关掉它就要接受"归档会话被宿主 gate 直接拒掉"。 */
   unarchiveOnPrompt: boolean
-  /** 图片附件落盘目录（`shell/uploads.ts`）；空串时该模块自己退化成"不落盘、拒收图片"。 */
+  /** 文件附件落盘目录（`shell/uploads.ts`）；空串时主机拒收文件附件。 */
   uploadDir: string
-  /** 单张图片字节上限（协议层只校张数与类型，校不了字节）。 */
-  maxImageBytes: number
   maxFileBytes: number
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
 }
@@ -115,7 +113,6 @@ const DEFAULTS: RuntimeOptions = {
   // 图片附件：默认**不收**（uploadDir 空 = 拒收）。要放开必须在插件配置里显式
   // 给一个目录——落盘是往用户磁盘写文件，不该由库默认值悄悄代劳。
   uploadDir: '',
-  maxImageBytes: 4 * 1024 * 1024,
   maxFileBytes: 512 * 1024,
 }
 

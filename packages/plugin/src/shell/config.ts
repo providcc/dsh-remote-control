@@ -93,8 +93,6 @@ export interface PluginConfig {
    * 所以要能被配置指向一个有清理策略的位置（比如 tmp），默认值偏向"找得到"而不是"省地方"。
    */
   uploadDir: string
-  /** 单张图片的体积上限（字节）。默认 4MB：协议层只校"是不是 jpeg、几张"，校不了字节数。 */
-  maxImageBytes: number
   /** 单个文件附件的字节上限。默认 512KB：中继单帧 1MB 是硬上限，而文件没有压缩这一步。 */
   maxFileBytes: number
   /**
@@ -127,7 +125,6 @@ export const DEFAULT_CONFIG: PluginConfig = {
   pairStoreFile: '',
   // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
   uploadDir: '',
-  maxImageBytes: 4 * 1024 * 1024,
   maxFileBytes: 512 * 1024,
   newSessionCwd: '',
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
