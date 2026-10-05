@@ -64,11 +64,17 @@ export interface QueuedMessage {
   /** state=failed 时的原因，原样给手机显示。 */
   message?: string
   /**
-   * 这条是谁发起的。'host' = 主机自己起的回合（用户在 DSH 里发的），
-   * 它的文字要等用户消息回传（delta role=user）才能填上。
+   * 这条是谁发起的。'host' = 用户在 DSH 里发的（经 agent/inbox/spliced 捕获，
+   * 2026-10-05 取证后从「猜」改成「直接看见」）。
    * **不进协议快照**——手机不需要区分，它只关心状态。
    */
   origin?: 'phone' | 'host'
+  /**
+   * 内核给这条消息的原始 id（inbox 事件里带来的）。
+   * 用它做去重键：同一条消息可能被 inbox 事件报告不止一次
+   * （实测 inserted 有多条、start 也会重复调整），按内核 id 认才不会重复显示。
+   */
+  kernelId?: string
   /**
    * 已经交给内核了，但内核还没确认在跑。
    * **对手机那一侧仍然显示 held**：它确实还没跑，说它 sent 就是撒谎。
@@ -175,40 +181,48 @@ export class PromptQueue {
   }
 
   /**
-   * 保证有一条"主机自己起的回合"的占位项，返回它。
+   * 内核报告「有一条用户消息被拼进 inbox 了」（agent/inbox/spliced）。
    *
-   * run-state 说 running 但我们没有任何 held 项可提升时调用——那说明这一回合
-   * 是主机侧发起的（用户在 DSH 里发的，或别的入口），手机那边看不见。
-   * 造一条 origin=host 的项，文字先空着，等用户消息回传填。
+   * **这是 dsh 侧排队消息进表的唯一入口**（2026-10-05 用户实测四连问题后取证）。
    *
-   * 幂等：已有占位项就返回它，不重复造。
+   * 之前这里是一套猜：run-state=running 且本会话无可提升项 → 造一条空占位项，
+   * 再等 delta role=user 回填文字。猜有两处硬伤：
+   *   - 占位项与真实消息**对不上号**（并发两轮、或消息在 run-state 之前到，
+   *     文字会填错那条）；
+   *   - 内核回填的 user delta 也可能是**审批策略提示**之类机器塞的话，
+   *     填进去就成了假排队。
+   * 现在改成内核直接告诉我们正文、来源和消息 id，不用猜。
+   *
+   * 幂等：同一个 kernelId 重复报告只更新、不新增。
    */
-  ensureHostSlot(sessionId: string): QueuedMessage {
-    const existing = this.items.find((it) => it.sessionId === sessionId && it.origin === 'host')
-    if (existing) return existing
-    const slot: QueuedMessage = {
-      queueId: 'h' + Math.random().toString(36).slice(2, 10),
+  noteInbox(sessionId: string, kernelId: string, text: string): void {
+    if (this.items.some((it) => it.kernelId === kernelId)) {
+      // 已入表，只补文字（第一次那条可能文字是空的，比如原文只有图片）
+      const it = this.items.find((x) => x.kernelId === kernelId)
+      if (it && !it.text && text) it.text = text
+      return
+    }
+    this.items.push({
+      queueId: kernelId,
       sessionId,
-      text: '',
+      text,
       images: 0,
       files: 0,
-      state: 'sent',
+      state: 'held',
       origin: 'host',
-    }
-    this.items.push(slot)
-    return slot
+      kernelId,
+    })
   }
 
   /**
-   * 主机侧用户消息的回传到了：把文字填进占位项。
-   *
-   * @returns true = 填上了（这一帧确实是主机侧回合的回传）
+   * 这条是不是已经在内核那边交出去了（手机发的转发出去了 / dsh 发的本来就进去了）。
+   * 用来判断「还能不能只是删表里的一项」——不能的话删除就得走 interrupt。
    */
-  fillHostText(sessionId: string, text: string): boolean {
-    const slot = this.items.find((it) => it.sessionId === sessionId && it.origin === 'host' && it.state === 'sent')
-    if (!slot) return false
-    if (!slot.text && text) slot.text = text
-    return true
+  hasHandedOff(queueId: string): boolean {
+    const it = this.find(queueId)
+    if (!it) return false
+    if (it.state !== 'held') return true
+    return Boolean(it.inflight)
   }
 
   /**

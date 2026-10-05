@@ -1825,29 +1825,97 @@ test('run-state 说 running 才提升 sent：那一刻才真的叫在跑', async
   assert.equal(items[0]?.state, 'sent', '内核确认在跑才提升')
 })
 
-test('dsh 侧创建的回合也要同步到 mp：run-state running 且没有我们的消息时造 host slot', async () => {
+test('dsh 侧创建的回合也要同步到 mp：inbox 事件直接入表（2026-10-05 取证后改）', async () => {
   const { runtime, kernel, transport } = fixture()
   runtime.start()
   await settle()
   transport.pair('c_q03')
-  // 用户直接在 DSH 里发消息：内核起回合、回传 user delta。手机上没发过任何东西。
-  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  // 用户直接在 DSH 里发消息：内核把它拼进 agent 的 inbox。
+  // **这就是主机侧排队的真实信号**——之前是拿 run-state + user delta 猜，
+  // 猜出来的占位项常常对不上号，还可能把审批策略提示当成用户消息。
   await kernel.feed({
-    kind: 'delta',
+    kind: 'inbox',
     sessionId: 'ses_live',
-    messageId: 'm1',
-    role: 'user',
+    target: 'next-turn',
+    messageId: 'msg_host_1',
     text: '主机侧发的那条',
-    done: true,
   })
   const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
-  assert.ok(frames.length >= 1, '主机侧回合也要推 ev.queue——否则手机完全看不见')
+  assert.ok(frames.length >= 1, '主机侧的排队也要推 ev.queue——否则手机完全看不见')
   const items = (frames.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  assert.equal(items.length, 1, '要有一条占位项')
-  assert.equal(items[0]?.state, 'sent', '主机侧回合确实在跑')
-  assert.equal(items[0]?.text, '主机侧发的那条', '文字要由 user delta 回填，不能空着')
+  assert.equal(items.length, 1, '要有一条')
+  assert.equal(items[0]?.text, '主机侧发的那条', '正文直接来自内核事件，不靠回填')
+  assert.equal(items[0]?.queueId, 'msg_host_1', 'queueId 用内核消息 id，双端对得上号')
+  assert.equal(items[0]?.state, 'held', '还没跑到它，就是排队中')
 })
 
+test('inbox：同一条内核消息重复报告只进表一次（幂等靠内核 id）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q04')
+  const ev = {
+    kind: 'inbox' as const,
+    sessionId: 'ses_live',
+    target: 'next-turn' as const,
+    messageId: 'msg_dup',
+    text: '同一条',
+  }
+  await kernel.feed(ev)
+  await kernel.feed(ev)
+  await kernel.feed(ev)
+  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
+  const items = (frames.at(-1) as { items?: unknown[] }).items ?? []
+  assert.equal(items.length, 1, '重复报告不该让手机上出现三条一样的')
+})
+
+test('cmd.get_queue：mp 主动拉取，主机回当前全量（进会话不靠推送）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q05')
+  await kernel.feed({
+    kind: 'inbox',
+    sessionId: 'ses_live',
+    target: 'next-turn',
+    messageId: 'msg_q1',
+    text: '排在前面的一条',
+  })
+  await kernel.feed({
+    kind: 'inbox',
+    sessionId: 'ses_live',
+    target: 'next-turn',
+    messageId: 'msg_q2',
+    text: '排在后面的一条',
+  })
+  // **在此刻手机一个事件都没收到也不影响**：进会话就是来问主机要。
+  await runtime.handleCommand(cmd('cmd.get_queue', { sessionId: 'ses_live' }), 'c_q05')
+  await settle()
+  const res = transport.resultReplies().at(-1) as { ok?: boolean; data?: { items?: Array<Record<string, unknown>> } }
+  assert.equal(res?.ok, true, '拉取要成功')
+  const items = res?.data?.items ?? []
+  assert.equal(items.length, 2, '两条排队都要在')
+  assert.deepEqual(
+    items.map((x) => x.text),
+    ['排在前面的一条', '排在后面的一条'],
+    '顺序必须与入队一致',
+  )
+})
+
+test('cmd.get_queue：另一条会话的排队不串台', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q06')
+  await kernel.feed({ kind: 'inbox', sessionId: 'ses_a', target: 'next-turn', messageId: 'm_a', text: 'A 的' })
+  await kernel.feed({ kind: 'inbox', sessionId: 'ses_b', target: 'next-turn', messageId: 'm_b', text: 'B 的' })
+  await runtime.handleCommand(cmd('cmd.get_queue', { sessionId: 'ses_a' }), 'c_q06')
+  await settle()
+  const res = transport.resultReplies().at(-1) as { data?: { items?: Array<Record<string, unknown>> } }
+  const items = res?.data?.items ?? []
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.text, 'A 的')
+})
 test('mp 端取消 sent：走中断，回执说清「已中断」而不是「撤不回来」', async () => {
   const { runtime, kernel, transport } = fixture()
   runtime.start()

@@ -1196,6 +1196,9 @@ export const MAPPED_SESSION_EVENTS = new Set([
   // 内核的 todo/write 在真机的 eventTypes 里（status.json 的 unmappedEventTypes 曾一直记着它），
   // 但没人转发到手机——于是手机上一整轮"现在在干什么"都是空白。2026-10-05 补上。
   'todo/write',
+  // agent/inbox/spliced 同理：真机 eventTypes 里一直有，却因缺 case 被记成 unmapped，
+  // 于是主机侧排队的消息在手机上完全不可见。2026-10-05 补上。
+  'agent/inbox/spliced',
 ])
 
 export function sessionEventKernelEvents(input: {
@@ -1256,6 +1259,40 @@ export function sessionEventKernelEvents(input: {
           text: textOf(data),
           role: 'user',
           done: true,
+        },
+      ]
+    }
+    case 'agent/inbox/spliced': {
+      // **「用户在 DSH 里发的消息」在这里第一次变得可见**（2026-10-05 取证）。
+      //
+      // 之前这条事件被 default: return [] 吞掉，于是插件完全不知道主机侧
+      // 有人在排队——status.json 的 kernel.unmappedEventTypes 里一直记着它，
+      // 是当时的唯一线索。真实负载（真机 session log，338 条）：
+      //   data.target     'next-turn'(163) | 'next-step'(175)
+      //   data.inserted   180 条有内容 / 158 条是**空数组**
+      //   source.kind     user(92) / ptc-mode(51) / repeat-tool-reminder(29)
+      //                   / user-approval(4) / tool-jobs(4)
+      //
+      // 三道过滤，缺一条手机就会多出假排队：
+      //   1. target !== 'next-turn' → 这是插话（当前轮内就消化），不是排队。
+      //   2. inserted 为空 → 纯 start 调整，没有任何消息进来。
+      //   3. source.kind !== 'user' → 内核自己塞的（图片回传、后台任务回执、
+      //      重复调用提醒、审批策略变更）。判据与 user/message 那条同源、
+      //      同一个理由：不是人写的话不能顶着用户的样子显示。
+      //
+      // messageId 用 inserted[0].id（内核给的原始 id），这样主机侧的消息
+      // 与手机侧的消息进的是同一张表、同一套去重逻辑。
+      if (data.target !== 'next-turn') return []
+      const inserted = Array.isArray(data.inserted) ? data.inserted : []
+      const first = inserted[0] as LooseObject | undefined
+      if (!first || !isHumanUserMessage(first)) return []
+      return [
+        {
+          kind: 'inbox',
+          sessionId,
+          target: 'next-turn',
+          messageId: typeof first.id === 'string' ? first.id : 'i' + String(input.seq),
+          text: textOf(first),
         },
       ]
     }

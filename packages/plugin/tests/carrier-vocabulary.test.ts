@@ -200,7 +200,7 @@ test('tool/result：callId 藏在 message.toolCallId，正文在 message.content
 })
 
 test('未识别的类型返回空数组且不抛（不映射、不猜语义）', () => {
-  for (const type of ['step/start', 'step/end', 'request/header', 'agent/inbox/spliced', 'internal/config']) {
+  for (const type of ['step/start', 'step/end', 'request/header', 'internal/config']) {
     assert.equal(MAPPED_SESSION_EVENTS.has(type), false, `${type} 被登记成已映射，但映射表里没有它`)
     assert.deepEqual(
       sessionEventKernelEvents({ sessionId: 'ses_1', type, seq: 1, data: { anything: true } }),
@@ -428,4 +428,93 @@ test('tool/result：正文是 part 数组时取文本，不许 stringify 成字�
   )
   assert.equal(tool?.resultPreview?.includes('\\"'), false, '还有字面量反斜杠引号：同上')
   assert.equal(tool?.resultPreview?.includes('[{"type"'), false, '把 part 数组的壳也贴给了用户')
+})
+
+/**
+ * agent/inbox/spliced：**主机侧排队消息的唯一入口**（2026-10-05 取证后补）。
+ *
+ * 真实负载（真机 session log 逐条统计，338 条）：
+ *   target     'next-turn' 163 / 'next-step' 175
+ *   inserted   180 条有内容 / 158 条空数组
+ *   source.kind user 92 / ptc-mode 51 / repeat-tool-reminder 29 /
+ *               user-approval 4 / tool-jobs 4
+ *
+ * 三道过滤的判据都在下面：**少一道，手机上就会多出一条用户没排过的假消息**。
+ */
+const inboxSplice = (data: Record<string, unknown>) => ({
+  sessionId: 'ses_1',
+  type: 'agent/inbox/spliced',
+  seq: 7,
+  data,
+})
+
+test('inbox：next-turn + source.kind=user 才出站，正文与内核 id 原样带出', () => {
+  const [ev] = sessionEventKernelEvents(
+    inboxSplice({
+      target: 'next-turn',
+      start: 0,
+      inserted: [
+        {
+          content: [{ type: 'text', text: '读handoff获取足够上下文' }],
+          source: { kind: 'user', rpcId: 'rpc_1' },
+          role: 'user',
+          id: 'msg_abc',
+        },
+      ],
+    }),
+  )
+  assert.deepEqual(ev, {
+    kind: 'inbox',
+    sessionId: 'ses_1',
+    target: 'next-turn',
+    messageId: 'msg_abc',
+    text: '读handoff获取足够上下文',
+  })
+})
+
+test('inbox：next-step 是插话不是排队，不出站', () => {
+  assert.deepEqual(
+    sessionEventKernelEvents(
+      inboxSplice({
+        target: 'next-step',
+        inserted: [{ content: [{ type: 'text', text: '顺便查下这个' }], source: { kind: 'user' }, id: 'm2' }],
+      }),
+    ),
+    [],
+  )
+})
+
+test('inbox：inserted 为空数组不算消息（真机 158/338 条是这样）', () => {
+  assert.deepEqual(sessionEventKernelEvents(inboxSplice({ target: 'next-turn', inserted: [] })), [])
+  assert.deepEqual(sessionEventKernelEvents(inboxSplice({ target: 'next-turn' })), [])
+})
+
+test('inbox：非 user 来源一律不出站（图片回传/后台任务/内核提醒/策略变更）', () => {
+  for (const kind of ['ptc-mode', 'tool-jobs', 'repeat-tool-reminder', 'user-approval']) {
+    assert.deepEqual(
+      sessionEventKernelEvents(
+        inboxSplice({
+          target: 'next-turn',
+          inserted: [{ content: [{ type: 'text', text: '机器塞的话' }], source: { kind }, id: 'm_' + kind }],
+        }),
+      ),
+      [],
+      kind + ' 不是人写的，不该显示成用户排的消息',
+    )
+  }
+})
+
+test('inbox：没有 id 时用 seq 兜底，保证 messageId 永不为空', () => {
+  const [ev] = sessionEventKernelEvents(
+    inboxSplice({
+      target: 'next-turn',
+      inserted: [{ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }],
+    }),
+  )
+  assert.equal(ev?.kind, 'inbox', '应该映射成 inbox')
+  assert.equal(ev?.kind === 'inbox' ? ev.messageId : null, 'i7', '没有 id 时用 seq 兜底')
+})
+
+test('inbox：登记进 MAPPED_SESSION_EVENTS（否则 status.json 会一直记着它没被映射）', () => {
+  assert.equal(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), true)
 })

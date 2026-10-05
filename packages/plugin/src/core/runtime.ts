@@ -289,6 +289,21 @@ export class HostRuntime {
           void this.drainQueue(cmd.sessionId)
           return
         }
+        case 'cmd.get_queue': {
+          // 手机主动来问'这条会话现在排着几条'（2026-10-05 用户实测第三点：
+          // mp 端进入会话看不到当前排队）。
+          //
+          // 之前只有 ev.queue 的**被动推送**，而推送只在状态变化时才有。
+          // 手机进会话/切回前台/刚重连这三个时刻，主机这边什么都没发生，
+          // 于是没有任何一帧会来——这不是同步慢，是根本没有触发点。
+          //
+          // 回执里直接带上全量（data.items），不等下一帧广播：
+          // 走 reply 是因为这是**问-答**而不是事件，回完这一次就结束，
+          // 不该在广播流里制造一个谁订阅谁负责的语义。
+          // 广播那条 ev.queue 仍然保留（状态变化时的实时性靠它）。
+          reply(true, { data: { items: this.queue.snapshot(cmd.sessionId) } })
+          return
+        }
         case 'cmd.drop_queued': {
           // 取消一条排队消息（2026-10-05 用户重做：mp 端要能取消）。
           // 三种状态各有各的做法，回执说的话也各不一样：
@@ -528,18 +543,11 @@ export class HostRuntime {
         if (event.text) this.window.push(event.sessionId, event.messageId, event.text, event.role)
         if (event.done) this.window.complete(event.sessionId, event.messageId, event.role)
         if (event.text) this.sleep.markActive()
-        // 主机侧用户消息的回传：把文字填进 run-state 造的那条占位项。
-        // 没有占位项就说明主机发了消息但 run-state 还没到，补一条。
-        // 这一步就是「在 dsh 创建的也要同步显示在 mp 端」的另一半。
-        if (event.role === 'user' && event.text) {
-          if (this.queue.fillHostText(event.sessionId, event.text)) {
-            this.pushQueue(event.sessionId)
-          } else if (this.queue.snapshot(event.sessionId).length === 0) {
-            this.queue.ensureHostSlot(event.sessionId)
-            this.queue.fillHostText(event.sessionId, event.text)
-            this.pushQueue(event.sessionId)
-          }
-        }
+        // 注意：**这里不再处理「主机侧发的消息」**。
+        // 以前靠 user 回传的 delta 去填一条猜出来的占位项——那是 2026-10-05 早上的
+        // 错路：内核会往 user 通道塞审批策略提示之类机器话，填进去就是假排队。
+        // 现在统一走 agent/inbox/spliced（见下面的 inbox 分支），那里有 source.kind
+        // 能分清谁是人写的。
         return
       }
       case 'tool':
@@ -555,11 +563,9 @@ export class HostRuntime {
           this.sleep.markActive()
           this.queue.setBusy(true)
           // 内核确认在跑：这才有资格把 held 提升成 sent。
-          const promoted = this.queue.markRunning(event.sessionId)
-          // 一条都没提升 = 这一回合不是手机发起的，是主机自己起的（用户在 DSH 里
-          // 发的，或别的入口）。造一条占位项，手机那才看得见主机侧的回合；
-          // 它的文字等 delta role=user 的回传填（见上面 delta 分支）。
-          if (promoted.length === 0) this.queue.ensureHostSlot(event.sessionId)
+          // **不再在这里造 host 占位项**（2026-10-05 修正）：主机侧排队的消息
+          // 由 inbox 事件直接入表，那里有正文和内核 id，不用猜。
+          this.queue.markRunning(event.sessionId)
           this.pushQueue(event.sessionId)
         } else {
           // 回合结束：把已经发出去的那些从排队条里撤掉（它们进了消息流），
@@ -570,6 +576,20 @@ export class HostRuntime {
         }
         void this.pushSessions('run-state')
         return
+      case 'inbox': {
+        // **用户在 DSH 里发的消息入表**（2026-10-05 取证后新增，见 ports/index.ts
+        // 里 kind:'inbox' 的注释）。这条是「dsh 侧排队的消息在手机上也看得见」
+        // 的唯一入口——在它之前，插件对主机侧排队**完全无知**，
+        // 只能靠 run-state 猜，猜出来的还常是空的。
+        //
+        // state 给 held：这条已经进了 agent 的 inbox，但**这一轮还没开始跑它**，
+        // 所以它就是排队的字面意思。而且 held 可删（见 drop_queued）。
+        //
+        // 幂等由 queue.noteInbox 按内核 id 保证，这里不重复判断。
+        this.queue.noteInbox(event.sessionId, event.messageId, event.text)
+        this.pushQueue(event.sessionId)
+        return
+      }
       case 'todo':
         // 与 tool 同一纪律：先 flush 同会话的文本缓冲，再广播整份快照。
         // 不做合并窗口——一轮 todo 也就十几条，逐条发手机也渲染得动；合并反而会让

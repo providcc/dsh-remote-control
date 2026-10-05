@@ -49,6 +49,43 @@ export type KernelEvent =
       argsPreview?: string
       resultPreview?: string
     }
+  | {
+      /**
+       * agent inbox 被拼接了一条消息（内核 agent/inbox/spliced）。
+       *
+       * **这是「用户在 DSH 里发的消息」唯一可靠的信号**（2026-10-05 用户实测
+       * 排队四连问题后取证得来）。真实负载：
+       *   {type:'agent/inbox/spliced', data:{
+       *     target: 'next-turn' | 'next-step',   // 排下一轮 vs 插当前轮的下一步
+       *     start: number,
+       *     inserted: [{content:[{type:'text',text}], source:{kind}, role, id}]}}
+       *
+       * 三个必须过滤的点（真机 session log 取证，各 100+ 条）：
+       *   1. target 只认 'next-turn'。'next-step' 是插话，当前轮里就消化了，
+       *      不是排队——混进来会让手机凭空多出一条排队。
+       *   2. inserted 有 158/338 条是**空数组**（纯 start 调整），空的不算消息。
+       *   3. source.kind 只有 'user' 是人写的。实测另有 user-approval（策略变更
+       *      提示）、ptc-mode（图片/文件回传）、tool-jobs（后台任务回执）、
+       *      repeat-tool-reminder（内核重复调用提醒）——这些都不是用户排的消息，
+       *      全部不显示。
+       *
+       * 为什么以前只能靠猜：宿主**确实**把这条事件转给了插件
+       * （status.json 的 kernel.eventTypes 里列着它），但 sessionEventKernelEvents
+       * 的 switch 没有对应 case，落到 default: return [] 被静默丢掉，
+       * 于是它同时出现在 kernel.unmappedEventTypes 里。
+       * 之前用「run-state=running 且本会话无可提升项 → 造 host 占位项、
+       * 再等 delta role=user 回填文字」来猜，既漏又对不齐（占位项和真实消息
+       * 可能对不上号）。现在直接用这条事件，正文/来源/消息 id 全都自带。
+       *
+       * text 是**空串**表示这次 splice 里没有可显示的文字（原文只剩图片，
+       * 或内容类型不是 text）。
+       */
+      kind: 'inbox'
+      sessionId: string
+      target: 'next-turn' | 'next-step'
+      messageId: string
+      text: string
+    }
   | { kind: 'run-state'; sessionId: string; state: 'running' | 'idle'; detail?: string }
   | {
       /** 待办清单全量快照（内核 `todo/write`）。
