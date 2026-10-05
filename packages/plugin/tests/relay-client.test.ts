@@ -531,6 +531,55 @@ test('peer-left 只摘掉那个客户端，会话与密钥必须留着（D3：�
   )
 })
 
+
+/**
+ * 2026-10-05 用户报：「mp 端解除配对，dsh 端执行的是手机离线」。
+ *
+ * 手机 unpair() 发的是 session-leave，中继把它转成 peer-left —— 与「socket 断了」
+ * 是**同一帧**。主机据此只摘成员、留着会话，于是 clientCount=0 而
+ * conversationCount=1，pill 说「手机离线」。可手机那边 unpair() 已经 _forgetPairing()
+ * 清掉 convId，**再也不会回来**：主机这条会话是条永远清不掉的幽灵。
+ *
+ * 所以 peer-left 多了 unpaired 标记，把这两种情况分开：
+ *   - 不带（掉线）→ 上一条判据那套行为，一个字都不许变（D3 仍然成立）；
+ *   - 带 true（主动解配）→ 会话一并作废，pill 回到「未配对」。
+ *
+ * 判据钉的是 conversationCount（pill 读的就是它），不是「内部发生了什么」。
+ */
+test('peer-left 带 unpaired：手机主动解配 → 会话一并作废（别再显示成「手机离线」）', () => {
+  const { client, slots, feed, gone } = harness()
+  const slot = slots.create(120_000)
+  feed({ t: 'peer-joined', sessionId: 'c_444555666777', clientId: 'k_mp', pairingToken: slot.token })
+  assert.equal(client.conversationCount, 1, '夹具自检：会话已建立')
+
+  feed({ t: 'peer-left', sessionId: 'c_444555666777', clientId: 'k_mp', unpaired: true })
+  assert.equal(
+    client.conversationCount,
+    0,
+    '手机已经解配了，主机还留着这条会话 → conversationCount 恒为 1，pill 永远显示「手机离线」，用户永远等不到「未配对」',
+  )
+  assert.ok(
+    !client.conversationIds().includes('c_444555666777'),
+    '会话没作废：这条幽灵没有任何东西会清掉它',
+  )
+  assert.ok(
+    gone.some((id) => id === 'c_444555666777'),
+    '上层没收到 onConversationGone：runtime 不会去清这条会话的运行态',
+  )
+})
+
+test('peer-left 不带 unpaired（掉线）时行为一个字都不许变：D3 仍然留着会话', () => {
+  const { client, slots, feed } = harness()
+  const slot = slots.create(120_000)
+  feed({ t: 'peer-joined', sessionId: 'c_555666777888', clientId: 'k_mp', pairingToken: slot.token })
+
+  feed({ t: 'peer-left', sessionId: 'c_555666777888', clientId: 'k_mp' })
+  assert.ok(
+    client.conversationIds().includes('c_555666777888'),
+    '把掉线也当成解配了：手机切一下后台就被要求重新扫码（D3 这条命脉不能动）',
+  )
+  assert.equal(client.conversationCount, 1, '掉线不该动 conversationCount')
+})
 test('主动作废已知会话：发 session-leave + 通知上层，且同一条通道只声明一次', () => {
   const { client, slots, feed, gone, outOf } = harness()
   const slot = slots.create(120_000)

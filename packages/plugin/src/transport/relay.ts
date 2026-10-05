@@ -434,6 +434,19 @@ export class RelayClient {
         // 成员表要在这里摘掉这个 clientId：会话留着 ≠ 这台手机还连着。
         // 不摘的话，一部解了配的手机在 status.json 里仍然算"已连接"，
         // 而它再也不会回来 —— 那个状态没有任何东西会清掉。
+        // **主动解配**：中继告诉我们这一条是用户点的「解除配对」，不是掉线。
+        // 这时那条会话必须一起作废——手机 unpair() 里已经 _forgetPairing() 清了 convId，
+        // 它再也不会带这个 convId 回来。留着它就是一条永远清不掉的幽灵：
+        // clientCount 归 0 而 conversationCount 仍是 1，pill 于是永远说「手机离线」
+        // （2026-10-05 用户报：「mp 端解除配对，dsh 端执行的是手机离线」）。
+        //
+        // 走 voidConversation 而不是只摘成员：它同时会落盘、发 session-leave、
+        // 通知 onConversationGone —— 与主机自己那侧「退出配对」完全同一条路，
+        // 两端解配的语义这才对称（原来只有主机→手机那侧是对称的）。
+        if (frame.unpaired) {
+          this.voidConversation(frame.sessionId)
+          return
+        }
         if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.delete(frame.clientId)
         this.options.onClientLeft(frame.sessionId, frame.clientId)
         this.emitState('online')
