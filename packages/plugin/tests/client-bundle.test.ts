@@ -1126,3 +1126,29 @@ test('反证：产物里的路由常量与宿主侧定义逐字一致（分叉�
   const found = [...new Set([...bundle.matchAll(/\/plugins\/[a-z0-9./-]+/g)].map((match) => match[0]))].sort()
   assert.deepEqual(found, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE].sort())
 })
+
+/**
+ * 「手机离线」那一屏必须有一句「不用重新扫码」（2026-10-05）。
+ *
+ * 判据钉的是**这个结论在不在**，不是那句文案长什么样——所以 2026-10-05 把
+ * 「配对还在 小程序回前台会自动重连 不用重新扫码」压成「不用重新扫码」时，
+ * 这条判据不动；反过来哪天有人嫌它多余整句删掉，这里会红。
+ *
+ * 它为什么必须在：手机切后台就是离线（小程序生命周期），而配对簿还在。
+ * 少了这句，用户看到「手机离线」会去扫一个根本不需要扫的码
+ * （2026-10-04 用户提的误解）。
+ */
+test('pill：「手机离线」那一屏要有一句「不用重新扫码」', () => {
+  const src = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../client/src/pill.ts'), 'utf8')
+  assert.match(
+    src,
+    /text\('p', 'drc-note', '不用重新扫码'\)/,
+    '「手机离线」那一屏没有这句：用户会去扫一个不需要扫的码（2026-10-04 的误解）',
+  )
+  // 同时钉住"别再长回去"：那三句解释用户 2026-10-05 已经嫌长了。
+  assert.doesNotMatch(
+    src,
+    /'配对还在 小程序回前台会自动重连 不用重新扫码'/,
+    '文案又长回去了：用户要的行动只有一个判断（要不要扫码），答案是不要，就只说不要',
+  )
+})

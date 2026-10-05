@@ -543,11 +543,21 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     return head
   }
 
-  /** 「手机离线」那一屏的解释行；不是那个状态时返回 null（不占地方）。 */
+  /**
+   * 「手机离线」那一屏的解释行；不是那个状态时返回 null（不占地方）。
+   *
+   * **只留最要紧的六个字**（2026-10-05 用户：文案太长）。
+   * 原来是「配对还在 小程序回前台会自动重连 不用重新扫码」——三句、三十多字，
+   * 而用户要的行动只有一个判断：要不要去扫码。答案是不要，那就只说不要。
+   *
+   * 为什么不能整句删掉：它当初是为了修一个真实误解加的
+   * （2026-10-04 用户看到「手机离线」就去扫一个不需要扫的码）。
+   * 少了这句，用户会以为得重新配对。所以留结论、砍解释。
+   */
   const offlineNote = (): HTMLElement | null => {
     if (!lastStatus) return null
     if (pillLabel(lastStatus).text !== '手机离线') return null
-    return text('p', 'drc-note', '配对还在 小程序回前台会自动重连 不用重新扫码')
+    return text('p', 'drc-note', '不用重新扫码')
   }
 
   /** 正文那几行（待处理 / 中继 / 状态 / 版本）；某一行拿不到值时它自己不占地方。 */
@@ -623,8 +633,9 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       panel.appendChild(note)
     }
     for (const row of infoRows()) panel.appendChild(row)
-    // 手机离线那一屏要说清「不用重新扫码」：配对簿还在，小程序回前台自动重连。
+    // 手机离线那一屏要提一句「不用重新扫码」：配对簿还在，小程序回前台自动重连。
     // 不说这句，用户看到「手机离线」会去扫一个不需要扫的码（2026-10-04 用户提的误解）。
+    // 2026-10-05 用户嫌长，理由与那句文案本身见 offlineNote 的注释。
     const note = offlineNote()
     if (note) panel.appendChild(note)
   }
