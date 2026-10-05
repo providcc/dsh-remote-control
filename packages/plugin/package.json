@@ -61,7 +61,7 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "dsh-remote-wire": "^1.6.0",
+    "dsh-remote-wire": "file:/Users/linbin/dsh-remote-control/dsh-remote-protocol",
     "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0",

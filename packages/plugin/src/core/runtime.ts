@@ -30,6 +30,7 @@ import type {
   SessionSummary,
 } from 'dsh-remote-wire'
 import { appendFileNote, appendImageNote, saveFileAttachments, saveImageAttachments } from '../shell/uploads.js'
+import { PromptQueue, type QueuedMessage } from '../shell/queue.js'
 import {
   keepAwakeState,
   messageDelta,
@@ -39,6 +40,7 @@ import {
   questionRequest,
   questionResolved,
   result as resultOf,
+  queueSnapshot,
   runState,
   sessionChanged,
   sessionHistory,
@@ -129,6 +131,9 @@ const SESSION_MERGE_MS = 500
 export class HostRuntime {
   private readonly options: RuntimeOptions
   private readonly window: DeltaWindow
+  /** 主机侧的排队表。为什么必须由主机当队列见 shell/queue.ts 头注。 */
+  private readonly queue = new PromptQueue()
+
   private readonly pending = new Map<string, PendingInteraction>()
   private unsubscribe: (() => void) | undefined
   private detachSink: (() => void) | undefined
@@ -264,12 +269,50 @@ export class HostRuntime {
             })
             text = appendFileNote(text, savedFiles.saved)
           }
-          const sent = await this.kernel.sendPrompt(cmd.sessionId, text)
-          reply(sent.ok, sent.message ? { message: sent.message } : {})
-          if (sent.ok) {
-            this.sleep.markActive()
-            void this.pushSessions('prompt') // F8：状态变了就要额外推一次
+          // 排队（2026-10-05 用户：排队要双向同步、手机要能删）。
+          // 不再一到就 followup：先入表，drain 时按"这一回合还在不在跑"决定
+          // 转不转发。理由见 shell/queue.ts 头注——不这样做就没有删除通路。
+          const queueId =
+            typeof cmd.queueId === 'string' && cmd.queueId ? cmd.queueId : 'h' + Math.random().toString(36).slice(2, 10) // 老手机不带
+          this.queue.enqueue({
+            queueId,
+            sessionId: cmd.sessionId,
+            text,
+            images: images.length,
+            files: files.length,
+            state: 'held',
+          })
+          // 回执：收下了（进表）。**不一定已经转发**——在跑的话它还要等。
+          // 手机靠 data.held 区分这两种，别把"收下了"当成"已经跑上了"。
+          reply(true, { data: { queued: queueId, held: this.queue.isBusy } })
+          this.pushQueue(cmd.sessionId)
+          void this.drainQueue(cmd.sessionId)
+          return
+        }
+        case 'cmd.drop_queued': {
+          // 删一条还扣在主机队列里的消息。
+          // **只删得动 held 的**：sent 的已经 followup 出去了，agent 的 inbox
+          // 不归我们管（没有句柄也没有删除入口），这时候给假成功比拒绝更糟。
+          const target = this.queue.find(cmd.queueId)
+          if (!target) {
+            reply(false, { message: '这条不在主机队列里（已经发出去了，或已经删过）' })
+            return
           }
+          if (target.state !== 'held') {
+            reply(false, {
+              message:
+                target.state === 'sent'
+                  ? '这条已经发给主机在跑了，撤不回来'
+                  : '这条上次没发出去，可以直接删（再点一次删除）',
+            })
+            // failed 的顺手删掉：它转发不出去，留着只是占地方
+            if (target.state === 'failed') this.queue.drop(cmd.queueId)
+            this.pushQueue(cmd.sessionId)
+            return
+          }
+          this.queue.drop(cmd.queueId)
+          reply(true, { data: { dropped: cmd.queueId } })
+          this.pushQueue(cmd.sessionId)
           return
         }
         case 'cmd.interrupt': {
@@ -400,6 +443,63 @@ export class HostRuntime {
     this.countOutbound(payload, this.transport.reply(conversationId, payload))
   }
 
+  /**
+   * 把排队条的真快照推给手机（双向同步的"同步"那一半）。
+   *
+   * 全量、不增量：队列短，全量替换比增量好推也好对；而且增量要定义
+   * "删了哪条、哪条变了状态"两套语义，手机那份还得跟着做合并——合并错一次
+   * 就会出现一条删不掉也消不掉的幽灵消息。
+   */
+  private pushQueue(sessionId: string): void {
+    this.broadcast(queueSnapshot({ sessionId, items: this.queue.snapshot(sessionId) }))
+  }
+
+  /**
+   * 排空：这一回合不在跑，就把扣着的消息转发出去。
+   *
+   * 三条纪律：
+   * 1. **在跑就整个不动**：转过去也是塞进 agent 自己的 inbox，那我们又失去
+   *    了对它的控制（更没有删除通路）。
+   * 2. **按入队顺序整批转发**：手机连发三条是一个意图（"我交代了三件事"），
+   *    只转一条会让另外两条继续等着，而用户已经看到它们发出去了。
+   * 3. **失败的那条留在表里**并记下原因，用户看得见、删得动；不悄悄蒸发。
+   */
+  private async drainQueue(sessionId: string): Promise<void> {
+    if (this.queue.isBusy) return
+    const batch = this.queue.takeHeld(sessionId)
+    if (batch.length === 0) return
+
+    this.queue.setBusy(true)
+    const ids = batch.map((it) => it.queueId)
+    // 先标 sent 再转发：转发期间手机看到的是"在跑了"（删除按钮收起），
+    // 而不是还挂着"可删"——那会让用户点了删除却删不掉。
+    this.queue.markSent(ids)
+    this.pushQueue(sessionId)
+
+    for (const item of batch) {
+      try {
+        const sent = await this.kernel.sendPrompt(item.sessionId, item.text)
+        if (!sent.ok) {
+          // 业务失败：这一条记下原因留在表里，剩下几条继续转（它们互不相干）
+          this.queue.markFailed(item.queueId, sent.message ?? '转发失败')
+          continue
+        }
+        this.sleep.markActive()
+      } catch (err) {
+        // 内核抛异常。**必须兜住**：drainQueue 是 void 出去的，异常会变成
+        // unhandled rejection，而这一条会永远卡在 sent——手机上显示"在跑"，
+        // 其实什么都没发生，也没有任何路径能把它救回来。
+        this.queue.markFailed(item.queueId, err instanceof Error ? err.message : String(err))
+      }
+    }
+    // 转完了就把 busy 放掉：不依赖 run-state 回帧（内核可能根本不发 idle）。
+    // 否则这次异常之后整张表永久锁死，后面发的消息一条都出不去。
+    this.queue.setBusy(false)
+    // 这里不 retireSent：撤回是 run-state 转 idle 时的事。在这里撤会让用户刚发出的消息凭空消失
+    void this.pushSessions('prompt') // F8：状态变了就要额外推一次
+    this.pushQueue(sessionId)
+  }
+
   /** 内核事件入口。合帧与顺序规则都在这几行里。 */
   private onKernelEvent(event: KernelEvent): void {
     switch (event.kind) {
@@ -423,7 +523,19 @@ export class HostRuntime {
       case 'run-state':
         this.window.flushSession(event.sessionId)
         this.broadcast(runState(event))
-        if (event.state === 'running') this.sleep.markActive()
+        if (event.state === 'running') {
+          this.sleep.markActive()
+          this.queue.setBusy(true)
+        } else {
+          // 回合结束：把已经发出去的那些从排队条里撤掉（它们进了消息流），
+          // 再把这一回合期间扣住的消息发出去——这是双向同步的另一半。
+          // 这里**不推 ev.queue**：那一帧会插在 run_state 与 session_changed 之间，
+          // 破坏既有的出站顺序约定（runtime 测试钉的就是这个）。队列变了由
+          // drainQueue 自己推，晚几帧没关系——手机是整体替换，不靠顺序拼。
+          this.queue.setBusy(false)
+          this.queue.retireSent()
+          void this.drainQueue(event.sessionId)
+        }
         void this.pushSessions('run-state')
         return
       case 'todo':

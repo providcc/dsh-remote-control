@@ -962,39 +962,67 @@ test('cmd.keep_awake 关掉时不带 idleReleaseSec：带了就会覆盖用户�
   assert.equal(results[results.length - 1]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdKeepAwake}`, 'cmdId 必须原样回传')
 })
 
-test('命令异常必须回 ev.result{ok:false} 且 cmdId 原样：回执对答靠它，漏发就静默卡住', async () => {
+test('内核抛异常：消息进队列就有回执（输入框不卡），失败落在 ev.queue 上、带原因', async () => {
   const { runtime, kernel, transport } = fixture()
   runtime.start()
   await settle()
   transport.pair('c_ffffffff05')
   kernel.throwOnSend = true
 
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' }), 'c_ffffffff05')
-  const results = transport.resultReplies()
-  assert.ok(results.length >= 1, '内核抛异常时一条回执都没有 → 手机输入框永久禁用，等到自己超时')
-  assert.equal(
-    results[0]?.cmdId,
-    `cmd_${PAYLOAD_TYPES.cmdSendPrompt}`,
-    '异常兜底的 cmdId 也必须回原值（回错了手机匹配不到）',
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好', queueId: 'q-err' }),
+    'c_ffffffff05',
   )
-  assert.equal(results[0]?.ok, false, '异常必须是 ok:false')
-  assert.match(String(results[0]?.message), /内核进程里炸了/, 'message 要带上底层原因，手机 toast 只显示前 40 字')
+  await settle()
 
-  // 业务失败（不是异常）同样回 ok:false + message，而且指令没有真的进内核。
+  // 1) 命令一定有条回执：没有回执手机输入框会永久禁用，等到自己超时。
+  //    “收下了”与“已经跑上了”是两件事——队列扣着消息时回的也是 ok:true。
+  const results = transport.resultReplies()
+  assert.ok(results.length >= 1, '一条回执都没有 → 手机输入框永久禁用，等到自己超时')
+  assert.equal(results[0]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdSendPrompt}`, '回执的 cmdId 必须回原值（回错了手机匹配不到）')
+  assert.equal(results[0]?.ok, true, '进了队列就是收下了：卡住比晚一步更难查')
+  assert.equal(
+    (results[0]?.data as Record<string, unknown>)?.queued,
+    'q-err',
+    '回执要带回主机认的那个 queueId，删除时对得上',
+  )
+
+  // 2) 失败必须落在 ev.queue 上，而且**贴着这一条**（不是一条通用 toast）。
+  //    手机据此把这条标成失败、给删除按钮、说出原因。
+  const queue = transport.ofType(PAYLOAD_TYPES.evQueue)
+  assert.ok(queue.length >= 1, '内核炸了却一帧 ev.queue 都没有 → 手机上这条还显示“在跑”')
+  const items = (queue.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  const hit = items.find((it) => it.queueId === 'q-err')
+  assert.ok(hit, '失败的那一条要出现在快照里，不能悄悄蒸发')
+  assert.equal(hit?.state, 'failed', '内核抛异常 -> 这一条是 failed')
+  assert.match(String(hit?.message), /内核进程里炸了/, 'message 要带上底层原因，手机 toast 只显示前 40 字')
+
+  // 3) 业务失败（不是异常）走同一条路：同样进队列、同样在快照里说清。
   kernel.throwOnSend = false
   kernel.rejectSendFor = 'ses_arch'
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: 'x' }), 'c_ffffffff05')
-  await settle()
-  const results2 = transport.resultReplies()
-  assert.ok(results2.length >= 2, `业务失败没回执（只有 ${results2.length} 条）→ 手机以为指令发出去了`)
-  const biz = results2.at(-1)
-  assert.equal(biz?.cmdId, `cmd_${PAYLOAD_TYPES.cmdSendPrompt}`, '回执必须回原 cmdId：手机按 id 查表，查不到就丢弃')
-  assert.equal(
-    biz?.ok,
-    false,
-    'ok:false 有两种来源（业务拒绝/主机异常），手机文案层要按 message 渲染，不能一律当成网络错误',
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: 'x', queueId: 'q-biz' }),
+    'c_ffffffff05',
   )
-  assert.match(String(biz?.message), /需先恢复/, '业务拒绝要带具体 message')
+  await settle()
+  const queue2 = transport.ofType(PAYLOAD_TYPES.evQueue)
+  const items2 = (queue2.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  const hit2 = items2.find((it) => it.queueId === 'q-biz')
+  assert.equal(hit2?.state, 'failed', '业务拒绝也是失败，同样贴在那一项上')
+  assert.match(String(hit2?.message), /需先恢复/, '业务拒绝要带具体 message')
+
+  // 4) 异常之后队列不许锁死：再发一条要能照常出去。
+  kernel.rejectSendFor = ''
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '再来', queueId: 'q-ok' }),
+    'c_ffffffff05',
+  )
+  await settle()
+  const queue3 = transport.ofType(PAYLOAD_TYPES.evQueue)
+  const items3 = (queue3.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  const ok3 = items3.find((it) => it.queueId === 'q-ok')
+  assert.ok(ok3, '异常之后再发的那条也要进表')
+  assert.notEqual(ok3?.state, 'failed', '状态恢复之后新消息不该被上次的异常带失败')
 })
 
 test('回执之后的会话状态变化必须额外推 session_changed：发指令/中断/审批都是（F8）', async () => {
