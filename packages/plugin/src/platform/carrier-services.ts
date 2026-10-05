@@ -49,6 +49,11 @@ export interface ServicesBundle {
   workspaceRegistry?: LooseObject
   userQuestions?: LooseObject
   /**
+   * 上下文占用测量（dsh-token-meter）。纯回放、不发模型调用。
+   * 2026-10-06 宿主能力普查发现它一直挂着而我们没用；mp 端现在完全
+   * 不知道一条会话离压缩还有多远。 */
+  tokenMeter?: LooseObject
+  /**
    * 新建会话的唯一落点。
    *
    * 取证：`@deepseek-ai/dsh-api-session-controller` 的 `SessionController` 内部持有
@@ -632,6 +637,28 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const { hits, canList, canSet } = probeModelFace()
     if (!hits.length) return `none (tried=${MODEL_FACE_METHODS.length})`
     return `${canList ? 'list' : 'no-list'}+${canSet ? 'set' : 'no-set'} via=${hits.join(',')}`.slice(0, 180)
+  }
+
+  /**
+   * 上下文占用的探测结果，进 status.json。
+   *
+   * 只报**能不能读到**，不报读到的数：数每条消息都在变，写进 status 只会让人
+   * 盯着一个每次读都不同的字段。真正的数字走 mp 那条命令。
+   */
+  function contextUsageFace(): string {
+    const meter = services.tokenMeter as LooseObject | undefined
+    if (!meter) return 'absent'
+    const measure = fn(meter, 'measure')
+    if (!measure) return 'no-measure (keys=' + shapeOf(meter) + ')'
+    // 真调一次：不试调就不知道它会不会在**我们的调用形状**下抛。
+    // try 住是因为它读会话投影，冷会话可能读不到 —— 那也不该把整个载体拖垮。
+    try {
+      const snapshot = measure.call(meter, undefined) as LooseObject | undefined
+      const total = snapshot && typeof snapshot.totalTokens === 'number' ? snapshot.totalTokens : null
+      return 'measure ok' + (total === null ? ' (no snapshot)' : ' (total=' + total + ')')
+    } catch (error) {
+      return 'measure threw: ' + messageOf(error).slice(0, 120)
+    }
   }
 
   async function sendPrompt(
@@ -1218,6 +1245,11 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         // 模型面到底有没有"写"的能力（能列可选、能切换）。手机上模型下拉该不该置灰，
         // 取决于这个而不是取决于"读得到当前值" —— 读得到只够显示一行文字。
         modelFace: modelFaceSummary(),
+        // **上下文占用**（dsh-token-meter，2026-10-06 宿主能力普查后接上）。
+        // 纯进程内服务、不发模型调用，只是回放会话日志做确定性测量。
+        // 记它是为了先分清责任：读不到可能是这一代没有 tokenMeter，
+        // 也可能是它没挂在 ctx 上 —— 没有这个字段，现场只能靠猜。
+        contextUsageFace: contextUsageFace(),
         workspaceRegistry: typeof services.workspaceRegistry === 'object',
         userQuestions: typeof services.userQuestions === 'object',
         archivedSessions: archivedIds().size,

@@ -1300,3 +1300,40 @@ test('只发图不发字：不要塞一个空文本块（模型看到的是一�
   assert.equal(content.length, 1, '一个空 text 块 + 一个 image 块：空话不该占一个块位')
   assert.equal(content[0]?.type, 'image')
 })
+/**
+ * 上下文占用的探测必须进 status.json（2026-10-06）。
+ *
+ * 判据钉的是**三态都要能说出来**，而不是「有就读到」：
+ *   absent          —— 这一代没有 tokenMeter
+ *   no-measure(...) —— 服务在，但没有 measure 方法（代际不符）
+ *   measure ok      —— 真调一次没抛
+ *
+ * 为什么值得单独钉：现场拿到「mp 上没有占用」这个现象时，第一步要分清
+ * 是宿主没这个能力、还是它挂错地方、还是我们没调对——三者的下一步完全不同。
+ * 这就是 approvalCalls=0 那次踩过的坑（判据红了却说不清是哪一层）。
+ */
+test('describe 里有 contextUsageFace：占用探测的三态都要能说出来', () => {
+  const described = fixture().kernel(fixture().bundle()).describe() as Record<string, unknown>
+  const face = String(described.contextUsageFace)
+  assert.match(
+    face,
+    /^(absent|no-measure|measure ok|measure threw: )/,
+    `contextUsageFace 的取值不在约定内：${face}。现场看到看不懂的值就等于没这个字段`,
+  )
+})
+
+/**
+ * 这一代没有 tokenMeter 时必须**照常报 absent**，不能把整个载体判死。
+ *
+ * 依赖「可选能力缺失就降级」这条纪律：它是一个锦上添花的读数，
+ * 拿不到不该让列会话、发指令、审批全挂——那才是把一个显示问题放大成停机。
+ */
+test('没有 tokenMeter 的那一代：describe 正常，只是脸面说 absent', () => {
+  const f = fixture()
+  const bundle = f.bundle()
+  delete (bundle as Record<string, unknown>).tokenMeter
+  const described = f.kernel(bundle).describe() as Record<string, unknown>
+  assert.equal(described.contextUsageFace, 'absent', '宿主没有这一代能力时要如实说 absent')
+  // 其余能力一点没受影响：载体仍然能列会话
+  assert.equal(typeof described.carrier, 'string', '一个读数缺失就把整个载体拖垮了')
+})
