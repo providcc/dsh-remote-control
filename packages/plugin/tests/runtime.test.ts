@@ -109,6 +109,10 @@ interface FakeKernel extends KernelPort {
   failList: boolean
   throwOnSend: boolean
   rejectSendFor: string | undefined
+  /** true 时 sendPrompt 静默成功、不发任何 run-state：用来证明＂！没确认在跑就不许说 sent＂！。 */
+  silentSend: boolean
+  /** 非空时 interrupt 回 ok:false：用来证明＂！取消失败不假装成功＂！。 */
+  rejectInterruptFor: string | undefined
   /**
    * 非空时 `runState()` 回它。**作废卡片那一帧发的是内核真相**（见 runtime 的
    * `voidStaleCard`），所以这里必须能演"回合还在跑"与"已经停了"两种收场。
@@ -132,6 +136,8 @@ function makeKernel(): FakeKernel {
     failList: false,
     throwOnSend: false,
     rejectSendFor: undefined,
+    silentSend: false,
+    rejectInterruptFor: undefined,
     runStateFor: undefined,
     failRunState: false,
     listing: undefined,
@@ -152,12 +158,16 @@ function makeKernel(): FakeKernel {
     },
     async sendPrompt(sessionId: string, text: string) {
       if (kernel.throwOnSend) throw new Error('内核进程里炸了')
-      if (kernel.rejectSendFor === sessionId) return { ok: false, message: '会话已归档，需先恢复' }
       kernel.calls.sendPrompt.push({ sessionId, text })
+      // silentSend：记了账（证明交给内核了），但不发 run-state。
+      // 用来演「交出去了可内核没跑」——旧版这时已经 markSent，手机上显示在跑其实什么都没跑。
+      if (kernel.silentSend) return { ok: true }
+      if (kernel.rejectSendFor === sessionId) return { ok: false, message: '会话已归档，需先恢复' }
       return { ok: true }
     },
     async interrupt(sessionId: string) {
       kernel.calls.interrupt.push(sessionId)
+      if (kernel.rejectInterruptFor === sessionId) return { ok: false, message: '内核不肯中断' }
       return { ok: true }
     },
     subscribe(onEvent) {
@@ -1776,4 +1786,129 @@ test('send_prompt 带假 jpeg / 超上限：协议层之外主机再拒一道，
     '被拒的批次不许在磁盘上留下任何文件',
   )
   fs.rmSync(dir, { recursive: true, force: true })
+})
+/**
+ * 排队重做（2026-10-05 用户：问题很多，重做；dsh 为准，双端一致）。
+ *
+ * 治三件事：
+ *   1. 状态不撒谎 —— sent 只能由 run-state=running 触发，不是「转发完」
+ *   2. mp 端能取消 —— sent 也能取消（中断这一轮），不再一律 ok:false
+ *   3. dsh 侧创建的消息也要出现在 mp —— host slot
+ */
+test('状态不撒谎：转发之后、run-state 之前，消息还是 held（不是 sent）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q01')
+  // 内核收到 sendPrompt 但**不发 run-state**：旧版这时已经 markSent，
+  // 手机上显示「在跑」其实什么都没跑。新版必须还是 held。
+  kernel.silentSend = true
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '在吗' }), 'c_q01')
+  await settle()
+  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
+  const items = (frames.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  assert.equal(items.length, 1, '消息要进表')
+  assert.equal(items[0]?.state, 'held', '没确认在跑就不许说 sent——这就是「显示正在跑其实没跑」的根因')
+  assert.ok(kernel.calls.sendPrompt.length >= 1, '消息确实已经转给内核了')
+})
+
+test('run-state 说 running 才提升 sent：那一刻才真的叫在跑', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q02')
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '跑一下' }), 'c_q02')
+  await settle()
+  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  const items =
+    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  assert.equal(items[0]?.state, 'sent', '内核确认在跑才提升')
+})
+
+test('dsh 侧创建的回合也要同步到 mp：run-state running 且没有我们的消息时造 host slot', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q03')
+  // 用户直接在 DSH 里发消息：内核起回合、回传 user delta。手机上没发过任何东西。
+  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  await kernel.feed({
+    kind: 'delta',
+    sessionId: 'ses_live',
+    messageId: 'm1',
+    role: 'user',
+    text: '主机侧发的那条',
+    done: true,
+  })
+  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
+  assert.ok(frames.length >= 1, '主机侧回合也要推 ev.queue——否则手机完全看不见')
+  const items = (frames.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  assert.equal(items.length, 1, '要有一条占位项')
+  assert.equal(items[0]?.state, 'sent', '主机侧回合确实在跑')
+  assert.equal(items[0]?.text, '主机侧发的那条', '文字要由 user delta 回填，不能空着')
+})
+
+test('mp 端取消 sent：走中断，回执说清「已中断」而不是「撤不回来」', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q04')
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: ' morning' }), 'c_q04')
+  await settle()
+  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  await settle()
+  const items =
+    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdDropQueued, { sessionId: 'ses_live', queueId: String(items[0]?.queueId) }),
+    'c_q04',
+  )
+  await settle()
+  const r = transport.resultReplies().at(-1)
+  assert.equal(r?.ok, true, 'sent 也必须能取消——用户明确要求 mp 端能取消')
+  assert.equal((r?.data as Record<string, unknown>)?.interrupted, true, '要标明这是中断，不是删除')
+  assert.ok(kernel.calls.interrupt.length >= 1, '取消 sent 必须真的去中断内核')
+})
+
+test('取消 sent 但内核拒了中断：回 ok:false 带原因，不假装成功', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q05')
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: 'x' }), 'c_q05')
+  await settle()
+  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  await settle()
+  kernel.rejectInterruptFor = 'ses_live'
+  const items =
+    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdDropQueued, { sessionId: 'ses_live', queueId: String(items[0]?.queueId) }),
+    'c_q05',
+  )
+  const r = transport.resultReplies().at(-1)
+  assert.equal(r?.ok, false, '中断没成就不许说取消成功')
+  assert.ok(String(r?.message).length > 0, '要带可读原因')
+})
+
+test('held 的删除仍然是真删除（不进内核）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_q06')
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '删我' }), 'c_q06')
+  await settle()
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdDropQueued, {
+      sessionId: 'ses_live',
+      queueId: String((transport.resultReplies().at(-1)?.data as Record<string, unknown>)?.queued),
+    }),
+    'c_q06',
+  )
+  const r = transport.resultReplies().at(-1)
+  assert.equal(r?.ok, true)
+  assert.ok(!(r?.data as Record<string, unknown>)?.interrupted, 'held 不是中断')
+  const items =
+    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
+  assert.equal(items.length, 0, 'held 删掉就真的从表里消失')
 })

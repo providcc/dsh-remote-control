@@ -290,23 +290,35 @@ export class HostRuntime {
           return
         }
         case 'cmd.drop_queued': {
-          // 删一条还扣在主机队列里的消息。
-          // **只删得动 held 的**：sent 的已经 followup 出去了，agent 的 inbox
-          // 不归我们管（没有句柄也没有删除入口），这时候给假成功比拒绝更糟。
+          // 取消一条排队消息（2026-10-05 用户重做：mp 端要能取消）。
+          // 三种状态各有各的做法，回执说的话也各不一样：
+          //   held    还没跑 -> 从表里拿掉，真的消失了
+          //   sent    正在跑 -> 只能中断这一轮（kernel.interrupt）
+          //   failed  没发出去 -> 顺手删掉，留着只是占地方
+          // 旧版对 sent 一律回 ok:false 说撤不回来，用户看到的就是 mp 端无法取消。
+          // 宿主确实有 interrupt（内核的 cancel），中断是真实能力；
+          // 但不吹成删除——回执写已中断，手机 toast 也跟着说中断。
           const target = this.queue.find(cmd.queueId)
           if (!target) {
             reply(false, { message: '这条不在主机队列里（已经发出去了，或已经删过）' })
             return
           }
-          if (target.state !== 'held') {
-            reply(false, {
-              message:
-                target.state === 'sent'
-                  ? '这条已经发给主机在跑了，撤不回来'
-                  : '这条上次没发出去，可以直接删（再点一次删除）',
-            })
-            // failed 的顺手删掉：它转发不出去，留着只是占地方
-            if (target.state === 'failed') this.queue.drop(cmd.queueId)
+          if (target.state === 'failed') {
+            this.queue.drop(cmd.queueId)
+            reply(true, { data: { dropped: cmd.queueId } })
+            this.pushQueue(cmd.sessionId)
+            return
+          }
+          if (target.state === 'sent') {
+            const done = await this.kernel.interrupt(target.sessionId)
+            if (!done.ok) {
+              reply(false, { message: done.message ?? '中断这一轮没成功，它还在跑' })
+              return
+            }
+            // 立刻摘掉这一条。同批的其它消息等 run-state idle 时 retireSent 收走，
+            // 不在这里动——那一批确实还在跑，别提前抹掉。
+            this.queue.drop(cmd.queueId)
+            reply(true, { data: { dropped: cmd.queueId, interrupted: true } })
             this.pushQueue(cmd.sessionId)
             return
           }
@@ -465,16 +477,15 @@ export class HostRuntime {
    * 3. **失败的那条留在表里**并记下原因，用户看得见、删得动；不悄悄蒸发。
    */
   private async drainQueue(sessionId: string): Promise<void> {
-    if (this.queue.isBusy) return
     const batch = this.queue.takeHeld(sessionId)
     if (batch.length === 0) return
 
     this.queue.setBusy(true)
-    const ids = batch.map((it) => it.queueId)
-    // 先标 sent 再转发：转发期间手机看到的是"在跑了"（删除按钮收起），
-    // 而不是还挂着"可删"——那会让用户点了删除却删不掉。
-    this.queue.markSent(ids)
-    this.pushQueue(sessionId)
+    // 这里**不标 sent**。旧版在这里 markSent，于是「交出去了」被当成「在跑了」
+    // ——用户看到的就是「显示正在跑，其实没跑」。
+    // 提升成 sent 只由 run-state=running 触发（见 onKernelEvent 的 run-state 分支），
+    // 在那之前它们安安静静地当 held：手机显示「等主机消化」，而且删得动。
+    // 也不推快照了——状态没变，推出去也是同一份内容。
 
     for (const item of batch) {
       try {
@@ -482,15 +493,20 @@ export class HostRuntime {
         if (!sent.ok) {
           // 业务失败：这一条记下原因留在表里，剩下几条继续转（它们互不相干）
           this.queue.markFailed(item.queueId, sent.message ?? '转发失败')
+          this.pushQueue(sessionId)
           continue
         }
         this.sleep.markActive()
+        // 交出过手了：标记 inflight，防止第二次 drain 把同一条再转一遍。
+        // 注意**不改成 sent**——内核还没说 running，那一步留给 markRunning。
+        this.queue.markInflight(item.queueId)
       } catch (err) {
         // 内核抛异常。**必须兜住**：drainQueue 是 void 出去的，异常会变成
         // unhandled rejection，而这一条会永远卡在 sent——手机上显示"在跑"，
         // 其实什么都没发生，也没有任何路径能把它救回来。
         this.queue.markFailed(item.queueId, err instanceof Error ? err.message : String(err))
       }
+      this.pushQueue(sessionId)
     }
     // 转完了就把 busy 放掉：不依赖 run-state 回帧（内核可能根本不发 idle）。
     // 否则这次异常之后整张表永久锁死，后面发的消息一条都出不去。
@@ -512,6 +528,18 @@ export class HostRuntime {
         if (event.text) this.window.push(event.sessionId, event.messageId, event.text, event.role)
         if (event.done) this.window.complete(event.sessionId, event.messageId, event.role)
         if (event.text) this.sleep.markActive()
+        // 主机侧用户消息的回传：把文字填进 run-state 造的那条占位项。
+        // 没有占位项就说明主机发了消息但 run-state 还没到，补一条。
+        // 这一步就是「在 dsh 创建的也要同步显示在 mp 端」的另一半。
+        if (event.role === 'user' && event.text) {
+          if (this.queue.fillHostText(event.sessionId, event.text)) {
+            this.pushQueue(event.sessionId)
+          } else if (this.queue.snapshot(event.sessionId).length === 0) {
+            this.queue.ensureHostSlot(event.sessionId)
+            this.queue.fillHostText(event.sessionId, event.text)
+            this.pushQueue(event.sessionId)
+          }
+        }
         return
       }
       case 'tool':
@@ -526,12 +554,16 @@ export class HostRuntime {
         if (event.state === 'running') {
           this.sleep.markActive()
           this.queue.setBusy(true)
+          // 内核确认在跑：这才有资格把 held 提升成 sent。
+          const promoted = this.queue.markRunning(event.sessionId)
+          // 一条都没提升 = 这一回合不是手机发起的，是主机自己起的（用户在 DSH 里
+          // 发的，或别的入口）。造一条占位项，手机那才看得见主机侧的回合；
+          // 它的文字等 delta role=user 的回传填（见上面 delta 分支）。
+          if (promoted.length === 0) this.queue.ensureHostSlot(event.sessionId)
+          this.pushQueue(event.sessionId)
         } else {
           // 回合结束：把已经发出去的那些从排队条里撤掉（它们进了消息流），
           // 再把这一回合期间扣住的消息发出去——这是双向同步的另一半。
-          // 这里**不推 ev.queue**：那一帧会插在 run_state 与 session_changed 之间，
-          // 破坏既有的出站顺序约定（runtime 测试钉的就是这个）。队列变了由
-          // drainQueue 自己推，晚几帧没关系——手机是整体替换，不靠顺序拼。
           this.queue.setBusy(false)
           this.queue.retireSent()
           void this.drainQueue(event.sessionId)
