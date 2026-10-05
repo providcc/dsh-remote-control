@@ -57,8 +57,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p client/tsconfig.json",
     "build": "pnpm clean && tsc -p tsconfig.json && tsc -p client/tsconfig.json && node ../../scripts/bundle-plugin.mjs",
     "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
-    "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format": "prettier --write . --ignore-path ../../.prettierignore",
+    "format:check": "prettier --check . --ignore-path ../../.prettierignore"
   },
   "dependencies": {
     "dsh-remote-wire": "file:/Users/linbin/dsh-remote-control/dsh-remote-protocol",
