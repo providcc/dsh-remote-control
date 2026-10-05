@@ -200,7 +200,7 @@ test('tool/result：callId 藏在 message.toolCallId，正文在 message.content
 })
 
 test('未识别的类型返回空数组且不抛（不映射、不猜语义）', () => {
-  for (const type of ['step/start', 'step/end', 'request/header', 'internal/config']) {
+  for (const type of ['step/start', 'step/end', 'internal/config']) {
     assert.equal(MAPPED_SESSION_EVENTS.has(type), false, `${type} 被登记成已映射，但映射表里没有它`)
     assert.deepEqual(
       sessionEventKernelEvents({ sessionId: 'ses_1', type, seq: 1, data: { anything: true } }),
@@ -518,3 +518,23 @@ test('inbox：没有 id 时用 seq 兜底，保证 messageId 永不为空', () =
 test('inbox：登记进 MAPPED_SESSION_EVENTS（否则 status.json 会一直记着它没被映射）', () => {
   assert.equal(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), true)
 })
+
+test('request/header 映射成按会话的 model（2026-10-05 用户实测：会话模型串台）', () => {
+  const [ev] = sessionEventKernelEvents({
+    sessionId: 'ses_1',
+    type: 'request/header',
+    seq: 20,
+    data: { header: { config: { provider: 'space-bunny', model: 'space-bunny-free', maxTokens: 32000 } } },
+  })
+  assert.deepEqual(ev, { kind: 'model', sessionId: 'ses_1', model: 'space-bunny-free', provider: 'space-bunny' })
+})
+
+test('request/header：没有 config.model 时不出站（宁可这轮不更新，也不显示错的）', () => {
+  assert.deepEqual(sessionEventKernelEvents({ sessionId: 'ses_1', type: 'request/header', seq: 1, data: { header: {} } }), [])
+  assert.deepEqual(sessionEventKernelEvents({ sessionId: 'ses_1', type: 'request/header', seq: 1, data: {} }), [])
+})
+
+test('request/header 登记进 MAPPED_SESSION_EVENTS', () => {
+  assert.equal(MAPPED_SESSION_EVENTS.has('request/header'), true)
+})
+

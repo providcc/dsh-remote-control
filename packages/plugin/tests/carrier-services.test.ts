@@ -22,6 +22,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServicesKernel, historyPageFromLog, type ServicesBundle } from '../src/platform/carrier-services.js'
 import { FakeClock } from '../src/core/clock.js'
+import { parseEvPayload } from 'dsh-remote-wire'
+import { questionRequest } from 'dsh-remote-wire'
 
 interface Calls {
   resume: Array<Record<string, unknown>>
@@ -1197,3 +1199,64 @@ test('被判定为宿主注入的 user/message：不发出站，但要在 kernel
   assert.match(traced, /time-context/, '丢掉的那条必须留痕，否则真机排错又要从头猜')
   assert.doesNotMatch(traced, /(?<!×)\buser\b(?!-)/, '真人消息不许被算进"注入"计数：那个计数是"我们丢了多少"的账')
 })
+
+/**
+ * 提问卡在手机上不弹的根因：mapQuestion 产出**协议不合法**的载荷，整帧被静默丢弃。
+ *
+ * 协议里 questionItem.question 与 choiceOption.label 都是 nonEmpty，而旧实现
+ * 写的是 String(item.question ?? '')——宿主那个字段名一旦对不上，空串就让
+ * parseEvPayload 返回 null，认不出的载荷**静默丢弃**（没有任何报错）。
+ * 现场长这样：dsh 弹了提问框，mp 端什么都没有，而 status.json 里
+ * questionsCalls=1 / questionsLast=no-answer，两头都对不上账。
+ *
+ * 所以判据直接钉「产出的帧必须能过协议自己的解析器」，而不是钉某几个字段名。
+ */
+test('提问卡：宿主字段名对不上时，产出的帧仍必须能过协议解析（否则手机上静默不弹）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let received: { questions: unknown[] } | undefined
+  kernel.attachInteractionSink!({
+    approval: async () => 'decline',
+    question: async (info: { questions: unknown[] }) => {
+      received = info as { questions: unknown[] }
+      return { answers: [] }
+    },
+  })
+  // 三种真实见过的畸形题面：只有 header、只有 text、以及完全没题面只有选项。
+  const request = {
+    agent: { session: { id: 'ses_live' } },
+    questions: [
+      { id: 'q1', header: '部署到哪个环境', options: [{ label: '预发' }, {}] },
+      { id: 'q2', text: '要不要继续' },
+      { id: 'q3', options: [{ value: 'A' }] },
+    ],
+  }
+  await listeners['user-questions/request']!(request, async () => {
+    throw new Error('桌面没答')
+  })
+  assert.ok(received, '提问没有派发到 sink')
+  // **这一条是全部重点**：把产出的题面原样塞进协议构造器，必须解析得过。
+  assert.notEqual(
+    parseEvPayload(questionRequest({ requestId: 'q_1', sessionId: 'ses_live', questions: received.questions as never })),
+    null,
+    '产出的 ev.question_request 过不了协议解析：这一帧会被静默丢弃，手机上永远不弹卡',
+  )
+  const items = received.questions as Array<Record<string, unknown>>
+  assert.equal(items.length, 3, '不该因为某一题畸形就少发一道')
+  assert.equal(items[0]?.question, '部署到哪个环境', '只有 header 时要退回取 header')
+  assert.equal(items[1]?.question, '要不要继续', '只有 text 时要退回取 text')
+  assert.equal(items[2]?.question, '第 3 题', '完全没有题面文字时给一道稳定的占位题')
+  // 选项同理：空 label 会让 choiceOption 校验失败
+  assert.deepEqual(items[0]?.options, [
+    { id: 'o1', label: '预发' },
+    { id: 'o2', label: '选项 2' },
+  ])
+  assert.deepEqual(items[2]?.options, [{ id: 'o1', label: 'A' }], '只有 value 时取 value')
+})
+

@@ -1058,22 +1058,45 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     return sink !== undefined
   }
 
+  /**
+   * 从一个对象里取第一个**非空**的字符串字段。
+   *
+   * 为什么不能直接 String(x ?? ""):协议里 questionItem.question 与
+   * choiceOption.label 都是 nonEmpty,空串会让**整帧** zod 校验失败,
+   * 而认不出的载荷是被**静默丢弃**的——手机上就永远不弹这张卡,
+   * 主机这边还记着 questionsCalls=1 / no-answer,两头都对不上账
+   * (2026-10-05 用户实测:dsh 弹了提问框,mp 端什么都没有)。
+   */
+  function firstText(item: LooseObject, keys: readonly string[]): string {
+    for (const key of keys) {
+      const value = item[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+    return ''
+  }
+
+  /** 题面文字的候选字段名:宿主各版本叫法不一致,逐个试。 */
+  const QUESTION_TEXT_KEYS = ['question', 'header', 'text', 'title', 'prompt'] as const
+  /** 选项文字的候选字段名。 */
+  const OPTION_TEXT_KEYS = ['label', 'text', 'title', 'value', 'name'] as const
+
   function mapQuestion(item: LooseObject, index: number): QuestionItem {
-    const options = Array.isArray(item.options) ? (item.options as LooseObject[]) : []
+    const rawOptions = Array.isArray(item.options) ? (item.options as LooseObject[]) : []
+    // 读不到题面就给一道稳定的占位题,**绝不给空串**(见 firstText 的注释)。
+    const text = firstText(item, QUESTION_TEXT_KEYS) || '第 ' + String(index + 1) + ' 题'
+    const options = rawOptions.map((option, optionIndex) => ({
+      // 平台选项只有 label(没有 id),所以 id 由这里稳定生成:
+      // 手机上回传 id,我们再映射回 label 交给平台(见 core/runtime.ts)。
+      id: 'o' + String(optionIndex + 1),
+      label: firstText(option as LooseObject, OPTION_TEXT_KEYS) || '选项 ' + String(optionIndex + 1),
+    }))
     return {
-      id: String(item.id ?? `q${index + 1}`),
-      question: String(item.question ?? ''),
+      id: String(item.id ?? 'q' + String(index + 1)),
+      question: text,
       ...(item.multiSelect === true ? { multi: true } : {}),
-      ...(options.length > 0
-        ? {
-            options: options.map((option, optionIndex) => ({
-              // 平台选项只有 label（没有 id），所以 id 由这里稳定生成：
-              // 手机上回传 id，我们再映射回 label 交给平台（见 core/runtime.ts）。
-              id: `o${optionIndex + 1}`,
-              label: String((option as LooseObject).label ?? ''),
-            })),
-          }
-        : {}),
+      // 没有可选项就不带这个键:手机把空数组渲染成一张只有输入框的卡,
+      // 与'有选项但都不可选'在用户眼里一模一样。
+      ...(options.length > 0 ? { options } : {}),
     }
   }
 
@@ -1199,6 +1222,10 @@ export const MAPPED_SESSION_EVENTS = new Set([
   // agent/inbox/spliced 同理：真机 eventTypes 里一直有，却因缺 case 被记成 unmapped，
   // 于是主机侧排队的消息在手机上完全不可见。2026-10-05 补上。
   'agent/inbox/spliced',
+  // request/header 同理：它每轮都带**本会话真正在用的模型**。不映射的话，
+  // mp 端只能显示宿主全局默认模型——那正是 2026-10-05 用户实测到的串台
+  // （本会话在用 space-bunny-free，却显示别的会话切出来的 muse-spark）。
+  'request/header',
 ])
 
 export function sessionEventKernelEvents(input: {
@@ -1259,6 +1286,30 @@ export function sessionEventKernelEvents(input: {
           text: textOf(data),
           role: 'user',
           done: true,
+        },
+      ]
+    }
+    case 'request/header': {
+      // **这条会话这一轮真正在用的模型**（2026-10-05 用户实测：当前会话跑
+      // space-bunny-free，mp 端顶栏却显示别的会话切出来的 muse-spark）。
+      //
+      // 以前读的是 agentDefaultModel.currentSelection()，那是**宿主全局默认
+      // 模型**（新建会话用哪个），与本会话无关：用户在别的会话切一次模型，
+      // 全局默认就变了，本会话的显示跟着变——而本会话根本没换过。
+      //
+      // 真机形状：data.header.config = {provider, model, maxTokens, ...}，
+      // **每轮一条**（实测 30 轮 30 条）。
+      //
+      // 读不到 model 就不出站：宁可这一轮不更新模型名，也不要显示错的。
+      const cfg = (data.header as LooseObject | undefined)?.config as LooseObject | undefined
+      const modelName = cfg?.model
+      if (typeof modelName !== 'string' || !modelName) return []
+      return [
+        {
+          kind: 'model',
+          sessionId,
+          model: modelName,
+          provider: typeof cfg?.provider === 'string' ? cfg.provider : undefined,
         },
       ]
     }

@@ -590,6 +590,15 @@ export class HostRuntime {
         this.pushQueue(event.sessionId)
         return
       }
+      case 'model':
+        // **按会话**广播模型（2026-10-05 用户实测：当前会话 space-bunny-free，
+        // mp 端显示别的会话切出来的 muse-spark）。
+        //
+        // 数据源是内核 request/header（每轮一条），**不是**宿主全局默认模型
+        // （agentDefaultModel.currentSelection = 新会话默认用哪个）。
+        // 全局那个与本会话无关——用户在别的会话切一次模型，本会话显示就跟着变。
+        this.broadcastModel(event.sessionId, event.model, event.provider)
+        return
       case 'todo':
         // 与 tool 同一纪律：先 flush 同会话的文本缓冲，再广播整份快照。
         // 不做合并窗口——一轮 todo 也就十几条，逐条发手机也渲染得动；合并反而会让
@@ -650,7 +659,6 @@ export class HostRuntime {
     }
     this.broadcast(sessionChanged(this.sessions, reason))
     this.broadcast(keepAwakeState(this.sleep.snapshot()))
-    this.broadcastModel()
     return this.sessions
   }
 
@@ -666,26 +674,21 @@ export class HostRuntime {
    * 后者看起来像 bug，前者只是没显示。内核缺 `currentSelection` 时真机上是常态
    * （见 carrier 的 modelFace 探测）。
    */
-  private broadcastModel(): void {
-    let selection: { provider: string; model: string } | undefined
-    try {
-      selection = this.kernel.modelSelection?.()
-    } catch {
-      return
-    }
-    if (!selection?.model) return
-    // 能不能切由端口回答（它才看得见内核服务对象），core 不猜。
+  private broadcastModel(sessionId: string, modelName: string, provider?: string): void {
+    if (!modelName) return
     const face = this.kernel.modelOptions?.()
     this.broadcast(
       model({
-        model: selection.model,
-        provider: selection.provider,
+        sessionId,
+        model: modelName,
+        provider,
         canSwitch: Boolean(face?.canSwitch),
         options: face?.options,
         reason: face?.canSwitch ? undefined : (face?.reason ?? '主机内核未提供切换模型的能力'),
       }),
     )
   }
+
 
   private refreshLoop(): void {
     if (this.stopped) return
