@@ -15,8 +15,8 @@ importers:
   packages/plugin:
     dependencies:
       dsh-remote-wire:
-        specifier: file:/Users/linbin/dsh-remote-control/dsh-remote-protocol
-        version: file:../dsh-remote-protocol
+        specifier: ^1.8.0
+        version: 1.8.0
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
@@ -368,8 +368,8 @@ packages:
   dijkstrajs@1.0.3:
     resolution: {integrity: sha512-qiSlmBq9+BCdCA/L46dw8Uy93mloxsPSbwnm5yrKn2vMPiy8KyAskTF6zuV/j5BMsmOGZDPs7KjU+mjb670kfA==}
 
-  dsh-remote-wire@file:../dsh-remote-protocol:
-    resolution: {directory: ../dsh-remote-protocol, type: directory}
+  dsh-remote-wire@1.8.0:
+    resolution: {integrity: sha512-WxC6d882iRAqAqM2iObAyGFe0+ze9S066jKltGHjSOhfyRxkAYTGgQ4IXhm9ew/oK54sRAmlYAYZwGm/EX1jrA==}
     engines: {node: '>=20'}
 
   emoji-regex@8.0.0:
@@ -671,7 +671,7 @@ snapshots:
 
   dijkstrajs@1.0.3: {}
 
-  dsh-remote-wire@file:../dsh-remote-protocol:
+  dsh-remote-wire@1.8.0:
     dependencies:
       tweetnacl: 1.0.3
       zod: 4.6.5

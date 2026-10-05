@@ -61,7 +61,7 @@
     "format:check": "prettier --check . --ignore-path ../../.prettierignore"
   },
   "dependencies": {
-    "dsh-remote-wire": "file:/Users/linbin/dsh-remote-control/dsh-remote-protocol",
+    "dsh-remote-wire": "^1.8.0",
     "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0",

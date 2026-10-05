@@ -88,19 +88,19 @@ export type KernelEvent =
     }
   | {
       /**
-      * **这条会话这一轮真正在用的模型**（内核 request/header，每轮一条）。
-      *
-      * 为什么不能用 agentDefaultModel.currentSelection()（2026-10-05 用户实测：
-      * 当前会话是 space-bunny-free，mp 端却显示 muse-spark）：
-      * 那个接口读的是**宿主全局默认模型**，即「新建会话时用哪个」，与
-      *「这条会话这一轮跑的是哪个」**不是一回事**。用户在别的会话切了模型，
-      * 全局默认就变了，于是本会话的 mp 端显示跟着变——而本会话根本没换。
-      * 取证：真机 session log 里 request/header 30 条，每轮一条，
-      * 最后一轮 config = {provider:'space-bunny', model:'space-bunny-free'}，
-      * 与用户报的当前模型一致。
-      *
-      * 只在真的读到 config.model 时才出站（读不到就不发，见 broadcastModel）。
-      */
+       * **这条会话这一轮真正在用的模型**（内核 request/header，每轮一条）。
+       *
+       * 为什么不能用 agentDefaultModel.currentSelection()（2026-10-05 用户实测：
+       * 当前会话是 space-bunny-free，mp 端却显示 muse-spark）：
+       * 那个接口读的是**宿主全局默认模型**，即「新建会话时用哪个」，与
+       *「这条会话这一轮跑的是哪个」**不是一回事**。用户在别的会话切了模型，
+       * 全局默认就变了，于是本会话的 mp 端显示跟着变——而本会话根本没换。
+       * 取证：真机 session log 里 request/header 30 条，每轮一条，
+       * 最后一轮 config = {provider:'space-bunny', model:'space-bunny-free'}，
+       * 与用户报的当前模型一致。
+       *
+       * 只在真的读到 config.model 时才出站（读不到就不发，见 broadcastModel）。
+       */
       kind: 'model'
       sessionId: string
       model: string

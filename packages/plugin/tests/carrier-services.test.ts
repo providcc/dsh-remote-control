@@ -1243,7 +1243,9 @@ test('提问卡：宿主字段名对不上时，产出的帧仍必须能过协�
   assert.ok(received, '提问没有派发到 sink')
   // **这一条是全部重点**：把产出的题面原样塞进协议构造器，必须解析得过。
   assert.notEqual(
-    parseEvPayload(questionRequest({ requestId: 'q_1', sessionId: 'ses_live', questions: received.questions as never })),
+    parseEvPayload(
+      questionRequest({ requestId: 'q_1', sessionId: 'ses_live', questions: received.questions as never }),
+    ),
     null,
     '产出的 ev.question_request 过不了协议解析：这一帧会被静默丢弃，手机上永远不弹卡',
   )
@@ -1259,4 +1261,3 @@ test('提问卡：宿主字段名对不上时，产出的帧仍必须能过协�
   ])
   assert.deepEqual(items[2]?.options, [{ id: 'o1', label: 'A' }], '只有 value 时取 value')
 })
-

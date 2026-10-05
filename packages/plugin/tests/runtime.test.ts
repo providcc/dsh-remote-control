@@ -986,10 +986,7 @@ test('内核抛异常：send_prompt 当场回 ok:false 并带原因（不假装�
   transport.pair('c_ffffffff05')
   kernel.throwOnSend = true
 
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' }),
-    'c_ffffffff05',
-  )
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' }), 'c_ffffffff05')
   await settle()
 
   const results = transport.resultReplies()

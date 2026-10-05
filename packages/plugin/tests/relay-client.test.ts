@@ -531,7 +531,6 @@ test('peer-left 只摘掉那个客户端，会话与密钥必须留着（D3：�
   )
 })
 
-
 /**
  * 2026-10-05 用户报：「mp 端解除配对，dsh 端执行的是手机离线」。
  *
@@ -558,10 +557,7 @@ test('peer-left 带 unpaired：手机主动解配 → 会话一并作废（别�
     0,
     '手机已经解配了，主机还留着这条会话 → conversationCount 恒为 1，pill 永远显示「手机离线」，用户永远等不到「未配对」',
   )
-  assert.ok(
-    !client.conversationIds().includes('c_444555666777'),
-    '会话没作废：这条幽灵没有任何东西会清掉它',
-  )
+  assert.ok(!client.conversationIds().includes('c_444555666777'), '会话没作废：这条幽灵没有任何东西会清掉它')
   assert.ok(
     gone.some((id) => id === 'c_444555666777'),
     '上层没收到 onConversationGone：runtime 不会去清这条会话的运行态',

@@ -412,8 +412,6 @@ export class HostRuntime {
     this.countOutbound(payload, this.transport.reply(conversationId, payload))
   }
 
-
-
   /** 内核事件入口。合帧与顺序规则都在这几行里。 */
   private onKernelEvent(event: KernelEvent): void {
     switch (event.kind) {
@@ -543,7 +541,6 @@ export class HostRuntime {
       }),
     )
   }
-
 
   private refreshLoop(): void {
     if (this.stopped) return

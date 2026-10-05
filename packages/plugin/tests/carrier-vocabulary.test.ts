@@ -530,11 +530,13 @@ test('request/header 映射成按会话的 model（2026-10-05 用户实测：会
 })
 
 test('request/header：没有 config.model 时不出站（宁可这轮不更新，也不显示错的）', () => {
-  assert.deepEqual(sessionEventKernelEvents({ sessionId: 'ses_1', type: 'request/header', seq: 1, data: { header: {} } }), [])
+  assert.deepEqual(
+    sessionEventKernelEvents({ sessionId: 'ses_1', type: 'request/header', seq: 1, data: { header: {} } }),
+    [],
+  )
   assert.deepEqual(sessionEventKernelEvents({ sessionId: 'ses_1', type: 'request/header', seq: 1, data: {} }), [])
 })
 
 test('request/header 登记进 MAPPED_SESSION_EVENTS', () => {
   assert.equal(MAPPED_SESSION_EVENTS.has('request/header'), true)
 })
-
