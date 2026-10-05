@@ -281,6 +281,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
           pairingWindow.markConsumed(pairingToken)
           // status.json 里也不能再挂着这张已经用掉的码：外部脚本只看年龄，不看是否被消费。
           if (active.pairing?.token === pairingToken) active.pairing = null
+          // 无论屏幕上是不是它，这张码都已经花掉——记账，之后任何一条发码路都不许再给出去。
+          spendPairingToken(pairingToken)
         }
         log('client paired', { conversationId })
       },
@@ -456,6 +458,32 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
 
   const active = { pairing: null as { qr: string; token: string; expiresAt: number } | null }
   /**
+   * **已经花掉、不许再发给任何人的配对码**。
+   *
+   * 为什么需要这一本账：配对码是一次性的（中继 `claim()` 里 `pending.used = true`，
+   * 重放拿到 `already_used`）。而 `active.pairing`——也就是 status.json 里那张、
+   * 状态栏二维码那张、`/pairing/new` 发的那张——原来只由 `markConsumed` 与 `wrappedPublish`
+   * 两个地方维护，于是只要没有新码顶上，屏幕上就一直挂着那张**已经花掉**的码：
+   *
+   * - 手机扫码 → 中继回 `already_used` → "新二维码连不上"；
+   * - 而 `pairOnStartSec` 默认是 **0**（自动发码关着），所以没有任何东西会去换一张，
+   *   只能干等这张码的 TTL 走完（线上中继 180 s）——用户说的"要等下次刷新的二维码才能用"。
+   *
+   * 判据把这三条路全钉住：消费一张、退出配对一次，`active.pairing` 都不许再是花掉的那张。
+   */
+  const spentTokens = new Set<string>()
+  /** 这本账只用来挡住"再把花掉的码发出去"，不需要长记忆：64 条足够跨过一次批量重配。 */
+  const SPENT_MAX = 64
+  function spendPairingToken(token: string): void {
+    if (!token) return
+    spentTokens.add(token)
+    while (spentTokens.size > SPENT_MAX) {
+      const oldest = spentTokens.values().next().value
+      if (oldest === undefined) break
+      spentTokens.delete(oldest)
+    }
+  }
+  /**
    * status.json 里的 `pairing` 必须是**窗口正在维护的那一张**（它的 QR 才在 active.pairing 里），
    * 不是 `slots.latest()`：手工 /drc pair 之后自动刷新会发新的一张，两者一旦分叉，
    * 外部脚本读到的是"一张没有二维码的码"。用 `resolveFor` 取密钥顺带把已过期的剔掉。
@@ -465,6 +493,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     if (!shown) return null
     const slot = slots.resolveFor(shown.token)
     if (!slot) return null
+    // 花掉的码不许再进 status.json：外部脚本照着它拼二维码，扫了必然失败。
+    if (spentTokens.has(shown.token)) return null
     return {
       token: slot.token,
       psk: slot.psk,
@@ -485,6 +515,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     const created = publishPairing(ttlMs)
     if (created) {
       active.pairing = { qr: created.qr, token: created.token, expiresAt: created.expiresAt }
+      // 新码天生没花过：从账上摘掉（同一张 token 被重发的极端情形下也安全）。
+      spentTokens.delete(created.token)
       // 手工发的那张也要让窗口认领，否则窗口以为"没有活动码"又发一张。
       pairingWindow.adopt({ token: created.token, createdAt: clock.now(), expiresAt: created.expiresAt })
     }
@@ -505,6 +537,9 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     if (!shown) return null
     const slot = slots.resolveFor(shown.token)
     if (!slot) return null
+    // 花掉的码一律当"没有码"：调用方（`ensureFreshPairing` 与 `pairing.png`）会去补一张新的，
+    // 而不是把一张扫了必然 `already_used` 的码递给用户。
+    if (spentTokens.has(shown.token)) return null
     // 过期时刻以 **slot** 为准，不是 active 里那份出码时的旧值：中继的 pair-ready 会用
     // 服务端权威 TTL 改写 slot.expiresAt（线上中继发的是 180s，本地默认 120s），
     // 而 active 没人更新。用旧值算 expiresInMs，本地过期之后 slot 还有效的那一整段里，
@@ -577,10 +612,21 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 把这种正常竞态报成失败只会让面板显示一句看不懂的红字）。
    * 与每条通道走 `voidConversation`，中继那边才会收到 `session-leave`、
    * 手机端才会显示"主机已断开，请重新配对"。
+   *
+   * **作废的同时必须换一张码**（2026-10-05 用户实测：退出配对后屏幕上那张二维码扫了没用，
+   * 要等它 TTL 走完才恢复）。原来只作废通道、不管码：`active.pairing` 还挂着刚走的那部手机
+   * 花掉的那一张，而 `pairOnStartSec` 默认 0（自动发码关着）于是没有任何东西去换它 ——
+   * 状态栏那张图、`/pairing/new` 发的那张，全都是 `already_used`。
+   *
+   * 两步都是必须的：把旧码记进花名账（这样即使补发失败也不会再把死码递出去），
+   * 再立刻补一张（这样状态栏上不是空白，用户点开就有能扫的）。
    */
   function unpairAll(): number {
     const ids = relay?.conversationIds() ?? []
     for (const id of ids) relay?.voidConversation(id)
+    if (active.pairing) spendPairingToken(active.pairing.token)
+    active.pairing = null
+    wrappedPublish()
     return ids.length
   }
 
