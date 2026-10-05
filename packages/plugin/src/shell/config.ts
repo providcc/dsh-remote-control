@@ -95,6 +95,8 @@ export interface PluginConfig {
   uploadDir: string
   /** 单张图片的体积上限（字节）。默认 4MB：协议层只校"是不是 jpeg、几张"，校不了字节数。 */
   maxImageBytes: number
+  /** 单个文件附件的字节上限。默认 512KB：中继单帧 1MB 是硬上限，而文件没有压缩这一步。 */
+  maxFileBytes: number
   /**
    * 新建会话使用的项目目录。空 = 跟着最近一条会话走（见 carrier-services 的 newSession）。
    * 不给这条出路的话只剩"宿主进程 cwd"这个黑洞：真机上就是 `/`。
@@ -126,6 +128,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
   uploadDir: '',
   maxImageBytes: 4 * 1024 * 1024,
+  maxFileBytes: 512 * 1024,
   newSessionCwd: '',
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
   // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。

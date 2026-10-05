@@ -322,6 +322,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       unarchiveOnPrompt: config.unarchiveOnPrompt,
       uploadDir: resolveUploadDir(config),
       maxImageBytes: config.maxImageBytes,
+      maxFileBytes: config.maxFileBytes,
       approvalTimeoutMs: config.approvalTimeoutSec * 1000,
       log: (message, fields) => log(message, fields),
     })

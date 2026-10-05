@@ -23,12 +23,13 @@ import type {
   AnswerItem,
   CmdPayload,
   EvPayload,
+  FileAttachment,
   HistoryItem,
   ImageAttachment,
   QuestionItem,
   SessionSummary,
 } from 'dsh-remote-wire'
-import { appendImageNote, saveImageAttachments } from '../shell/uploads.js'
+import { appendFileNote, appendImageNote, saveFileAttachments, saveImageAttachments } from '../shell/uploads.js'
 import {
   keepAwakeState,
   messageDelta,
@@ -77,6 +78,7 @@ export interface RuntimeOptions {
   uploadDir: string
   /** 单张图片字节上限（协议层只校张数与类型，校不了字节）。 */
   maxImageBytes: number
+  maxFileBytes: number
   log?: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
 }
 
@@ -114,6 +116,7 @@ const DEFAULTS: RuntimeOptions = {
   // 给一个目录——落盘是往用户磁盘写文件，不该由库默认值悄悄代劳。
   uploadDir: '',
   maxImageBytes: 4 * 1024 * 1024,
+  maxFileBytes: 512 * 1024,
 }
 
 /** 一次列表最多给手机多少条会话（与中继侧的会话上限同源，取证 §5.3）。 */
@@ -235,6 +238,31 @@ export class HostRuntime {
               dir: saved.dir,
             })
             text = appendImageNote(text, saved.saved)
+          }
+          // 文件附件：同一条通路（落盘 + 路径写进正文），差别在 uploads.ts 头注。
+          const files: FileAttachment[] = Array.isArray(cmd.files) ? cmd.files : []
+          if (files.length > 0) {
+            if (!this.options.uploadDir) {
+              reply(false, { message: '这台主机没配附件落盘目录（uploadDir），收不了文件附件' })
+              return
+            }
+            const savedFiles = saveFileAttachments({
+              files,
+              dir: this.options.uploadDir,
+              sessionId: cmd.sessionId,
+              maxBytesPerFile: this.options.maxFileBytes,
+            })
+            if (!savedFiles.ok) {
+              reply(false, { message: savedFiles.message })
+              return
+            }
+            this.options.log?.('文件附件落盘', {
+              sessionId: cmd.sessionId,
+              files: savedFiles.saved.length,
+              bytes: savedFiles.saved.reduce((sum, f) => sum + f.bytes, 0),
+              dir: savedFiles.dir,
+            })
+            text = appendFileNote(text, savedFiles.saved)
           }
           const sent = await this.kernel.sendPrompt(cmd.sessionId, text)
           reply(sent.ok, sent.message ? { message: sent.message } : {})

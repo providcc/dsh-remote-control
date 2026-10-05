@@ -136,6 +136,101 @@ export function saveImageAttachments(options: {
   return { ok: true, saved: written, dir: sessionDir }
 }
 
+/** 一批落盘成功的文件（图片之外的附件，2026-10-05 加）。 */
+export interface SavedFile {
+  /** 收敛后的文件名（落盘用的那个，扩展名保留）。 */
+  name: string
+  /** 绝对路径——prompt 正文里给 Agent 的就是它。 */
+  path: string
+  bytes: number
+  /** 类型标签（来自手机的扩展名；可能为空）。 */
+  mediaType?: string
+}
+
+export type SaveFilesResult = SaveImagesResult
+
+/**
+ * 文件附件的正文增补。与 {@link appendImageNote} 同一条理由（正文在后、空正文可用），
+ * 多带一个类型标签：Agent 认文件靠扩展名，而落盘名可能被收敛过，
+ * 把手机上那个原始类型并排列出来更稳。
+ */
+export function appendFileNote(text: string, saved: ReadonlyArray<SavedFile>): string {
+  if (saved.length === 0) return text
+  const lines = saved.map((f, i) => (f.mediaType ? `${i + 1}. ${f.path}（${f.mediaType}）` : `${i + 1}. ${f.path}`))
+  const note = `\n\n[文件附件 ${saved.length} 个，已存到本机]\n${lines.join('\n')}`
+  const head = String(text || '')
+  return head === '' ? note.replace(/^\n\n/, '') : head + note
+}
+
+/**
+ * 把一批文件附件写进 <dir>/<safeSessionId>/。
+ *
+ * 与 `saveImageAttachments` 的三处差别，都是文件本身逼出来的：
+ * 1. **不校内容魔数**。图片那边有 JPEG 文件头这一道，文件类型太多了，硬凑一份
+ *    魔数表只会给出"看起来校验过"的假保证。真正的闸在 mp 侧两道 + 这里的大小上限。
+ * 2. **不改扩展名**。图片统一强写成 .jpg（画布重编码出来的就是 jpeg），文件改了
+ *    扩展名 Agent 就不认它了。收敛仍走 `safeSegment`——手机传来的名字是不可信输入。
+ * 3. **同名不覆盖**（与图片同一条理由）：加序号而不是失败。
+ *
+ * 整批先验后写：被拒的批次一个字节都不留在磁盘上。
+ */
+export function saveFileAttachments(options: {
+  files: ReadonlyArray<{ name: string; mediaType?: string; data: string }>
+  dir: string
+  sessionId: string
+  maxCount?: number
+  maxBytesPerFile?: number
+}): SaveFilesResult {
+  const maxCount = options.maxCount ?? 4
+  const maxBytes = options.maxBytesPerFile ?? 512 * 1024
+  const files = options.files || []
+  if (files.length === 0) return { ok: true, saved: [], dir: options.dir }
+  if (files.length > maxCount) {
+    return { ok: false, message: `一次最多带 ${maxCount} 个文件，收到 ${files.length} 个` }
+  }
+
+  const decoded: Array<{ file: (typeof files)[number]; buf: Buffer }> = []
+  for (const [i, one] of files.entries()) {
+    const buf = decodeBase64(one.data)
+    if (!buf) return { ok: false, message: `第 ${i + 1} 个文件的解码失败（不是合法 base64）` }
+    if (buf.length > maxBytes) {
+      return {
+        ok: false,
+        message: `第 ${i + 1} 个文件有 ${Math.round(buf.length / 1024)}KB，超过单个上限 ${Math.round(maxBytes / 1024)}KB`,
+      }
+    }
+    decoded.push({ file: one, buf })
+  }
+
+  const sessionDir = path.join(options.dir, safeSegment(options.sessionId, 'session'))
+  const written: SavedFile[] = []
+  try {
+    fs.mkdirSync(sessionDir, { recursive: true })
+    for (const [i, one] of decoded.entries()) {
+      // 空名字兜底成按序号的通用名：手机那头可能给一个只有扩展名的文件，
+      // 收敛之后就什么都不剩了。
+      const fallback = `file-${i + 1}`
+      const base = safeSegment(one.file.name, fallback, 96) || fallback
+      let name = base
+      let n = 1
+      while (fs.existsSync(path.join(sessionDir, name))) {
+        // 序号插在扩展名之前（a.pdf → a-2.pdf），插在末尾会变成 a.pdf-2，Agent 认不出。
+        const dot = base.lastIndexOf('.')
+        name = dot > 0 ? `${base.slice(0, dot)}-${++n}${base.slice(dot)}` : `${base}-${++n}`
+      }
+      const file = path.join(sessionDir, name)
+      fs.writeFileSync(file, one.buf, { mode: 0o600 })
+      written.push({ name, path: file, bytes: one.buf.length, mediaType: one.file.mediaType })
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      message: `文件落盘失败：${String((error as Error)?.message ?? error).slice(0, 160)}`,
+    }
+  }
+  return { ok: true, saved: written, dir: sessionDir }
+}
+
 /**
  * prompt 正文增补：把落盘路径写成 Agent 能消费的形状。
  *
