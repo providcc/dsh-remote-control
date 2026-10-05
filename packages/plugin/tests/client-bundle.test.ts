@@ -922,7 +922,12 @@ test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板
   assert.ok(root.find('drc-panel'), '面板要弹出来')
   assert.equal(root.find('drc-qr')!.src, `${PAIR_IMAGE_ROUTE}?e=e1`, '图片地址要带上这一版码的 epoch')
   assert.equal(root.find('drc-code')!.textContent, '482913', '6 位码必须与 QR 同时在屏上——手输是唯一退路')
-  assert.equal(root.find('drc-note')!.textContent, '微信扫码配对 1 分 0 秒后过期')
+  // 剩余时间**常显在码上面**（2026-10-05 用户报"显示着码却配不上"之后加的）：
+  // 服务端权威寿命 3 分钟，旧版只有 tick 走完后 note 才改口，那之前屏上没有任何
+  // 时间信息——手机上挪一圈回来码就废了，而用户看不出它废了。
+  assert.equal(root.find('drc-count')!.textContent, '1 分 0 秒后过期')
+  // 还有时间时 note 闭嘴：一行说一件事。
+  assert.equal(root.find('drc-note'), undefined, '倒计时已经在说这件事，note 不许重复')
   // 引导行：第一次装好插件的人要能在这一屏看明白"码是给谁扫的、扫完得到什么"。
   // 口径是用户 2026-10-05 定的：一条、短、不带括号/顿号/书名号等符号（空格分隔）。
   assert.equal(root.find('drc-guide')!.textContent, '打开小程序扫这个码 远程控制这台电脑')
@@ -930,6 +935,56 @@ test('按下发码那颗：POST 发码那条，再把图与 6 位码画进面板
   // 出图这一版右上角那颗是**刷新**，不再是"生成配对码"——同一件事两个说法会让用户以为要重新配一次。
   assert.equal(root.find('drc-btn')!.textContent, '刷新', '二维码页那颗按钮的文案')
   assert.equal(root.find('drc-pill')!.getAttribute('aria-expanded'), 'true')
+})
+
+test('中继不在线：连码都不发，面板说明白"现在发不出配对码"', async () => {
+  // 2026-10-05 线上取证：主机半开掉线的那 10 分钟里 pill 照常画着一张码，
+  // 用户扫码 → 中继 invalid_or_expired → 手机只说"配对失败"。一张扫了必然失败
+  // 的码比没有码更糟。现在中继不在线时**一个请求都不该打出去**。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, relay: 'offline' },
+  })
+  const root = harness.mountPill()
+  // 先等一轮 /status 回来：守卫读的是 poll 的结果，挂上那一刻还没有。
+  await flush()
+  await openPairing(root)
+  assert.equal(
+    harness.requests.includes(PAIR_NEW_ROUTE),
+    false,
+    `中继不在线就不该打发码那条：${harness.requests.join(' | ')}`,
+  )
+  assert.equal(root.find('drc-qr'), undefined, '没有码就不该有那张图')
+  const shown = root.find('drc-panel')!.allText()
+  assert.match(shown, /主机还没连上中继/, '第一句要说清为什么现在没有码')
+  assert.match(shown, /中继恢复后点右上角刷新/, '第二句告诉人下一步点什么')
+  assert.ok(root.find('drc-btn'), '刷新按钮要在场——中继回来就靠它')
+})
+
+test('面板开着的时候中继掉了：死的二维码当场换成 offline，不许留在屏上', async () => {
+  // 今天线上就是这么误导用户的：面板停在一张码上，主机半开掉线，
+  // 用户照着扫 → 中继 invalid_or_expired → 手机只说"配对失败"。
+  // status 用**可变对象**：poll 每轮都读它，所以"中继掉线"就是把 relay 改掉。
+  const status = { ...DEFAULT_STATUS, paired: 0, pairings: 0 }
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status,
+    newAnswer: { state: 'ready', token: '482913', epoch: 'e1', expiresInMs: 60000 },
+  })
+  const root = harness.mountPill()
+  await flush()
+  await openPairing(root)
+  assert.ok(root.find('drc-qr'), '前提：先有一张码在屏上')
+
+  // 中继掉线：下一轮 /status 带回来 offline，那一屏必须当场换掉。
+  // （轮询是 setInterval 驱动的，测试里手工打那一拍——挂载后只有一个节拍：status。）
+  status.relay = 'offline'
+  await harness.fireAndFlush(0)
+  assert.equal(root.find('drc-qr'), undefined, '中继走了就不许留着那张码')
+  const shown = root.find('drc-panel')!.allText()
+  assert.match(shown, /主机还没连上中继/)
 })
 
 test('200 + state:"unavailable" 不是成功：面板要说明白，不许弹一张白框', async () => {

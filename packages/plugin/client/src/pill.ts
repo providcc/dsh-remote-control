@@ -128,6 +128,8 @@ export type PanelView =
   | { kind: 'info' }
   | { kind: 'loading' }
   | { kind: 'qr'; token: string; expiresInMs: number; imageSrc: string }
+  /** 中继不在线：**不给二维码**。一张扫了必然失败的码比没有码更糟。 */
+  | { kind: 'offline' }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'failed'; detail: string }
 
@@ -314,7 +316,12 @@ const CSS = `
 .drc-key { flex: 0 0 auto; color: var(--dsw-alias-label-tertiary); }
 .drc-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .drc-qr { display: block; width: 200px; height: 200px; margin: 8px auto 0; image-rendering: pixelated; }
-.drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
+.drc-count { margin: 8px 0 0; text-align: center; color: var(--dsw-alias-label-secondary, #5f6368);
+    font-size: 12px; font-variant-numeric: tabular-nums; }
+  .drc-count[data-kind="urgent"] { color: var(--dsw-alias-state-warn-primary, #faad14); font-weight: 600; }
+  /* 离线那一屏的两行说明：第一行是结论，整块居中、不挤。 */
+  .drc-note-block { margin-top: 10px; }
+  .drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
   /* 引导行：比 note 重一档（第一次用的人要看清），但不加图标不加底色——
      这一屏的主角是二维码，多一个色块就成了推销而不是引导。 */
   .drc-guide { margin: 8px 0 0; text-align: center; color: var(--dsw-alias-label-secondary, #5f6368); font-size: 12px; }
@@ -485,8 +492,25 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   /** 二维码那一行的说明：没过期报剩余时间，过期了就明说要自己再按一次（不再自动补一张）。 */
   // 2026-10-05 用户定的口径：不加间隔号、不用书名号——扫一眼的行，一个多余符号
   // 就多一分"像系统消息不像人话"的感觉。"微信扫码配对"直接点名用哪个 App 扫。
-  const qrNote = (): string =>
-    expiresInMs > 0 ? `微信扫码配对 ${secondsText(expiresInMs)}后过期` : '配对码已过期 点右上角刷新重新生成'
+  // 过期那句话现在由倒计时那行与 note 分工：倒计时说"还有多久"，note 只在
+  // 已经过期时说话（还能用的时候它闭嘴——一行说一件事）。
+  const qrNote = (): string => (expiresInMs > 0 ? '' : '配对码已过期 点右上角刷新重新生成')
+
+  /**
+   * 二维码顶上那行**倒计时**：还剩多久这一页就不作数了。
+   *
+   * 2026-10-05 线上取证：配对码服务端权威寿命 3 分钟，而旧版只有 1 秒 tick 走完后
+   * note 才改口"已过期"——那之前用户看到的是一张**没有任何时间信息**的码。手机上
+   * 挪聊天界面、找小程序、点扫描，三分钟经常就这么过去的，于是"显示着码却配不上"。
+   * 现在剩余秒数一直在码的旁边，最后 30 秒还会变重（见 CSS 的 `data-kind`）。
+   */
+  const countdown = (): HTMLElement | null => {
+    if (view.kind !== 'qr') return null
+    if (expiresInMs <= 0) return null
+    const node = text('p', 'drc-count', `${secondsText(expiresInMs)}后过期`)
+    if (expiresInMs <= 30_000) node.setAttribute('data-kind', 'urgent')
+    return node
+  }
 
   /**
    * 抬头一行：左边状态、右边动作。**面板唯一那颗动作按钮就收在这里**（面板的右上角）。
@@ -498,6 +522,11 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
    *
    * 状态那句话跟那颗 pill 读同一份 `pillLabel(lastStatus)`，所以面板开着时轮询一回来
    * （比如手机上刚扫完码）这句话就跟着变。
+   *
+   * 2026-10-05 用户报"显示着码却配不上"之后，这颗按钮的含义被第三次收紧：
+   * 它现在是**唯一**的续命入口（码过期 / 中继恢复后都归它），所以码过期那一屏的
+   * note 直接点名"点右上角刷新"，倒计时也常显——三分钟的权威寿命不能只由
+   * 服务端知道。
    */
   const header = (): HTMLElement => {
     const head = doc.createElement('div')
@@ -556,7 +585,18 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     panel.appendChild(header())
     if (view.kind === 'loading') {
       panel.appendChild(text('p', 'drc-note', '正在生成配对码'))
+    } else if (view.kind === 'offline') {
+      // 中继不在线：二维码这一屏整个不画。
+      //
+      // 2026-10-05 线上取证：主机半开掉线的那 10 分钟里 pill 照常画着一张码，用户
+      // 扫码 → 中继 `invalid_or_expired` → 手机只说"配对失败"。那张码不是"还没扫"，
+      // 是**扫了也必然失败**——比没有码更糟，因为它让人去试一件注定不成的事。
+      // 所以离线这一屏只留一句人话加那颗刷新按钮，码等中继回来再说。
+      panel.appendChild(text('p', 'drc-note drc-note-block', '主机还没连上中继 现在发不出配对码'))
+      panel.appendChild(text('p', 'drc-note', '中继恢复后点右上角刷新 这里会出现二维码'))
     } else if (view.kind === 'qr') {
+      const count = countdown()
+      if (count) panel.appendChild(count)
       const image = doc.createElement('img')
       image.className = 'drc-qr'
       image.setAttribute('alt', '配对二维码')
@@ -568,7 +608,9 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       panel.appendChild(text('p', 'drc-guide', GUIDE_LINE))
       // 6 位码仍然单独印一行（QR 扫不出来时那是唯一退路）。
       panel.appendChild(text('p', 'drc-code', view.token))
-      panel.appendChild(text('p', 'drc-note', qrNote()))
+      // note 只在过期时出现（还有时间时那行闭嘴——一行说一件事）。
+      const note = qrNote()
+      if (note !== '') panel.appendChild(text('p', 'drc-note', note))
     } else if (view.kind === 'unavailable' || view.kind === 'failed') {
       const note =
         view.kind === 'unavailable'
@@ -601,6 +643,16 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
 
   async function requestPairing(): Promise<void> {
     if (disposed || !panel) return
+    // 中继不在线就**根本不发码**：旧实现在这里也会打一个 POST，路由回
+    // `state:"unavailable"`，于是同一件事在两条路上各判一次（客户端还要猜
+    // `reason` 的字符串）。"现在不可能有码"这件事轮询里早就知道——2 秒一次的
+    // `lastStatus.relay`，用它拦在发请求之前，用户看到的是"主机还没连上中继"
+    // 而不是一张必然扫不出来的码（2026-10-05 线上取证，见 offline 分支的注释）。
+    if (lastStatus && lastStatus.relay !== 'online' && lastStatus.relay !== undefined) {
+      view = { kind: 'offline' }
+      paint()
+      return
+    }
     view = { kind: 'loading' }
     paint()
     let answer: NewAnswer | undefined
@@ -648,6 +700,26 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
    * （轮询是 2 秒节拍，等它会让"按下没反应"成为错觉）。随后立刻补一次真轮询对账，
    * 万一宿主那边没作废掉（比如守卫拒了），下一次轮询会把真相带回来。
    */
+  /**
+   * 面板开着的时候，中继掉了要**当场**把二维码那屏换成 offline——
+   * 否则用户手里捏着一张已经发不出去的码，而它看上去和好码一模一样。
+   * 轮询（2 秒一次）已经在跑，这里只是它每次回来时多做一次判断。
+   */
+  const syncOfflineView = (): void => {
+    if (!panel) return
+    if (view.kind !== 'qr') return
+    if (!lastStatus) return
+    const relay = lastStatus.relay
+    if (relay === undefined || relay === 'online') return
+    view = { kind: 'offline' }
+    if (countTimer !== undefined) {
+      clearInterval(countTimer)
+      countTimer = undefined
+    }
+    expiresInMs = 0
+    paint()
+  }
+
   async function requestUnpair(): Promise<void> {
     if (disposed || !panel) return
     try {
@@ -700,7 +772,12 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
      * `POST /pairing/new` 是幂等的：码还活着就还是那一张，所以下面这句在"重复点开"时
      * 不会把 pending 表堆成一串码。
      */
-    if (pairingNow() > 0) {
+    // 中继不在线时**不点开就是死码页**：openPanel 一开始就走 offline 那一支。
+    // （旧行为是先打一个 POST 再收到 unavailable，白绕一圈还要客户端猜字符串。）
+    if (lastStatus && lastStatus.relay !== undefined && lastStatus.relay !== 'online') {
+      view = { kind: 'offline' }
+      paint()
+    } else if (pairingNow() > 0) {
       view = { kind: 'info' }
       paint()
     } else {
@@ -752,6 +829,8 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       const body = (await response.json?.()) as StatusAnswer | undefined
       if (!body || typeof body !== 'object') return
       lastStatus = body
+      // 中继掉了：二维码那屏当场换成 offline（见 syncOfflineView 的注释）。
+      syncOfflineView()
       /**
        * 手机上刚扫完码：面板若还停在二维码上，当场翻回状态视图。
        *
