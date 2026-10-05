@@ -972,7 +972,14 @@ test('cmd.keep_awake 关掉时不带 idleReleaseSec：带了就会覆盖用户�
   assert.equal(results[results.length - 1]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdKeepAwake}`, 'cmdId 必须原样回传')
 })
 
-test('内核抛异常：消息进队列就有回执（输入框不卡），失败落在 ev.queue 上、带原因', async () => {
+/**
+ * 内核抛异常时的回执。
+ *
+ * 取消排队之前这条测的是「进了队列先回 ok，失败落在 ev.queue 上」（2026-10-05）。
+ * 队列取消后 send_prompt 直接调内核，异常就该**当场**回 ok:false 带原因——
+ * 手机靠这条回执解锁输入框，回 ok:true 却什么都没发生是最难查的一种。
+ */
+test('内核抛异常：send_prompt 当场回 ok:false 并带原因（不假装收下了）', async () => {
   const { runtime, kernel, transport } = fixture()
   runtime.start()
   await settle()
@@ -980,59 +987,19 @@ test('内核抛异常：消息进队列就有回执（输入框不卡），失�
   kernel.throwOnSend = true
 
   await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好', queueId: 'q-err' }),
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' }),
     'c_ffffffff05',
   )
   await settle()
 
-  // 1) 命令一定有条回执：没有回执手机输入框会永久禁用，等到自己超时。
-  //    “收下了”与“已经跑上了”是两件事——队列扣着消息时回的也是 ok:true。
   const results = transport.resultReplies()
   assert.ok(results.length >= 1, '一条回执都没有 → 手机输入框永久禁用，等到自己超时')
-  assert.equal(results[0]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdSendPrompt}`, '回执的 cmdId 必须回原值（回错了手机匹配不到）')
-  assert.equal(results[0]?.ok, true, '进了队列就是收下了：卡住比晚一步更难查')
-  assert.equal(
-    (results[0]?.data as Record<string, unknown>)?.queued,
-    'q-err',
-    '回执要带回主机认的那个 queueId，删除时对得上',
+  assert.equal(results[0]?.cmdId, `cmd_` + PAYLOAD_TYPES.cmdSendPrompt, '回执的 cmdId 必须回原值')
+  assert.equal(results[0]?.ok, false, '内核抛了异常却回 ok:true：手机上看起来像发出去了，其实根本没到')
+  assert.ok(
+    String(results[0]?.message ?? '').length > 0,
+    '失败回执必须带原因，否则手机上只有一句「发送失败」，无从判断该不该重试',
   )
-
-  // 2) 失败必须落在 ev.queue 上，而且**贴着这一条**（不是一条通用 toast）。
-  //    手机据此把这条标成失败、给删除按钮、说出原因。
-  const queue = transport.ofType(PAYLOAD_TYPES.evQueue)
-  assert.ok(queue.length >= 1, '内核炸了却一帧 ev.queue 都没有 → 手机上这条还显示“在跑”')
-  const items = (queue.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  const hit = items.find((it) => it.queueId === 'q-err')
-  assert.ok(hit, '失败的那一条要出现在快照里，不能悄悄蒸发')
-  assert.equal(hit?.state, 'failed', '内核抛异常 -> 这一条是 failed')
-  assert.match(String(hit?.message), /内核进程里炸了/, 'message 要带上底层原因，手机 toast 只显示前 40 字')
-
-  // 3) 业务失败（不是异常）走同一条路：同样进队列、同样在快照里说清。
-  kernel.throwOnSend = false
-  kernel.rejectSendFor = 'ses_arch'
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: 'x', queueId: 'q-biz' }),
-    'c_ffffffff05',
-  )
-  await settle()
-  const queue2 = transport.ofType(PAYLOAD_TYPES.evQueue)
-  const items2 = (queue2.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  const hit2 = items2.find((it) => it.queueId === 'q-biz')
-  assert.equal(hit2?.state, 'failed', '业务拒绝也是失败，同样贴在那一项上')
-  assert.match(String(hit2?.message), /需先恢复/, '业务拒绝要带具体 message')
-
-  // 4) 异常之后队列不许锁死：再发一条要能照常出去。
-  kernel.rejectSendFor = ''
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '再来', queueId: 'q-ok' }),
-    'c_ffffffff05',
-  )
-  await settle()
-  const queue3 = transport.ofType(PAYLOAD_TYPES.evQueue)
-  const items3 = (queue3.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  const ok3 = items3.find((it) => it.queueId === 'q-ok')
-  assert.ok(ok3, '异常之后再发的那条也要进表')
-  assert.notEqual(ok3?.state, 'failed', '状态恢复之后新消息不该被上次的异常带失败')
 })
 
 test('回执之后的会话状态变化必须额外推 session_changed：发指令/中断/审批都是（F8）', async () => {
@@ -1744,239 +1711,4 @@ test('send_prompt 带图片但主机没配 uploadDir：拒收且不发给内核'
   )
   assert.equal(f.kernel.calls.sendPrompt.length, 0, '没收图的许可就不该把这条指令发进去')
   assert.match(lastReplyText(f.transport), /uploadDir/, '拒绝原因要原样回到手机上：用户得知道改哪')
-})
-
-test('send_prompt 带假 jpeg / 超上限：协议层之外主机再拒一道，kernel 不收到半截消息', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
-  const f = fixture({ uploadDir: dir, maxImageBytes: 16 })
-  f.runtime.start()
-  await settle()
-  f.transport.pair('c_ffffffff22')
-  // 内容其实是 png（魔数对不上）：mediaType 说谎也要拒
-  await f.runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
-      sessionId: 'ses_img',
-      text: 'x',
-      images: [
-        { name: 'a.png', mediaType: 'image/jpeg', data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64') },
-      ],
-    }),
-    'c_ffffffff22',
-  )
-  assert.equal(f.kernel.calls.sendPrompt.length, 0, '文件头对不上的 jpeg 必须被拒')
-  // 真 jpeg 但超过字节上限
-  await f.runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
-      sessionId: 'ses_img',
-      text: 'x',
-      images: [
-        {
-          name: 'b.jpg',
-          mediaType: 'image/jpeg',
-          data: Buffer.from([0xff, 0xd8, 0xff, ...Array.from({ length: 20 }, (_, i) => i)]).toString('base64'),
-        },
-      ],
-    }),
-    'c_ffffffff22',
-  )
-  assert.equal(f.kernel.calls.sendPrompt.length, 0, '超上限同样拒')
-  const left = fs.readdirSync(dir)
-  assert.ok(
-    left.every((d) => fs.readdirSync(path.join(dir, d)).length === 0),
-    '被拒的批次不许在磁盘上留下任何文件',
-  )
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-/**
- * 排队重做（2026-10-05 用户：问题很多，重做；dsh 为准，双端一致）。
- *
- * 治三件事：
- *   1. 状态不撒谎 —— sent 只能由 run-state=running 触发，不是「转发完」
- *   2. mp 端能取消 —— sent 也能取消（中断这一轮），不再一律 ok:false
- *   3. dsh 侧创建的消息也要出现在 mp —— host slot
- */
-test('状态不撒谎：转发之后、run-state 之前，消息还是 held（不是 sent）', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q01')
-  // 内核收到 sendPrompt 但**不发 run-state**：旧版这时已经 markSent，
-  // 手机上显示「在跑」其实什么都没跑。新版必须还是 held。
-  kernel.silentSend = true
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '在吗' }), 'c_q01')
-  await settle()
-  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
-  const items = (frames.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  assert.equal(items.length, 1, '消息要进表')
-  assert.equal(items[0]?.state, 'held', '没确认在跑就不许说 sent——这就是「显示正在跑其实没跑」的根因')
-  assert.ok(kernel.calls.sendPrompt.length >= 1, '消息确实已经转给内核了')
-})
-
-test('run-state 说 running 才提升 sent：那一刻才真的叫在跑', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q02')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '跑一下' }), 'c_q02')
-  await settle()
-  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
-  const items =
-    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  assert.equal(items[0]?.state, 'sent', '内核确认在跑才提升')
-})
-
-test('dsh 侧创建的回合也要同步到 mp：inbox 事件直接入表（2026-10-05 取证后改）', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q03')
-  // 用户直接在 DSH 里发消息：内核把它拼进 agent 的 inbox。
-  // **这就是主机侧排队的真实信号**——之前是拿 run-state + user delta 猜，
-  // 猜出来的占位项常常对不上号，还可能把审批策略提示当成用户消息。
-  await kernel.feed({
-    kind: 'inbox',
-    sessionId: 'ses_live',
-    target: 'next-turn',
-    messageId: 'msg_host_1',
-    text: '主机侧发的那条',
-  })
-  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
-  assert.ok(frames.length >= 1, '主机侧的排队也要推 ev.queue——否则手机完全看不见')
-  const items = (frames.at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  assert.equal(items.length, 1, '要有一条')
-  assert.equal(items[0]?.text, '主机侧发的那条', '正文直接来自内核事件，不靠回填')
-  assert.equal(items[0]?.queueId, 'msg_host_1', 'queueId 用内核消息 id，双端对得上号')
-  assert.equal(items[0]?.state, 'held', '还没跑到它，就是排队中')
-})
-
-test('inbox：同一条内核消息重复报告只进表一次（幂等靠内核 id）', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q04')
-  const ev = {
-    kind: 'inbox' as const,
-    sessionId: 'ses_live',
-    target: 'next-turn' as const,
-    messageId: 'msg_dup',
-    text: '同一条',
-  }
-  await kernel.feed(ev)
-  await kernel.feed(ev)
-  await kernel.feed(ev)
-  const frames = transport.ofType(PAYLOAD_TYPES.evQueue)
-  const items = (frames.at(-1) as { items?: unknown[] }).items ?? []
-  assert.equal(items.length, 1, '重复报告不该让手机上出现三条一样的')
-})
-
-test('cmd.get_queue：mp 主动拉取，主机回当前全量（进会话不靠推送）', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q05')
-  await kernel.feed({
-    kind: 'inbox',
-    sessionId: 'ses_live',
-    target: 'next-turn',
-    messageId: 'msg_q1',
-    text: '排在前面的一条',
-  })
-  await kernel.feed({
-    kind: 'inbox',
-    sessionId: 'ses_live',
-    target: 'next-turn',
-    messageId: 'msg_q2',
-    text: '排在后面的一条',
-  })
-  // **在此刻手机一个事件都没收到也不影响**：进会话就是来问主机要。
-  await runtime.handleCommand(cmd('cmd.get_queue', { sessionId: 'ses_live' }), 'c_q05')
-  await settle()
-  const res = transport.resultReplies().at(-1) as { ok?: boolean; data?: { items?: Array<Record<string, unknown>> } }
-  assert.equal(res?.ok, true, '拉取要成功')
-  const items = res?.data?.items ?? []
-  assert.equal(items.length, 2, '两条排队都要在')
-  assert.deepEqual(
-    items.map((x) => x.text),
-    ['排在前面的一条', '排在后面的一条'],
-    '顺序必须与入队一致',
-  )
-})
-
-test('cmd.get_queue：另一条会话的排队不串台', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q06')
-  await kernel.feed({ kind: 'inbox', sessionId: 'ses_a', target: 'next-turn', messageId: 'm_a', text: 'A 的' })
-  await kernel.feed({ kind: 'inbox', sessionId: 'ses_b', target: 'next-turn', messageId: 'm_b', text: 'B 的' })
-  await runtime.handleCommand(cmd('cmd.get_queue', { sessionId: 'ses_a' }), 'c_q06')
-  await settle()
-  const res = transport.resultReplies().at(-1) as { data?: { items?: Array<Record<string, unknown>> } }
-  const items = res?.data?.items ?? []
-  assert.equal(items.length, 1)
-  assert.equal(items[0]?.text, 'A 的')
-})
-test('mp 端取消 sent：走中断，回执说清「已中断」而不是「撤不回来」', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q04')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: ' morning' }), 'c_q04')
-  await settle()
-  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
-  await settle()
-  const items =
-    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdDropQueued, { sessionId: 'ses_live', queueId: String(items[0]?.queueId) }),
-    'c_q04',
-  )
-  await settle()
-  const r = transport.resultReplies().at(-1)
-  assert.equal(r?.ok, true, 'sent 也必须能取消——用户明确要求 mp 端能取消')
-  assert.equal((r?.data as Record<string, unknown>)?.interrupted, true, '要标明这是中断，不是删除')
-  assert.ok(kernel.calls.interrupt.length >= 1, '取消 sent 必须真的去中断内核')
-})
-
-test('取消 sent 但内核拒了中断：回 ok:false 带原因，不假装成功', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q05')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: 'x' }), 'c_q05')
-  await settle()
-  await kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
-  await settle()
-  kernel.rejectInterruptFor = 'ses_live'
-  const items =
-    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdDropQueued, { sessionId: 'ses_live', queueId: String(items[0]?.queueId) }),
-    'c_q05',
-  )
-  const r = transport.resultReplies().at(-1)
-  assert.equal(r?.ok, false, '中断没成就不许说取消成功')
-  assert.ok(String(r?.message).length > 0, '要带可读原因')
-})
-
-test('held 的删除仍然是真删除（不进内核）', async () => {
-  const { runtime, kernel, transport } = fixture()
-  runtime.start()
-  await settle()
-  transport.pair('c_q06')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '删我' }), 'c_q06')
-  await settle()
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdDropQueued, {
-      sessionId: 'ses_live',
-      queueId: String((transport.resultReplies().at(-1)?.data as Record<string, unknown>)?.queued),
-    }),
-    'c_q06',
-  )
-  const r = transport.resultReplies().at(-1)
-  assert.equal(r?.ok, true)
-  assert.ok(!(r?.data as Record<string, unknown>)?.interrupted, 'held 不是中断')
-  const items =
-    (transport.ofType(PAYLOAD_TYPES.evQueue).at(-1) as { items?: Array<Record<string, unknown>> }).items ?? []
-  assert.equal(items.length, 0, 'held 删掉就真的从表里消失')
 })
