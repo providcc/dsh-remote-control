@@ -29,7 +29,7 @@ import type {
   QuestionItem,
   SessionSummary,
 } from 'dsh-remote-wire'
-import { appendFileNote, appendImageNote, saveFileAttachments, saveImageAttachments } from '../shell/uploads.js'
+import { appendFileNote, saveFileAttachments } from '../shell/uploads.js'
 import {
   keepAwakeState,
   messageDelta,
@@ -212,34 +212,20 @@ export class HostRuntime {
               return
             }
           }
-          // 图片附件：内核端口只收文本，所以主机先把图落盘、把路径写进正文
-          // （为什么必须落盘、三条纪律见 shell/uploads.ts 头注）。落盘失败 =
-          // 整条 prompt 失败：用户的意图包含这些图，少发几张比明确失败更难查。
           let text = cmd.text
           const images: ImageAttachment[] = Array.isArray(cmd.images) ? cmd.images : []
-          if (images.length > 0) {
-            if (!this.options.uploadDir) {
-              reply(false, { message: '这台主机没配图片落盘目录（uploadDir），收不了图片附件' })
-              return
-            }
-            const saved = saveImageAttachments({
-              images,
-              dir: this.options.uploadDir,
-              sessionId: cmd.sessionId,
-              maxBytesPerImage: this.options.maxImageBytes,
-            })
-            if (!saved.ok) {
-              reply(false, { message: saved.message })
-              return
-            }
-            this.options.log?.('图片附件落盘', {
-              sessionId: cmd.sessionId,
-              images: saved.saved.length,
-              bytes: saved.saved.reduce((sum, img) => sum + img.bytes, 0),
-              dir: saved.dir,
-            })
-            text = appendImageNote(text, saved.saved)
-          }
+          // 图片附件（2026-10-05 用户：正文里不要再出现路径）。
+          //
+          // 以前是「落盘 + 把绝对路径追加进 prompt 正文」：路径会出现在对话正文里，
+          // 用户和模型都看得见，还把本机目录结构泄露给模型。现在按宿主原生的图片
+          // 内容块送进去 {type:image, data, mimeType}，服务端会经 attachment store
+          // 转成内容寻址的持久引用 —— 正文一个字节都不用改。
+          //
+          // 也不再落盘：宿主的 attachment store 已经负责持久化，我们再存一份只是
+          // 让同一个文件在本机有两个副本，还平白多一个 uploadDir 闸门。
+          const imageBlocks = images
+            .filter((one) => one && typeof one.data === 'string' && one.data !== '')
+            .map((one) => ({ data: one.data, mimeType: one.mediaType || 'image/jpeg' }))
           // 文件附件：同一条通路（落盘 + 路径写进正文），差别在 uploads.ts 头注。
           const files: FileAttachment[] = Array.isArray(cmd.files) ? cmd.files : []
           if (files.length > 0) {
@@ -269,7 +255,7 @@ export class HostRuntime {
           // 理由是 inbox 没有删除入口：排队看着能撤，实际撤不掉，两端只会越差越远。
           // 执行中不许提交这条由**手机**保证（发送键在执行中是中断键）。
           try {
-            const sent = await this.kernel.sendPrompt(cmd.sessionId, text)
+            const sent = await this.kernel.sendPrompt(cmd.sessionId, text, imageBlocks)
             if (!sent.ok) {
               reply(false, { message: sent.message ?? '发送失败' })
               return

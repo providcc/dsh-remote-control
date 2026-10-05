@@ -1261,3 +1261,42 @@ test('提问卡：宿主字段名对不上时，产出的帧仍必须能过协�
   ])
   assert.deepEqual(items[2]?.options, [{ id: 'o1', label: 'A' }], '只有 value 时取 value')
 })
+
+/**
+ * 图片必须以**内容块**进消息，正文不许出现路径（2026-10-05 用户）。
+ *
+ * 这一条钉的是真正的落点：runtime 只是把附件转交下去，真正把它变成
+ * `{type:'image', data, mimeType}` 的是这里的 buildUserMessage。判据直接看
+ * followup 收到的那个消息对象 —— 那是宿主真正会读的东西。
+ */
+test('图片走内容块进消息：正文里一个字都不许多，正文后面才是图片块', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true }))
+  const image = { data: '/9j/4AAQSkZJRg==', mimeType: 'image/jpeg' }
+  const sent = await kernel.sendPrompt('ses_live', '看这张报错', [image])
+  assert.equal(sent.ok, true, sent.message ?? '')
+  assert.equal(f.calls.followup.length, 1, '图没被拒就必须真的送进去')
+
+  const content = (f.calls.followup[0] as unknown as { content?: Array<Record<string, unknown>> }).content ?? []
+  assert.deepEqual(
+    content[0],
+    { type: 'text', text: '看这张报错' },
+    '第一个块必须是用户原话：追加任何东西都会让模型看到一句用户没说过的话',
+  )
+  assert.deepEqual(
+    content[1],
+    { type: 'image', data: image.data, mimeType: image.mimeType },
+    '图片没按宿主原生的形状进去：这一代认的是 {type:image, data, mimeType}',
+  )
+  assert.equal(content.length, 2, `正文里混进了落盘那套痕迹（附件说明、绝对路径……）——现在正文必须原样透传`)
+})
+
+test('只发图不发字：不要塞一个空文本块（模型看到的是一句空话）', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true }))
+  const sent = await kernel.sendPrompt('ses_live', '   ', [{ data: 'AAA', mimeType: 'image/jpeg' }])
+  assert.equal(sent.ok, true, sent.message ?? '')
+  const content = (f.calls.followup[0] as unknown as { content?: Array<Record<string, unknown>> }).content ?? []
+  assert.equal(content.length, 1, '一个空 text 块 + 一个 image 块：空话不该占一个块位')
+  assert.equal(content[0]?.type, 'image')
+})

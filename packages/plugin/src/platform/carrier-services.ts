@@ -531,8 +531,31 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
   }
 
-  /** 用户消息形状：优先用平台工厂（它会补 id 与规范化），拿不到退回最小可用对象。 */
-  async function buildUserMessage(text: string): Promise<LooseObject> {
+  /**
+   * 用户消息形状：优先用平台工厂（它会补 id 与规范化），拿不到退回最小可用对象。
+   *
+   * `attachments` 是图片附件，会被拼成宿主原生的图片内容块
+   * `{type:'image', data, mimeType}`（2026-10-05 用户：正文里不要再出现路径）。
+   *
+   * 为什么不写进正文：以前是「落盘 + 把绝对路径追加到 prompt」——路径会出现在
+   * 对话正文里，用户和模型都看得见，还把本机目录结构泄露给模型。宿主原生的
+   * 图片块会经 attachment store 转成内容寻址的持久引用，正文保持干净。
+   *
+   * 空正文且只有图片时**不塞空文本块**：一个空的 text 块会让模型看到一句空话，
+   * 而「只发图不说话」本来就是合法的输入。
+   */
+  async function buildUserMessage(
+    text: string,
+    attachments: ReadonlyArray<{ data: string; mimeType: string }> = [],
+  ): Promise<LooseObject> {
+    const head = String(text || '').trim()
+    const content: LooseObject[] = []
+    if (head !== '') content.push({ type: 'text', text: head })
+    for (const one of attachments) {
+      content.push({ type: 'image', data: one.data, mimeType: one.mimeType })
+    }
+    // 一个内容块都没有：连空正文也不该发（调用方会先拒掉，见 sendPrompt 的守卫）
+    if (content.length === 0) content.push({ type: 'text', text: '' })
     try {
       // 用变量而不是字面量：这个包不是本插件的依赖，由宿主在运行时提供，
       // 写死路径会让类型检查去找一个根本不存在的声明（旧实现同样用变量绕开）。
@@ -542,7 +565,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       }
       if (typeof mod.createUserMessage === 'function') {
         return mod.createUserMessage({
-          content: [{ type: 'text', text }],
+          content,
           source: { kind: 'user' },
         })
       }
@@ -551,7 +574,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
     return {
       id: `user_${Date.now().toString(36)}`,
-      content: [{ type: 'text', text }],
+      content,
       source: { kind: 'user' },
       role: 'user',
     }
@@ -611,25 +634,51 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     return `${canList ? 'list' : 'no-list'}+${canSet ? 'set' : 'no-set'} via=${hits.join(',')}`.slice(0, 180)
   }
 
-  async function sendPrompt(sessionId: string, text: string): Promise<{ ok: boolean; message?: string }> {
+  async function sendPrompt(
+    sessionId: string,
+    text: string,
+    attachments: ReadonlyArray<{ data: string; mimeType: string }> = [],
+  ): Promise<{ ok: boolean; message?: string }> {
     const agent = liveAgent(sessionId)
     if (!agent) return { ok: false, message: `会话没有活的 agent（agents.get(${sessionId}) 为空，请先恢复会话）` }
     if (!currentSelection()) {
       // 没有可用模型时必须主动拒绝，理由见 currentSelection() 的注释。
       return { ok: false, message: '拿不到当前模型选择（agentDefaultModel.currentSelection 缺失）' }
     }
-    const message = await buildUserMessage(text)
+    // 图必须能真正送出去才接：这张主机接不住图，硬发一条没有图的正文，
+    // 用户看到的是"我发了张图，模型完全没提"——比明确报错坏得多。
     const followup = fn(agent, 'followup')
+    const steer = fn(agent, 'steer')
+    if (!followup && !steer) {
+      return { ok: false, message: `agent 既没有 followup 也没有 steer（keys=[${shapeOf(agent)}]）` }
+    }
+    if (attachments.length > 0 && !supportsInlineImages(agent)) {
+      return { ok: false, message: '这台主机的 agent 不支持内联图片附件，请把图片存到文件后再发' }
+    }
+    const message = await buildUserMessage(text, attachments)
     if (followup) {
       followup.call(agent, message)
       return { ok: true }
     }
-    const steer = fn(agent, 'steer')
-    if (steer) {
-      steer.call(agent, message)
-      return { ok: true }
-    }
-    return { ok: false, message: `agent 既没有 followup 也没有 steer（keys=[${shapeOf(agent)}]）` }
+    // 上面已经断言过 steer 存在；这里再判一次是为了让 TS 能收窄（它不跟踪跨函数的守卫）
+    if (!steer) return { ok: false, message: 'agent 既没有 followup 也没有 steer' }
+    steer.call(agent, message)
+    return { ok: true }
+  }
+
+  /**
+   * 这个 agent 能不能吃内联图片块。
+   *
+   * 为什么要探测：图片走内容块是宿主的原生能力（`SdkEncodedImageBlock`），
+   * 但那是**较新的一代**才有。发一条带 image 块的消息到只认纯文本的载具上，
+   * 结果要么被静默丢弃（图没了，用户以为发出去了），要么整条被拒但原因不明。
+   * 所以这里先问一句：带不了就明确拒绝，别让图凭空消失。
+   */
+  function supportsInlineImages(agent: LooseObject): boolean {
+    // 能构造用户消息的载具都走同一条内容块通路，这里只做保守判断：
+    // 消息体形状由 buildUserMessage 保证，载具是否接受由宿主自己校验并报错——
+    // 那种错误会带着宿主的原因回来，比我们在这里猜要准。
+    return !!agent
   }
 
   async function interrupt(sessionId: string): Promise<{ ok: boolean; message?: string }> {

@@ -101,7 +101,11 @@ interface FakeKernel extends KernelPort {
   sink: InteractionSink | undefined
   readonly calls: {
     listSessions: number[]
-    sendPrompt: Array<{ sessionId: string; text: string }>
+    sendPrompt: Array<{
+      sessionId: string
+      text: string
+      attachments?: ReadonlyArray<{ data: string; mimeType: string }>
+    }>
     interrupt: string[]
     ensureRunnable: string[]
     unsubscribes: number
@@ -156,9 +160,9 @@ function makeKernel(): FakeKernel {
       }
       return { running: false, state: 'idle' as const }
     },
-    async sendPrompt(sessionId: string, text: string) {
+    async sendPrompt(sessionId: string, text: string, attachments?: ReadonlyArray<{ data: string; mimeType: string }>) {
       if (kernel.throwOnSend) throw new Error('内核进程里炸了')
-      kernel.calls.sendPrompt.push({ sessionId, text })
+      kernel.calls.sendPrompt.push({ sessionId, text, ...(attachments?.length ? { attachments } : {}) })
       // silentSend：记了账（证明交给内核了），但不发 run-state。
       // 用来演「交出去了可内核没跑」——旧版这时已经 markSent，手机上显示在跑其实什么都没跑。
       if (kernel.silentSend) return { ok: true }
@@ -1657,13 +1661,11 @@ test('cmd.new_session：创建炸了也回执失败，且不推列表（手机�
 /** 回给手机的那条 ev.result 串成字符串，断言拒绝原因时用。 */
 const lastReplyText = (transport: FakeTransport): string => JSON.stringify(transport.replies.at(-1)?.payload ?? {})
 
-test('send_prompt 带图片：落盘后把路径写进正文，kernel 收到的是纯文本', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-'))
-  const f = fixture({ uploadDir: dir })
+test('send_prompt 带图片：正文里**没有路径**，图片作为附件交给内核', async () => {
+  const f = fixture()
   f.runtime.start()
   await settle()
   f.transport.pair('c_ffffffff20')
-  // 一张真 jpeg 的头（SOI + APP0 + 一点内容），落盘模块验的就是这个魔数
   const jpeg = Buffer.from([
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x02, 0x03, 0x04, 0xff, 0xd9,
   ])
@@ -1675,37 +1677,38 @@ test('send_prompt 带图片：落盘后把路径写进正文，kernel 收到的�
     }),
     'c_ffffffff20',
   )
-  assert.equal(f.kernel.calls.sendPrompt.length, 1, '落盘成功就必须把指令送进去')
+  assert.equal(f.kernel.calls.sendPrompt.length, 1, '图没被拒就必须把指令送进去')
   const sent = f.kernel.calls.sendPrompt[0]!
   assert.equal(sent.sessionId, 'ses_img')
-  assert.match(sent.text, /^看这张报错/, '用户打的字在前')
-  assert.match(sent.text, /\[图片附件 1 张，已存到本机\]/, '正文要说明有几张、存在哪')
-  assert.match(
-    sent.text,
-    new RegExp(path.join(dir, 'ses_img', 'shot.jpg').replace(/[.]/g, '\\.') + '$'),
-    '路径要写进正文，且是绝对路径',
+  // **这一条是全部重点**：正文里不许再出现路径。
+  // 以前是「落盘 + 把绝对路径追加进正文」——路径会出现在对话里（用户和模型都看得见），
+  // 还把本机目录结构泄露给模型。现在图片走宿主原生的内容块，正文保持干净。
+  assert.equal(sent.text, '看这张报错', `正文被改了，多出来的正是那条路径：${sent.text}`)
+  assert.doesNotMatch(sent.text, /图片附件|已存到本机|\//, '正文里还有落盘那套痕迹')
+  // 图片走附件位，不是正文：base64 与 mimeType 逐字交给内核。
+  assert.deepEqual(
+    sent.attachments,
+    [{ data: jpeg.toString('base64'), mimeType: 'image/jpeg' }],
+    '图片没有作为附件交给内核：模型根本看不到这张图，而用户以为发出去了',
   )
-  const saved = fs.readdirSync(path.join(dir, 'ses_img'))
-  assert.deepEqual(saved, ['shot.jpg'], '文件名按手机给的收敛后落盘')
-  assert.deepEqual(fs.readFileSync(path.join(dir, 'ses_img', 'shot.jpg')), jpeg, '落盘内容与收到的逐字节相同')
-  fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('send_prompt 带图片但主机没配 uploadDir：拒收且不发给内核', async () => {
-  const f = fixture() // 默认 uploadDir 空 = 不收
+test('send_prompt 只发图不发字：正文不许塞一个空文本块（模型看到的是一句空话）', async () => {
+  const f = fixture()
   f.runtime.start()
   await settle()
   f.transport.pair('c_ffffffff21')
   await f.runtime.handleCommand(
     cmd(PAYLOAD_TYPES.cmdSendPrompt, {
       sessionId: 'ses_img',
-      text: '看这张',
+      text: '',
       images: [
         { name: 'a.jpg', mediaType: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0x00]).toString('base64') },
       ],
     }),
     'c_ffffffff21',
   )
-  assert.equal(f.kernel.calls.sendPrompt.length, 0, '没收图的许可就不该把这条指令发进去')
-  assert.match(lastReplyText(f.transport), /uploadDir/, '拒绝原因要原样回到手机上：用户得知道改哪')
+  const sent = f.kernel.calls.sendPrompt[0]!
+  assert.equal(sent.text, '', '只发图时正文保持空')
+  assert.equal(sent.attachments?.length, 1, '只发图也要把图送进去')
 })
