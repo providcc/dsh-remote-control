@@ -28,8 +28,17 @@ pnpm install
 pnpm test
 ```
 
-要求 Node.js ≥ 20 与 pnpm 11（见 `.nvmrc`）。协议层 `dsh-remote-wire` 以 npm 依赖引入
-（`^1.0.0`，已发布；`pnpm-lock.yaml` 已提交，CI 用 `--frozen-lockfile`，升版流程见 README「前置条件」）。
+要求 Node.js ≥ 20 与 pnpm 11（见 `.nvmrc`）。协议层 `dsh-remote-wire` 以 npm 依赖引入，
+并且是**精确钉**（`"dsh-remote-wire": "1.0.0-rc.1"`，**不是** `^`——caret 会解析到更高的
+1.9.0，那就不是 rc 了）。
+
+**协议升版 = 一次跨四仓的发布**（2026-10-06 订正：原文把这句指给 README「前置条件」，
+那里并没有这一节）：先在 `dsh-remote-protocol` 发版，再把
+`packages/plugin/package.json` 的 pin 改成那个**精确**版本号，重跑
+`pnpm install` 并提交新的 `pnpm-lock.yaml`，最后 `pnpm typecheck && pnpm test`。
+漏掉第二步的话 `pnpm install --frozen-lockfile` 会直接红；漏掉重新 install 的话，
+类型与运行时拿到的是**旧**协议（比如 `cmd.new_session.workspace` 读出来永远是
+undefined，而 `parseCmdPayload` 又会把它 strip 掉——症状是"代码写了、行为没变"）。
 
 ## 开发流程
 
