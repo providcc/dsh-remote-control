@@ -653,7 +653,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   const collected: Record<string, unknown> = {}
   const hasServices = (): boolean => typeof collected.sessions === 'object' && collected.sessions !== null
 
-  const probe: Record<string, string> = {}
+  // wanted 是**布尔表**，不是字符串 —— 它回答"装没装"，值天然是 true/false。
+  const probe: Record<string, string | Record<string, boolean>> = {}
   const injectFired: string[] = []
   let hasGet = true
   let hasInject = true
@@ -922,6 +923,25 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       .split('/')
       .pop() ?? '',
   ].join('|')
+  /**
+   * `probe.wanted` 逐个点名回答的包（2026-10-06 宿主能力普查后定的）。
+   *
+   * 为什么点名而不倒全表：loader 有 50+ 条，status.json 会截断，
+   * 倒全表的那一半**看起来就像没加载**，而那正是最容易得出错结论的用法。
+   * 这里问的是"在不在"，答案短、不截断、且可复算。
+   */
+  const PROBE_PACKAGES = [
+    'dsh-token-meter',
+    'dsh-session-projection',
+    'dsh-compaction-basic',
+    'dsh-command-compact',
+    'dsh-api-workspace-files',
+    'dsh-client-file-upload',
+    'dsh-experimental-api-speech-to-text',
+    'dsh-llm-retry',
+    'dsh-tool-todo',
+  ] as const
+
   // 谁调用 apply：栈里能看出是 cordis-plugin-loader 还是别的包装层。
   probe.applyStack = String(new Error('drc-probe').stack ?? '')
     .split('\n')
@@ -938,7 +958,13 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         rows.push(`${String(options.id ?? '?')}=${String(options.name ?? '?')}`)
         if (rows.length >= 300) break
       }
-      probe.loaderRows = rows.join(',').slice(0, 2600)
+      // `loaderRows` 会被 status.json 的长度截断，所以**不能**拿它回答
+      // "某个包到底加载了没有"——截断点之后的看起来就像没加载，而那正是
+      // 最容易得出错误结论的用法（2026-10-06差点据此断言 token-meter 没挂）。
+      // 要回答"装没装"用下面的 wanted：逐个点名，短、确定、不受截断影响。
+      const all = rows.join(',')
+      probe.wanted = Object.fromEntries(PROBE_PACKAGES.map((name) => [name, all.includes('@deepseek-ai/' + name)]))
+      probe.loaderRows = all.slice(0, 2600)
     } else {
       probe.loaderRows = 'no-loader-service'
     }
