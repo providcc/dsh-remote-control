@@ -949,6 +949,115 @@ test('replayPending：已结算的不复活（settle 删掉的就该一直不在
   )
 })
 
+// ── inbox 接线（2026-10-06 下午）：主机侧排队的用户消息进手机 ──
+//
+// 用户在 DSH 里敲字时这一轮还没跑完，消息排给下一轮。原来它到 switch 就被丢掉，
+// 手机上"对方正在输入"的另一半永远看不见。接线复用 ev.message_delta role=user：
+// 手机本来就会渲染（去重测试锁着），历史回放走同一条 user 路，不需要新载荷。
+
+test('inbox：真人排队消息按 user role 出站（与 user/message 同一条渲染路）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_inbox')
+  kernel.feed({
+    kind: 'inbox',
+    sessionId: 'ses_live',
+    target: 'next-turn',
+    messageId: 'm1',
+    text: '桌面发的',
+  })
+  await settle()
+  const deltas = transport.broadcasts.filter((payload) => payload.t === PAYLOAD_TYPES.evMessageDelta) as Array<
+    Extract<EvPayload, { t: 'ev.message_delta' }>
+  >
+  assert.ok(deltas.length >= 1, '排队消息到 switch 就被丢了：手机永远看不见桌面发了什么')
+  const last = deltas[deltas.length - 1]!
+  assert.equal(last.role, 'user', '必须是 user role，否则手机渲染成助手的话')
+  assert.equal(last.delta, '桌面发的')
+  assert.equal(last.done, true, '排队消息是完整的一句，必须带 done，否则手机为它一直转圈')
+})
+
+test('inbox：空正文不发（纯图片的 splice 在手机上没有载体）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_inbox_empty')
+  transport.broadcasts.length = 0
+  kernel.feed({ kind: 'inbox', sessionId: 'ses_live', target: 'next-turn', messageId: 'm2', text: '' })
+  await settle()
+  assert.equal(
+    transport.broadcasts.filter((payload) => payload.t === PAYLOAD_TYPES.evMessageDelta).length,
+    0,
+    '空 user 块是假事实，mp 本来也不建块，不浪费这一帧',
+  )
+})
+
+// ── cmd.get_pending（2026-10-06 下午）：手机主动拉挂起卡 ──
+//
+// peer-joined 的重发只发生在重配对；普通 socket 重连中继不通知主机，
+// 主机收不到任何信号。手机在（重）连上、进会话页时拉一次，主机把 pending 里
+// 还挂着的按原请求帧重发（与 replayPending 同一构造器、同一 requestId）。
+
+test('get_pending：挂着的提问按原帧重发 + 回执说清重发了几张', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_gp')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  const first = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(first !== undefined, '首帧没发出去，后面测的就不是重发')
+  transport.replies.length = 0
+
+  await runtime.handleCommand(cmd('cmd.get_pending', { sessionId: 'ses_live' }), 'c_gp')
+  await settle()
+  const cards = transport.replies
+    .map((item) => item.payload)
+    .filter((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest)
+  assert.equal(cards.length, 1, '挂着一张就该重发一张')
+  assert.equal(
+    (cards[0] as Extract<EvPayload, { t: 'ev.question_request' }>).requestId,
+    first.requestId,
+    '必须同一 requestId：手机按它覆盖，不翻倍',
+  )
+  const results = transport.resultReplies()
+  assert.equal(results[results.length - 1]?.ok, true)
+  assert.deepEqual((results[results.length - 1]?.data as Record<string, unknown>)?.replayed, 1)
+})
+
+test('get_pending：带 sessionId 只重发那条会话的；没挂起只回 ok 不发帧', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_gp2')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  transport.replies.length = 0
+
+  await runtime.handleCommand(cmd('cmd.get_pending', { sessionId: 'ses_other' }), 'c_gp2')
+  await settle()
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evQuestionRequest).length,
+    0,
+    '别的会话挂着的不关这次拉取的事',
+  )
+  const results = transport.resultReplies()
+  assert.equal(results[results.length - 1]?.ok, true)
+  assert.deepEqual((results[results.length - 1]?.data as Record<string, unknown>)?.replayed, 0)
+})
+
 test('stop() 结算所有挂起交互：返回 decline 并释放每一次挂锁', async () => {
   const { runtime, kernel, transport, sleep } = fixture()
   runtime.start()

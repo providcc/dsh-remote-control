@@ -11,7 +11,9 @@
     "url": "git+https://github.com/providcc/dsh-remote-control.git"
   },
   "homepage": "https://github.com/providcc/dsh-remote-control#readme",
-  "bugs": "https://github.com/providcc/dsh-remote-control/issues",
+  "bugs": {
+    "url": "https://github.com/providcc/dsh-remote-control/issues"
+  },
   "engines": {
     "node": ">=20"
   },

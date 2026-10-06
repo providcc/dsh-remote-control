@@ -370,6 +370,23 @@ export class HostRuntime {
           )
           return
         }
+        case 'cmd.get_pending': {
+          // 手机主动拉还挂着的审批/提问（重连、进会话页时各一次）。
+          // 与 peer-joined 的重发同一批帧构造器（同一 requestId，手机按卡覆盖），
+          // 只是触发方从主机变成手机——普通 socket 重连中继不通知主机，
+          // 主机侧收不到任何信号，只能由手机拉。
+          // 没有挂起时只回 ok:true 的回执：回空数组是"没有"，与"没读到"必须分得清。
+          let replayed = 0
+          for (const [id, item] of this.pending) {
+            if (cmd.sessionId !== undefined && item.sessionId !== cmd.sessionId) continue
+            const frame = this.buildPendingFrame(id, item)
+            if (!frame) continue
+            this.replyTo(conversationId, frame)
+            replayed += 1
+          }
+          reply(true, { data: { replayed } })
+          return
+        }
       }
     } catch (error) {
       // 兜底回执：手机端至少要看到"这条命令失败了"，否则 UI 会静默卡在原地。
@@ -438,15 +455,18 @@ export class HostRuntime {
         if (event.text) this.window.push(event.sessionId, event.messageId, event.text, event.role)
         if (event.done) this.window.complete(event.sessionId, event.messageId, event.role)
         if (event.text) this.sleep.markActive()
-        // 注意：**这里不再处理「主机侧发的消息」**。
-        // 以前靠 user 回传的 delta 去填一条猜出来的占位项——那是 2026-10-05 早上的
-        // 错路：内核会往 user 通道塞审批策略提示之类机器话，填进去就是假排队。
-        //
-        // 真正的路径是内核的 agent/inbox/spliced（那里有 source.kind 能分清谁是人写的），
-        // **但它还没接线**：映射层产出的 `{kind:'inbox'}` 在这个 switch 里没有 case，
-        // 所以它到这里就被丢掉了（2026-10-06 核实）。因此主机侧排队的消息目前
-        // **到不了手机**——这是个已知的没做完，不是"按设计不需要"。
-        // 接线要动协议与 mp，见 carrier-services.ts 里 MAPPED_SESSION_EVENTS 的注释。
+        return
+      }
+      case 'inbox': {
+        // 主机侧排队的用户消息（内核 agent/inbox/spliced）：用户在 DSH 里敲了字，
+        // 这一轮还没跑完，消息排给下一轮。手机上它就是一条用户指令——与 user/message
+        // 同一条渲染路（用户气泡 + 历史回放），复用 ev.message_delta role=user。
+        // 空正文不发：纯图片的 splice 在手机上没有载体，发一条空 user 块等于假事实
+        // （mp 的 _applyText 对空正文本来就不建块，这里的跳过只是不浪费那一帧）。
+        if (!event.text) return
+        this.window.push(event.sessionId, event.messageId, event.text, 'user')
+        this.window.complete(event.sessionId, event.messageId, 'user')
+        this.sleep.markActive()
         return
       }
       case 'tool':
@@ -844,24 +864,9 @@ export class HostRuntime {
       try {
         // 重配对时通道换了：旧 conversationId 已经作废，后续的结算作废帧要发到新通道。
         item.conversationId = conversationId
-        this.replyTo(
-          conversationId,
-          item.kind === 'approval'
-            ? permissionRequest({
-                requestId: id,
-                sessionId: item.sessionId,
-                action: item.action ?? '操作',
-                ...(item.reason === undefined ? {} : { reason: item.reason }),
-                options: APPROVAL_OPTIONS,
-                expiresAt: item.expiresAt,
-              })
-            : questionRequest({
-                requestId: id,
-                sessionId: item.sessionId,
-                questions: item.options ?? [],
-                expiresAt: item.expiresAt,
-              }),
-        )
+        const frame = this.buildPendingFrame(id, item)
+        if (!frame) continue
+        this.replyTo(conversationId, frame)
         replayed += 1
       } catch (error) {
         this.log('pending replay failed', { requestId: id, message: messageOf(error) })
@@ -869,6 +874,34 @@ export class HostRuntime {
     }
     if (replayed > 0) this.log('pending replayed', { conversationId, count: replayed })
     return replayed
+  }
+
+  /**
+   * 把一条挂起的等待拼回它最初的那一帧（`cmd.get_pending` 与 `replayPending` 共用）。
+   *
+   * 同一 requestId、同一内容、同一 expiresAt——手机按 requestId 覆盖，
+   * 重发落在已有卡的手机上只是原地重写。提问的 questions 为空时不拼：
+   * 空数组的提问卡在手机上是一张只有输入框的卡，与"有选项但都不可选"长得一样，
+   * 发出去是假事实（首帧不可能为空——内核问的时候一定带了题）。
+   */
+  private buildPendingFrame(id: string, item: PendingInteraction): EvPayload | null {
+    if (item.kind === 'approval') {
+      return permissionRequest({
+        requestId: id,
+        sessionId: item.sessionId,
+        action: item.action ?? '操作',
+        ...(item.reason === undefined ? {} : { reason: item.reason }),
+        options: APPROVAL_OPTIONS,
+        expiresAt: item.expiresAt,
+      })
+    }
+    if (!item.options || item.options.length === 0) return null
+    return questionRequest({
+      requestId: id,
+      sessionId: item.sessionId,
+      questions: item.options,
+      expiresAt: item.expiresAt,
+    })
   }
 
   /**

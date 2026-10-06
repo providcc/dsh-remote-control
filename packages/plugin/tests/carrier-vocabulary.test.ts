@@ -515,20 +515,11 @@ test('inbox：没有 id 时用 seq 兜底，保证 messageId 永不为空', () =
   assert.equal(ev?.kind === 'inbox' ? ev.messageId : null, 'i7', '没有 id 时用 seq 兜底')
 })
 
-// 这条断言 2026-10-06 被**反转**了，理由记在这里，别再翻回去。
-//
-// 原来的理由是"不登记的话 status.json 会一直记着它没被映射"。实际上登记进去
-// 造成了更坏的结果：`MAPPED_SESSION_EVENTS` 只驱动 status.json 的记账，
-// **不驱动 HostRuntime 的 switch**。而 switch 里没有 `case 'inbox'`（真实负载
-// 映射出 `{kind:'inbox'}` 后被丢弃），于是：
-//   登记了 → 留痕路径不触发 → status.json 报"一切正常"，而手机其实什么都收不到。
-// **专门用来证明"内核发了我们没认"的通道，在这件事上是瞎的。**
-//
-// 这正是 HANDOFF §4 记下的那个取证陷阱的翻版：那张表只管记账。
-// 现在它已撤出映射表，status.json 如实报 unmapped；接线（协议加载荷 + mp 加
-// 处理器 + 这里改回来）做完再登记，同一条判据会盯着。
-test('inbox：还没接线就不许留在 MAPPED_SESSION_EVENTS（留痕通道必须说真话）', () => {
-  assert.equal(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), false)
+// 这条断言 2026-10-06 被**反转**过一次（撤出映射表让证据说真话），
+// 2026-10-06 下午随接线（control 2.0.13，runtime `case 'inbox'`）再反转回来。
+// 出站面由 runtime.test.ts 的穷举自检盯着（样本已配好，漏了 case 就红）。
+test('inbox：已接线就必须留在 MAPPED_SESSION_EVENTS（撤出是临时的）', () => {
+  assert.equal(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), true)
 })
 
 test('request/header 映射成按会话的 model（2026-10-05 用户实测：会话模型串台）', () => {

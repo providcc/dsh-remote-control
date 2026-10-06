@@ -1312,19 +1312,18 @@ export const MAPPED_SESSION_EVENTS = new Set([
   // 内核的 todo/write 在真机的 eventTypes 里（status.json 的 unmappedEventTypes 曾一直记着它），
   // 但没人转发到手机——于是手机上一整轮"现在在干什么"都是空白。2026-10-05 补上。
   'todo/write',
-  // **agent/inbox/spliced 刻意不在这里**（2026-10-06 改回）。
+  // agent/inbox/spliced（2026-10-06 接上，control 2.0.13）。
   //
-  // 曾经 2026-10-05 把它加进来，理由是"真机 eventTypes 里一直有"。
-  // 但映射层产出 `{kind:'inbox'}` 之后，`HostRuntime.onKernelEvent` 的 switch
-  // **没有 case 'inbox'**（runtime.ts 里还留着一句"见下面的 inbox 分支"，
-  // 那个分支不存在），事件从 switch 末尾掉出去被丢弃——而因为它在这个表里，
-  // 下面那段"没认就记进 unmapped"的留痕路径**永远不会触发**。
-  // 结果：主机侧排队的消息在手机上完全不可见，而**证据通道报的是"一切正常"**。
+  // 曾经 2026-10-05 把它加进来又 2026-10-06 撤出去：当时映射层产出 `{kind:'inbox'}`
+  // 之后 `HostRuntime.onKernelEvent` 的 switch **没有 case 'inbox'**，事件从 switch
+  // 末尾掉出去被丢弃——而因为它在这个表里，"没认就记进 unmapped"的留痕路径永不触发，
+  // status.json 报"一切正常"，手机却什么都收不到。
   //
-  // 这里面是"我们没接"，不是"我们接了"。真正的接线要动三处：协议加一个
-  // inbox 载荷（wire 发版）+ mp 加处理器 + 这里改回来。所以**先撤出映射表**，
-  // 让 status.json 如实报 unmapped——排错第一步就能分清"内核没发"与"我们没接"。
-  // 接线做完再把它加回来，同一条判据（runtime.test.ts 的穷举自检）会盯着。
+  // 接线不需要新协议载荷：inbox 就是"用户在 DSH 里发的、排给下一轮的消息"，
+  // 与 `user/message` 走同一条渲染路（用户气泡 + 历史回放）——runtime 里
+  // `case 'inbox'` 把它按 user role 推进合帧窗口，复用 `ev.message_delta`。
+  // 手机本来就会渲染 role=user 的 delta（去重测试锁着），mp 一行不用改。
+  'agent/inbox/spliced',
   // request/header 同理：它每轮都带**本会话真正在用的模型**。不映射的话，
   // mp 端只能显示宿主全局默认模型——那正是 2026-10-05 用户实测到的串台
   // （本会话在用 space-bunny-free，却显示别的会话切出来的 muse-spark）。
@@ -1698,6 +1697,23 @@ export function historyPageFromLog(input: {
 
   const flat: KernelEvent[] = []
   for (const group of page) flat.push(...group.events)
+
+  // 第一页（最新一页）恒带最新的一份待办快照。待办是"此刻的清单"，
+  // 不是"当时发生了什么"——40 条窗口装满工具事件时，快照会被裁在外面，
+  // 手机重进一条跑了很久的会话，顶部条子直接消失（2026-10-06 用户实测），
+  // 而且之后没有 todo 变更就没有实时帧来补，它会一直缺着。
+  // 只补第一页：更早页的快照是过期的，手机只应用第一页那一份（mp 侧守卫）。
+  // 快照很小（十几条短文本），不计入分页预算——预算管的是"别顶满中继帧"，
+  // 一份清单顶不满（wire 1.5.0 同一口径）。
+  if (input.beforeSeq === undefined && !flat.some((event) => event.kind === 'todo')) {
+    for (let i = ranged.length - 1; i >= 0; i--) {
+      const snap = ranged[i]!.events.find((event) => event.kind === 'todo')
+      if (snap) {
+        flat.push(normalizeHistoryEvent(snap, terminal))
+        break
+      }
+    }
+  }
 
   // 游标只在**确实还有更早、且还有内容**的时候给：给出一个翻不出东西的游标，
   // 手机上会长出一个点了没反应的「加载更早」。

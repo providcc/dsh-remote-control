@@ -7,6 +7,10 @@
 **DSH Remote Control** 的宿主侧——跑在 DeepSeek Harness 里的 cordis 插件。它把本机的 DSH 与
 零知识中继配对，让微信小程序可以**发指令、看流式输出、回答审批**，全程载荷级端到端加密。
 
+> EN: the host-side plugin for DSH Remote Control (a cordis bundle for DeepSeek Harness).
+> Pair your DSH over a zero-knowledge relay and drive it from a WeChat Mini Program —
+> send prompts, watch streaming output, approve tool calls. Payload-level end-to-end encrypted.
+
 本仓**只有一个包**：`dsh-remote-control`（发 npm）。它一次构建产出**两半产物**——宿主侧
 `dist/bundle/index.js` 与浏览器面 `dist/bundle/client.cjs`，都由
 [`scripts/install-to-profile.sh`](./scripts/install-to-profile.sh) 装进 profile：
@@ -23,7 +27,7 @@
 > 2026-10-03 连终端文本码一起删了，**配对入口只剩这颗 pill**。
 
 其余两半在各自仓库：[`dsh-remote-server`](https://github.com/providcc/dsh-remote-server)（零知识中继）、
-`dsh-remote-mp`（微信小程序客户端）。三者共用
+[`dsh-remote-mp`](https://github.com/providcc/dsh-remote-mp)（微信小程序客户端）。三者共用
 [`dsh-remote-protocol`](https://github.com/providcc/dsh-remote-protocol)（线协议；npm 包名 `dsh-remote-wire`，本插件以 npm 依赖消费）。
 
 ```

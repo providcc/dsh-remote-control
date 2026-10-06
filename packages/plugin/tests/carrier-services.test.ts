@@ -936,6 +936,38 @@ test('历史：预算再小也要给出一整组，不能产出空页（空页 +
   assert.ok(page.events.length >= 1, '给了空页但游标还在动，手机端的「加载更早」会一直转')
 })
 
+test('历史：第一页恒带最新待办快照（长回合里窗口裁掉也不许丢）', () => {
+  // 2026-10-06 用户实测：重进一条跑了很久的会话，顶部待办条直接消失。
+  // 待办是"此刻的清单"：todo/write 在回合开头，后面跟了几十条工具事件，
+  // 40 条窗口把它裁在外面，而之后没有 todo 变更就没有实时帧来补——一直缺着。
+  const log = [
+    { type: 'todo/write', seq: 1, data: { todos: [{ content: '做一件事', status: 'in_progress' }] } },
+    ...Array.from({ length: 10 }, (_, i) => ({
+      type: 'tool/call',
+      seq: 2 + i,
+      data: { turn: 1, step: 1 + i, callId: `call_${i}`, name: 'bash', arguments: '{"command":"x"}' },
+    })),
+  ]
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 3 })
+  const todos = page.events.filter((event) => event.kind === 'todo')
+  assert.equal(todos.length, 1, '第一页没有待办：手机重进长会话，顶部条子直接消失')
+  assert.equal(
+    (todos[0] as { todos: Array<{ content: string }> }).todos[0]?.content,
+    '做一件事',
+    '必须是最新那一份快照',
+  )
+})
+
+test('历史：第一页本来就有待办时不许补第二份（去重，不是越多越好）', () => {
+  const log = [
+    { type: 'todo/write', seq: 1, data: { todos: [{ content: '旧的', status: 'pending' }] } },
+    { type: 'todo/write', seq: 2, data: { todos: [{ content: '新的', status: 'in_progress' }] } },
+  ]
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100 })
+  const todos = page.events.filter((event) => event.kind === 'todo')
+  assert.equal(todos.length, 1, '塌缩后最新一份只留一条，兜底不能再加一条')
+})
+
 test('历史：没有下文的工具调用要落成"已结束 + 说明"，不能让它一直显示"正在执行"', () => {
   const log = [
     { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '跑一下' }], role: 'user', id: 'u-1' } },
@@ -1495,18 +1527,14 @@ test('历史：空清单也是一份快照，照样保留（用户拍板取最�
   assert.equal(todos[0]!.todos.length, 0, '最后一份是空的（内核清空了清单），这就是用户拍板的语义')
 })
 
-// ── inbox：还没接线，所以证据必须说"没接"（2026-10-06）────────────────────
+// ── inbox：已接线，证据必须说"已接"（2026-10-06 下午）────────────────────
 //
-// `agent/inbox/spliced` 被映射成 `{kind:'inbox'}`，但 HostRuntime 的 switch 里
-// 没有 case 'inbox'，事件被丢弃——主机侧排队的消息在手机上完全不可见。
-// 2026-10-05 把它加进了 MAPPED_SESSION_EVENTS，于是"没认就记进 unmapped"的
-// 留痕路径**永不触发**，status.json 报的是"一切正常"：
-// **专门用来证明"内核发了我们没认"的通道，在这件事上是瞎的。**
-//
-// 现在它已撤出映射表（接线要动协议与 mp，见 MAPPED_SESSION_EVENTS 的注释），
-// 所以判据是：它必须出现在 unmappedEventTypes 里。
+// `agent/inbox/spliced` 映射成 `{kind:'inbox'}`，HostRuntime 的 switch 里有了
+// case 'inbox'（按 user role 进合帧窗口，复用 ev.message_delta）。
+// 撤出映射表是接线完成前的临时状态，现在回到映射表；出站面由
+// runtime.test.ts 的穷举自检盯着。
 
-test('inbox 还没接线：证据账本必须如实把它记成 unmapped', () => {
+test('inbox 已接线：必须回到映射表，不再记成 unmapped', () => {
   const f = fixture()
   const services = f.bundle({ live: true })
   const listeners: Record<string, (...args: unknown[]) => void> = {}
@@ -1531,12 +1559,10 @@ test('inbox 还没接线：证据账本必须如实把它记成 unmapped', () =>
   )
 
   const described = kernel.describe() as Record<string, string | undefined>
-  assert.ok(
+  assert.equal(
     String(described.unmappedEventTypes ?? '').includes('agent/inbox/spliced'),
-    '它还出不了站，就必须被记成 unmapped，否则证据通道报的是"一切正常"',
+    false,
+    '已经接线还记成 unmapped，证据通道就又说谎了',
   )
-  assert.ok(
-    !MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'),
-    '还没接线就不许留在映射表里：留在里面会让留痕路径永不触发',
-  )
+  assert.ok(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), '接线完成就必须回到映射表里')
 })

@@ -5,6 +5,29 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.13] - 2026-10-06
+
+### 新增：`cmd.get_pending`——手机主动拉还挂着的审批/提问（wire 1.9.0）
+
+`peer-joined` 的重发（2.0.12）只发生在重配对；普通 socket 重连中继不通知主机，
+主机收不到任何信号。手机在进会话页、重连成功时各拉一次，主机把 `pending` 里
+还挂着的按原请求帧重发（与 `replayPending` 同一构造器、同一 `requestId`），
+没有只回 `ev.result{ok:true, replayed:0}`。`sessionId` 可选（带了只重发那条会话的）。
+
+### 新增：inbox 接线——主机侧排队的用户消息进手机
+
+内核 `agent/inbox/spliced`（用户在 DSH 里敲字、排给下一轮）原来产出 `{kind:'inbox'}`
+后在 switch 里没有 case，从此掉出去被丢弃（还撤出过映射表让证据说真话）。
+现在按 user role 推进合帧窗口，复用 `ev.message_delta`：手机本来就会渲染 role=user，
+历史回放走同一条 user 路——**不需要新协议载荷，mp 一行不用改**。
+
+### 修复：历史第一页恒带最新待办快照
+
+待办是"此刻的清单"：`todo/write` 在回合开头，后面跟几十条工具事件，
+40 条窗口把它裁在外面，手机重进长会话顶部条子直接消失，之后没有 todo 变更
+就没有实时帧来补。第一页（且仅第一页）没有就把最新一份 append 进去；
+快照很小，不计分页预算。
+
 ## [2.0.12] - 2026-10-06
 
 ### 新增：配对那一刻重发还挂着的审批/提问（`replayPending`）
