@@ -1429,3 +1429,67 @@ test('compaction：start/end 成对，end 带 error 时是 failed 不是 ended',
     '压缩失败被当成压缩完了：上下文已经烂掉，而用户以为一切正常',
   )
 })
+
+// ── 待办要活过历史页（2026-10-06）────────────────────────────────────────
+//
+// 曾经的现场：`isHistoryWorthy` 只放行 delta 与 tool，`todo` 在**进历史页之前**
+// 就被丢掉了。于是 `runtime.ts` 里 `historyWireItem` 的 todo 分支是死代码，
+// mp 的 `_replayTodos` 恒为 undefined，顶部那颗待办条**只在页面正好开着、
+// 真机又正好推来一帧实时 ev.todo 时才会出现**——打开一条已有会话就什么都没有。
+//
+// 而且在这个文件里，realLog fixture 从来没有 todo，todo 出现次数为 0，
+// 所以整条链路上没有一条判据断言过 todo 能活过 historyPageFromLog。
+// 这就是它能一直静默的原因。
+
+function logWithTodos(): Array<{ type: string; seq: number; data: Record<string, unknown> }> {
+  const log = realLog('ses_1')
+  const last = log[log.length - 1]!.seq
+  return [
+    ...log,
+    // 三条**全量**快照：内核每轮 todo 工具调用都发一整份（真机形状）
+    { type: 'todo/write', seq: last + 1, data: { todos: [{ content: '读 handoff', status: 'completed' }] } },
+    {
+      type: 'todo/write',
+      seq: last + 2,
+      data: {
+        todos: [
+          { content: '读 handoff', status: 'completed' },
+          { content: '实现落盘', status: 'in_progress' },
+        ],
+      },
+    },
+    { type: 'todo/write', seq: last + 3, data: { todos: [{ content: '实现落盘', status: 'completed' }] } },
+  ]
+}
+
+const todosIn = (page: { events: KernelEvent[] }): KernelEvent[] => page.events.filter((e) => e.kind === 'todo')
+
+test('历史：todo/write 要活过 historyPageFromLog（以前被 isHistoryWorthy 挡掉了）', () => {
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  assert.ok(todosIn(page).length > 0, '一条待办都没活下来 —— mp 于是永远等不到历史快照')
+})
+
+test('历史：一页只留**最后一份**待办快照（全量语义，冗余的会把正文挤出 charBudget）', () => {
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  const todos = todosIn(page) as Array<{ todos: Array<{ content: string }> }>
+  assert.equal(todos.length, 1, '三条全量快照应当塌缩成一条')
+  assert.equal(todos[0]!.todos[0]!.content, '实现落盘', '留的是最后那一份')
+})
+
+test('历史：待办不占正文的位置（正文字数一条都不能少）', () => {
+  const bare = historyPageFromLog({ sessionId: 'ses_1', events: realLog('ses_1'), limit: 100 })
+  const withTodo = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  const deltas = (page: typeof bare) => page.events.filter((e) => e.kind === 'delta').length
+  assert.equal(deltas(withTodo), deltas(bare), '待办把正文挤出去了')
+})
+
+test('历史：空清单也是一份快照，照样保留（用户拍板取最后一份，内核清空后 mp 就不显示）', () => {
+  const log = [...realLog('ses_1')]
+  const last = log[log.length - 1]!.seq
+  log.push({ type: 'todo/write', seq: last + 1, data: { todos: [{ content: 'x', status: 'pending' }] } })
+  log.push({ type: 'todo/write', seq: last + 2, data: { todos: [] } })
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100 })
+  const todos = todosIn(page) as Array<{ todos: unknown[] }>
+  assert.equal(todos.length, 1)
+  assert.equal(todos[0]!.todos.length, 0, '最后一份是空的（内核清空了清单），这就是用户拍板的语义')
+})

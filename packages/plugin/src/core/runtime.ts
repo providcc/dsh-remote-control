@@ -123,6 +123,9 @@ const LISTING_LIMIT = 100
 /** 一次历史翻页默认给多少条（协议上界 200，这里更保守：一帧要装得下）。 */
 const HISTORY_LIMIT = 40
 /** 相邻两条 `ev.session_changed` 的最小间隔；小于它就改成尾随推送。 */
+/** 每会话模型缓存的容量上限。与 voided/pairing slots 同一套有界纪律。 */
+const MODEL_CACHE_MAX = 256
+
 const SESSION_MERGE_MS = 500
 
 export class HostRuntime {
@@ -137,6 +140,21 @@ export class HostRuntime {
   private mergeTimer: unknown
   private mergePendingReason = 'merged'
   private sessions: SessionSummary[] = []
+  /**
+   * 每条会话**内核真实上报过**的模型（2026-10-06 补）。
+   *
+   * 为什么需要它：模型的数据源是内核 `request/header`，而它**每轮一条**——
+   * 空闲会话永远不发。所以打开一条跑完的会话时，mp 的 `modelName` 从 `''` 起算、
+   * 顶栏 `wx:if="{{modelName}}"` 空则不渲染，用户看到的现象是"当前模型不见了"。
+   *
+   * **不是**退回读宿主全局的 `agentDefaultModel.currentSelection()`：那是"新建
+   * 会话用哪个"，用户在别的会话切一次模型，本会话的显示就跟着变——2026-10-05
+   * 用户实测到的串台（space-bunny-free 显示成 muse-spark）就是它。
+   * 这里只缓存内核**为这条会话**报过的值，所以补发的是真的，且不会串台。
+   *
+   * 内存天然有界：`pushSessions` 里按当前会话列表裁剪，LISTING_LIMIT 上限 100。
+   */
+  private readonly modelBySession = new Map<string, { model: string; provider?: string }>()
   private started = false
   private stopped = false
   private lastPushAt = 0
@@ -435,6 +453,7 @@ export class HostRuntime {
         // 数据源是内核 request/header（每轮一条），**不是**宿主全局默认模型
         // （agentDefaultModel.currentSelection = 新会话默认用哪个）。
         // 全局那个与本会话无关——用户在别的会话切一次模型，本会话显示就跟着变。
+        this.rememberModel(event.sessionId, event.model, event.provider)
         this.broadcastModel(event.sessionId, event.model, event.provider)
         return
       case 'todo':
@@ -508,7 +527,49 @@ export class HostRuntime {
     }
     this.broadcast(sessionChanged(this.sessions, reason))
     this.broadcast(keepAwakeState(this.sleep.snapshot()))
+    this.replayModels()
     return this.sessions
+  }
+
+  /**
+   * 随会话列表**补发**每条会话的模型。
+   *
+   * 为什么这条路径必须存在（2026-10-06 取证）：commit 9511904 修提问弹窗时把
+   * `this.broadcastModel()` 从 `pushSessions()` 里删掉了——那次重构改了
+   * broadcastModel 的签名（从"读全局"改成"广播这个事件带来的"），
+   * **call site 被删掉而不是适配**。于是模型只在跑一轮时出站，
+   * 打开已有会话/重连后顶栏一片空白。
+   *
+   * 挂在 pushSessions 上是因为它本来就是那个"状态变了就推一次"的唯一入口，
+   * 而且它的 reason `'list'`（mp 重连时 `chat.js` 会发 `cmd.list_sessions`）
+   * **不走合并窗口**——所以重连这一路是白拿的，不需要另加触发点。
+   *
+   * 只补发**内核报过的**：没见过的会话一条都不发。凭空造一个全局模型名，
+   * 显示的是猜的东西，比不显示更糟。
+   */
+  private replayModels(): void {
+    for (const [sessionId, entry] of this.modelBySession) {
+      this.broadcastModel(sessionId, entry.model, entry.provider)
+    }
+  }
+
+  /**
+   * 记一条会话的模型，并做**有界**淘汰。
+   *
+   * 刻意**不**按会话列表裁剪：列表是 LIMIT 截断的（LISTING_LIMIT=100），
+   * 一条跑过模型的会话一旦掉出前 100，它的模型就会被误删——那正好是"打开一条
+   * 旧会话模型是空的"这条 bug 换个原因复发。
+   * 改用与 `RelayClient.voided` / `PairingSlots` 同一套的容量上限（见 MODEL_CACHE_MAX）。
+   */
+  private rememberModel(sessionId: string, model: string, provider?: string): void {
+    // 命中就重新插到队尾：容量满时淘汰的是**最久没被内核确认过**的那条。
+    this.modelBySession.delete(sessionId)
+    this.modelBySession.set(sessionId, { model, ...(provider ? { provider } : {}) })
+    while (this.modelBySession.size > MODEL_CACHE_MAX) {
+      const oldest = this.modelBySession.keys().next()
+      if (oldest.done) break
+      this.modelBySession.delete(oldest.value)
+    }
   }
 
   /**

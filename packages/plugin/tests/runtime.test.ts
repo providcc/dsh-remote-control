@@ -1025,6 +1025,88 @@ test('回执之后的会话状态变化必须额外推 session_changed：发指�
   }
 })
 
+// ── 模型必须在「没有轮次」时也拿得到（2026-10-06）───────────────────────
+//
+// commit 9511904（修提问弹窗的那个）把 `this.broadcastModel()` 从
+// `pushSessions()` 里删掉了：那次重构把 broadcastModel 从「读宿主全局默认
+// 模型并广播」改成「广播某个事件带来的模型」，**call site 被删掉而不是适配**。
+// 于是 ev.model 只在内核发 request/header（= 会话正在跑一轮）时才出站。
+// mp 那边 `modelName` 只有初始化与 `_onModel` 两处写、**没有任何清空路径**，
+// 所以打开一条空闲会话时它不是"消失了"，是**从来没被设置过**。
+//
+// 本文件此前 model 出现 0 次——「无轮次时也要推模型」从来没有被覆盖过。
+
+test('模型：这一轮跑完之后，后续每次列表推送都要补发 ev.model', async () => {
+  // 场景就是用户报的：会话跑完一轮（request/header 报过一次模型），随后中继重启 /
+  // 手机重连 → mp 重新进会话。此时内核**不会再发** request/header（它每轮一条），
+  // 所以模型只能从缓存补发。没有补发的话顶栏 `modelName` 停在 ''、根本不渲染。
+  const { runtime, kernel, clock, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_fffffff1')
+  await settle()
+
+  kernel.feed({ kind: 'model', sessionId: 'ses_live', model: 'space-bunny-free' })
+  await settle()
+  transport.broadcasts.length = 0
+
+  // 之后每一次列表推送（含 mp 重连触发的 cmd.list_sessions）都要带上它
+  await clock.advance(1_000)
+  await runtime.pushSessions('list')
+  await settle()
+
+  const models = transport.ofType(PAYLOAD_TYPES.evModel)
+  assert.ok(models.length >= 1, '一次都没补发：打开一条空闲会话时 mp 顶栏的模型名永远为空（用户报"当前模型不见了"）')
+})
+
+test('模型：补发的 ev.model 必须带 sessionId，且是**本会话**的模型', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_fffffff2')
+  await settle()
+
+  // 两条会话各自跑一轮，各自带上自己的模型（2026-10-05 用户报的串台就是这里）
+  kernel.listing = [
+    { id: 'ses_alpha', state: 'idle', running: false, title: 'A' },
+    { id: 'ses_beta', state: 'idle', running: false, title: 'B' },
+  ]
+  kernel.feed({ kind: 'model', sessionId: 'ses_alpha', model: 'space-bunny-free' })
+  await settle()
+  kernel.feed({ kind: 'model', sessionId: 'ses_beta', model: 'muse-spark' })
+  await settle()
+  transport.broadcasts.length = 0
+
+  await runtime.pushSessions('list')
+  await settle()
+
+  const models = transport.ofType(PAYLOAD_TYPES.evModel) as Array<{ t: string; sessionId?: string; model?: string }>
+  assert.ok(models.length > 0, '补发没发生')
+  // wire 1.8.0 起 sessionId 必填非空，所以补发**不能**用全局值兜底
+  for (const model of models) {
+    assert.ok(model.sessionId, 'sessionId 必填：空会话名的帧会被 schema 直接丢掉')
+  }
+  // 一条会话的模型绝不能串到另一条上
+  const bySession = new Map(models.map((m) => [m.sessionId, m.model]))
+  assert.equal(bySession.get('ses_alpha'), 'space-bunny-free')
+  assert.equal(bySession.get('ses_beta'), 'muse-spark')
+})
+
+test('模型：没见过的会话不许补发（不能凭空造一个全局模型名）', async () => {
+  const { runtime, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_fffffff3')
+  await settle()
+  transport.broadcasts.length = 0
+
+  await runtime.pushSessions('list')
+  await settle()
+
+  const models = transport.ofType(PAYLOAD_TYPES.evModel)
+  assert.equal(models.length, 0, '内核一次都没报过模型，补发就会显示一个猜的名字——比不显示更糟')
+})
+
 test('相邻 500ms 内的重复列表推送被合并（全量快照，合并中间几次不丢信息）', async () => {
   const { runtime, kernel, clock, transport } = fixture()
   runtime.start()

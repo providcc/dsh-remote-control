@@ -1654,7 +1654,9 @@ export function historyPageFromLog(input: {
     }
   }
 
-  const ranged = input.beforeSeq === undefined ? groups : groups.filter((group) => group.seq < input.beforeSeq!)
+  const ranged = collapseTodoSnapshots(
+    input.beforeSeq === undefined ? groups : groups.filter((group) => group.seq < input.beforeSeq!),
+  )
   const limit = Math.max(1, input.limit)
   const budget = input.charBudget ?? HISTORY_CHAR_BUDGET
 
@@ -1686,11 +1688,59 @@ export function historyPageFromLog(input: {
   }
 }
 
-/** 历史只留"有内容"的两种：有正文的 delta、有 callId 的工具事件。 */
+/**
+ * 历史里放行什么。
+ *
+ * 前两条是"有内容"判据；第三条 `todo` 是 2026-10-06 补的：
+ * 它以前**连映射都做了**（`case 'todo/write'` 在下），但在这里被 return false
+ * 挡掉了，于是 `runtime.ts` 里 `historyWireItem` 的 todo 分支是**死代码**——
+ * mp 的 `_replayTodos` 恒为 undefined，顶部那颗待办条只在"页面正好开着、
+ * 真机又正好推来一帧实时 ev.todo"时才出现，打开一条已有会话就什么都没有。
+ *
+ * 预算的账在 `collapseTodoSnapshots` 里算：todo 是**全量快照**（内核每轮
+ * todo 工具调用都发一整份），直接放行会让一页塞进几十条冗余快照、把正文挤出去。
+ */
 function isHistoryWorthy(event: KernelEvent): boolean {
   if (event.kind === 'delta') return event.text.length > 0
   if (event.kind === 'tool') return event.callId.length > 0
+  // 待办整份都是"内容"，是否保留交给塌缩那一步决定（见 collapseTodoSnapshots）。
+  if (event.kind === 'todo') return true
   return false
+}
+
+/**
+ * 一页历史里只留**最后一份**待办快照。
+ *
+ * 为什么不是"每份都留"：`todo/write` 是全量语义，同一轮里会连发好几份，
+ * 前两份的内容会被后一份整体覆盖。一页留一份既符合 mp 侧本来就只取最后一份的
+ * 语义（`chat.js` 的 `_replayTodos`），又让 `items` / `charBudget` 的账算得准——
+ * 否则几十条冗余快照会把真正的正文挤出首页。
+ *
+ * **空清单也是一份快照，照样保留**：用户 2026-10-06 拍板「取最后一份」。
+ * 所以一轮跑完内核把清单清空之后，历史里最后一份就是空的，mp 因此不显示那颗条子
+ * ——这是忠实语义，不是漏数据。
+ *
+ * 必须在**预算循环之前**做：否则被丢掉的那些快照已经计进了 items/chars，
+ * 账面会虚高、实际取到的正文比预算允许的少。
+ */
+function collapseTodoSnapshots(groups: Array<{ seq: number; events: KernelEvent[] }>): typeof groups {
+  let lastTodoIdx = -1
+  for (let i = 0; i < groups.length; i++) {
+    if (groups[i]!.events.some((event) => event.kind === 'todo')) lastTodoIdx = i
+  }
+  if (lastTodoIdx < 0) return groups
+  const out: typeof groups = []
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i]!
+    if (i === lastTodoIdx || !group.events.some((event) => event.kind === 'todo')) {
+      out.push(group)
+      continue
+    }
+    const kept = group.events.filter((event) => event.kind !== 'todo')
+    // 这一组只装了待办的话，整组消失（否则会产出一个空组，白占 seq 与游标）。
+    if (kept.length > 0) out.push({ seq: group.seq, events: kept })
+  }
+  return out
 }
 
 /**
