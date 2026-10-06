@@ -46,7 +46,7 @@
 
 ### 前置条件
 
-`dsh-remote-wire` 是 npm 依赖，本仓以 `^1.0.0` 消费它，`pnpm-lock.yaml` 已提交、CI 用
+`dsh-remote-wire` 是 npm 依赖，本仓以 `^1.8.0` 消费它，`pnpm-lock.yaml` 已提交、CI 用
 `pnpm install --frozen-lockfile`。协议升版时走这三步：改 `packages/plugin/package.json` 里的版本
 → 跑一次 `pnpm install` → 把更新后的 `pnpm-lock.yaml` 一起提交。
 
