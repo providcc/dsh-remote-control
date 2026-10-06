@@ -18,6 +18,7 @@ import assert from 'node:assert/strict'
 import type { CmdPayload, EvPayload, SessionSummary } from 'dsh-remote-wire'
 import { PAYLOAD_TYPES } from 'dsh-remote-wire'
 import { HostRuntime, type RuntimeTransport } from '../src/core/runtime.js'
+import { MAPPED_SESSION_EVENTS, sessionEventKernelEvents } from '../src/platform/carrier-services.js'
 import { KeepAwake } from '../src/core/sleep-policy.js'
 import { FakeClock } from '../src/core/clock.js'
 import type {
@@ -1105,6 +1106,98 @@ test('模型：没见过的会话不许补发（不能凭空造一个全局模�
 
   const models = transport.ofType(PAYLOAD_TYPES.evModel)
   assert.equal(models.length, 0, '内核一次都没报过模型，补发就会显示一个猜的名字——比不显示更糟')
+})
+
+// ── 映射表不许声称映射了却没人接（2026-10-06）────────────────────────────
+//
+// `HostRuntime.onKernelEvent` 的 switch 是**手写枚举**：case 少了任何一个
+// KernelEvent kind，那个事件就从 switch 末尾掉出去被丢弃，而且**一声不响**。
+// 真实的例子：`agent/inbox/spliced` 被映射成 `{kind:'inbox'}`，ports/index.ts
+// 还为它写了 35 行注释说这是"用户在 DSH 里发的消息"唯一可靠的信号，而 switch
+// 里**没有 case 'inbox'**（runtime.ts 里还留着一句"见下面的 inbox 分支"的注释，
+// 那个分支不存在）。它同时留在 MAPPED_SESSION_EVENTS 里，于是
+// "没认就记进 unmapped"那条路径永远不会触发——**专门用来证明"内核发了我们
+// 没认"的证据通道，报告的是"一切正常"**。
+//
+// 本文件此前只喂了 6 种 kind，model / retry / compaction / inbox 一个都没有。
+// 这条判据把映射表**穷举**一遍：新增映射时忘了加 case，这里立刻红。
+
+/**
+ * 允许"映射了但故意不出站"的 kind，逐条写明理由。
+ * 新增条目必须在这里显式登记——那正是"我是故意丢的"与"我忘了接"的分界。
+ */
+const INTENTIONAL_DROPS = new Map<string, string>([
+  [
+    'approval/asked',
+    '只记账不翻译：审批卡片走 approval/request 那条 waterfall（attachInteractionSink），' +
+      '这条内核事件只是审计面（asked 带 toolName）。见 carrier-services.ts 的对应注释。',
+  ],
+  ['approval/decided', '同上：decided 的 outcome 是"谁答的"的证据，进 status.json 就够了，卡片已由 waterfall 发出。'],
+])
+
+test('穷举自检：MAPPED_SESSION_EVENTS 产出的每一种 kind 都必须有出站面', async () => {
+  const { runtime, kernel, transport, clock } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_ffffffee')
+  await settle()
+
+  // 映射表里每一种内核事件，配一份能让它真的产出 KernelEvent 的 data。
+  // 形状取自 app.asar 的 typert.host.js 声明串。
+  const SAMPLES: Record<string, Record<string, unknown>> = {
+    'turn/start': { turn: 1 },
+    'assistant/message': { message: { content: [{ type: 'text', text: 'hi' }] } },
+    'user/message': { content: [{ type: 'text', text: 'yo' }], source: { kind: 'user' }, id: 'u1' },
+    'tool/call': { callId: 'c1', name: 'read_file', arguments: { path: '/x' } },
+    'tool/result': { callId: 'c1' },
+    'turn/end': { turn: 1 },
+    'session/title': { title: '标题' },
+    'approval/asked': { id: 'a1', toolName: 'write_file' },
+    'approval/decided': { id: 'a1', outcome: 'allowed' },
+    'todo/write': { todos: [{ content: '做一件事', status: 'pending' }] },
+    // 真机形状（carrier-services.ts 的注释里有 338 条样本的统计）：
+    // target 必须是 next-turn，inserted[0].source.kind 必须是 user，
+    // 否则映射层会按设计返回 []（插话/机器注入/空调整都不该显示成排队）。
+    'agent/inbox/spliced': {
+      target: 'next-turn',
+      inserted: [{ id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '桌面发的' }] }],
+    },
+    'request/header': { header: { config: { provider: 'p', model: 'm' } } },
+    'llm/retry': { retry: 2, maxRetries: 5, failure: 'timeout' },
+    'compaction/start': { compactionId: 'x', turn: 1 },
+    'compaction/end': { compactionId: 'x', turn: 1 },
+  }
+
+  // 映射表里新增了一种内核事件却没给样本，等于这条判据从此不再覆盖它——
+  // 所以先断言两边一一对应。这是「判据本身别腐坏」的守卫。
+  const unsampled = [...MAPPED_SESSION_EVENTS].filter((type) => !(type in SAMPLES))
+  assert.deepEqual(unsampled, [], `映射表新增了这些类型，判据里还没有样本：${unsampled.join('、')}`)
+
+  const missing: string[] = []
+  for (const [type, data] of Object.entries(SAMPLES)) {
+    if (!MAPPED_SESSION_EVENTS.has(type)) continue
+    // 先把时间推过 500ms 的合并窗口：有些 kind（title / sessions-changed）是
+    // **绕道 pushSessions** 出站的，不推进时钟就会撞上合并、看起来像"没出站"。
+    // 那不是丢失，是它本来就走另一条路。
+    await clock.advance(1_000)
+    transport.broadcasts.length = 0
+    // 推进时钟会把上一轮遗留的合并定时器跑掉，那些尾随广播必须先沉淀干净——
+    // 否则它们会被算成"这一条有出站面"，把漏接的 case 假通过掉。
+    await settle()
+    transport.broadcasts.length = 0
+    const [event] = sessionEventKernelEvents({ sessionId: 'ses_live', type, seq: 1, data })
+    if (!event) continue
+    kernel.feed(event)
+    await settle()
+    const produced = transport.broadcasts.length > 0
+    if (!produced && !INTENTIONAL_DROPS.has(type)) missing.push(type)
+  }
+
+  assert.deepEqual(
+    missing,
+    [],
+    `这些内核事件映射出来了却没有任何出站面——多半是 onKernelEvent 的 switch 漏了 case：${missing.join('、')}`,
+  )
 })
 
 test('相邻 500ms 内的重复列表推送被合并（全量快照，合并中间几次不丢信息）', async () => {

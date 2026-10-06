@@ -23,6 +23,7 @@ import assert from 'node:assert/strict'
 import {
   createServicesKernel,
   historyPageFromLog,
+  MAPPED_SESSION_EVENTS,
   sessionEventKernelEvents,
   type ServicesBundle,
 } from '../src/platform/carrier-services.js'
@@ -1492,4 +1493,50 @@ test('历史：空清单也是一份快照，照样保留（用户拍板取最�
   const todos = todosIn(page) as Array<{ todos: unknown[] }>
   assert.equal(todos.length, 1)
   assert.equal(todos[0]!.todos.length, 0, '最后一份是空的（内核清空了清单），这就是用户拍板的语义')
+})
+
+// ── inbox：还没接线，所以证据必须说"没接"（2026-10-06）────────────────────
+//
+// `agent/inbox/spliced` 被映射成 `{kind:'inbox'}`，但 HostRuntime 的 switch 里
+// 没有 case 'inbox'，事件被丢弃——主机侧排队的消息在手机上完全不可见。
+// 2026-10-05 把它加进了 MAPPED_SESSION_EVENTS，于是"没认就记进 unmapped"的
+// 留痕路径**永不触发**，status.json 报的是"一切正常"：
+// **专门用来证明"内核发了我们没认"的通道，在这件事上是瞎的。**
+//
+// 现在它已撤出映射表（接线要动协议与 mp，见 MAPPED_SESSION_EVENTS 的注释），
+// 所以判据是：它必须出现在 unmappedEventTypes 里。
+
+test('inbox 还没接线：证据账本必须如实把它记成 unmapped', () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  kernel.subscribe(() => {})
+  const fire = listeners['session/event']!
+  assert.ok(fire, 'session/event 没订阅上')
+
+  fire(
+    { id: 'ses_live' },
+    {
+      type: 'agent/inbox/spliced',
+      data: {
+        target: 'next-turn',
+        inserted: [{ id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '桌面发的' }] }],
+      },
+    },
+  )
+
+  const described = kernel.describe() as Record<string, string | undefined>
+  assert.ok(
+    String(described.unmappedEventTypes ?? '').includes('agent/inbox/spliced'),
+    '它还出不了站，就必须被记成 unmapped，否则证据通道报的是"一切正常"',
+  )
+  assert.ok(
+    !MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'),
+    '还没接线就不许留在映射表里：留在里面会让留痕路径永不触发',
+  )
 })

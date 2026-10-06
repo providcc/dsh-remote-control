@@ -1255,7 +1255,19 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         archivedSessions: archivedIds().size,
         hasOn: typeof services.on === 'function',
         // 真机排错的第一现场：内核到底发了哪些事件类型、其中哪些我们没认。
-        eventTypes: [...seenEventTypes].slice(-24).join('|'),
+        // **不许截断**（2026-10-06）。曾经是 `.slice(-24)`：Set 保留插入顺序，
+        // 所以一旦见过 24 种类型，这个字符串就永久冻结——更早见过的再也回不来。
+        // 现场（本轮亲眼看着它滑动）：重启前 23 种、含 permission/preset；
+        // 重启后 24 种、permission/preset 消失，尾部多了 llm/retry 等三种。
+        //
+        // 截断的代价是它**与 unmappedEventTypes 对不上账**：后者也是同一个
+        // seenEventTypes 喂的，所以"被记成我们没认"却"在 eventTypes 里查不到"
+        // 这件事本身就是个矛盾信号，而它恰恰是这个字段存在的理由
+        // （"内核到底发了哪些事件类型、其中哪些我们没认"）。
+        //
+        // 不封顶是安全的：事件类型来自内核那份**有限词表**（本轮实测 59 种），
+        // 不是随输入增长的集合——它天然有界，加 slice 只是自造截断。
+        eventTypes: [...seenEventTypes].sort().join('|'),
         unmappedEventTypes: [...unmappedEventTypes].join('|'),
         injectedUserMessages: [...injectedUserMessages].map(([kind, count]) => `${count}×${kind}`).join('|') || 'none',
         approvalFace: faces['approval/request'].registered,
@@ -1300,9 +1312,19 @@ export const MAPPED_SESSION_EVENTS = new Set([
   // 内核的 todo/write 在真机的 eventTypes 里（status.json 的 unmappedEventTypes 曾一直记着它），
   // 但没人转发到手机——于是手机上一整轮"现在在干什么"都是空白。2026-10-05 补上。
   'todo/write',
-  // agent/inbox/spliced 同理：真机 eventTypes 里一直有，却因缺 case 被记成 unmapped，
-  // 于是主机侧排队的消息在手机上完全不可见。2026-10-05 补上。
-  'agent/inbox/spliced',
+  // **agent/inbox/spliced 刻意不在这里**（2026-10-06 改回）。
+  //
+  // 曾经 2026-10-05 把它加进来，理由是"真机 eventTypes 里一直有"。
+  // 但映射层产出 `{kind:'inbox'}` 之后，`HostRuntime.onKernelEvent` 的 switch
+  // **没有 case 'inbox'**（runtime.ts 里还留着一句"见下面的 inbox 分支"，
+  // 那个分支不存在），事件从 switch 末尾掉出去被丢弃——而因为它在这个表里，
+  // 下面那段"没认就记进 unmapped"的留痕路径**永远不会触发**。
+  // 结果：主机侧排队的消息在手机上完全不可见，而**证据通道报的是"一切正常"**。
+  //
+  // 这里面是"我们没接"，不是"我们接了"。真正的接线要动三处：协议加一个
+  // inbox 载荷（wire 发版）+ mp 加处理器 + 这里改回来。所以**先撤出映射表**，
+  // 让 status.json 如实报 unmapped——排错第一步就能分清"内核没发"与"我们没接"。
+  // 接线做完再把它加回来，同一条判据（runtime.test.ts 的穷举自检）会盯着。
   // request/header 同理：它每轮都带**本会话真正在用的模型**。不映射的话，
   // mp 端只能显示宿主全局默认模型——那正是 2026-10-05 用户实测到的串台
   // （本会话在用 space-bunny-free，却显示别的会话切出来的 muse-spark）。

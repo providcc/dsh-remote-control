@@ -430,8 +430,12 @@ export class HostRuntime {
         // 注意：**这里不再处理「主机侧发的消息」**。
         // 以前靠 user 回传的 delta 去填一条猜出来的占位项——那是 2026-10-05 早上的
         // 错路：内核会往 user 通道塞审批策略提示之类机器话，填进去就是假排队。
-        // 现在统一走 agent/inbox/spliced（见下面的 inbox 分支），那里有 source.kind
-        // 能分清谁是人写的。
+        //
+        // 真正的路径是内核的 agent/inbox/spliced（那里有 source.kind 能分清谁是人写的），
+        // **但它还没接线**：映射层产出的 `{kind:'inbox'}` 在这个 switch 里没有 case，
+        // 所以它到这里就被丢掉了（2026-10-06 核实）。因此主机侧排队的消息目前
+        // **到不了手机**——这是个已知的没做完，不是"按设计不需要"。
+        // 接线要动协议与 mp，见 carrier-services.ts 里 MAPPED_SESSION_EVENTS 的注释。
         return
       }
       case 'tool':
