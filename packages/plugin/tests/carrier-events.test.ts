@@ -71,6 +71,29 @@ test('失败回合：中文 + 原始内核原因都要出现在手机上（这�
   assert.equal(state?.detail, 'turn-error', 'run_state 要带 detail：手机的状态行与排错入口都读它')
 })
 
+test('坏图片历史那条错误必须说清"新建会话"：它拖垮的是**之后每一轮**，不止这一条消息', () => {
+  // 取证（2026-10-06 21:32 修复后的真机）：新发的图已经是 `{type:'image', attachment:{…}}`
+  // （对的），但同一条会话历史里还留着修复前那两条裸块；内核每轮遍历全部历史求图片版本，
+  // 于是连 21:34:14 那条**纯文本**消息都以同一句报错收场。
+  // 只把英文报错念一遍，用户永远不知道为什么"我什么都没干也失败"。
+  const events = turnEndKernelEvents({
+    sessionId: 'ses_1',
+    seq: 12,
+    data: {
+      reason: {
+        kind: 'error',
+        error: { message: "Cannot read properties of undefined (reading 'attachmentId')", code: 'UNKNOWN' },
+      },
+    },
+  })
+  const [notice] = deltas(events)
+  const text = notice?.text ?? ''
+  assert.match(text, /新建一条会话/, '必须给出用户唯一能做的那件事')
+  assert.match(text, /图片/, '要点名是图片消息这条历史坏了')
+  assert.match(text, /attachmentId/, `原始报错要留着（排错与对照内核日志）：${text}`)
+  assert.ok(text.length < 400, `错误文本 ${text.length} 字符：没夹长度`)
+})
+
 test('内核 message 又长又带换行时夹住长度并压成一行（一帧不能顶到中继上限，也不能刷爆手机屏幕）', () => {
   const long = `Error: ${'x'.repeat(5_000)}\n  at Object.<anonymous> (/Users/someone/secret-path/index.js:1:1)`
   const events = turnEndKernelEvents({

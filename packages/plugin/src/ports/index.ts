@@ -210,10 +210,21 @@ export interface KernelPort {
    *
    * 以前图片的通路是「主机落盘 + 把绝对路径写进 prompt 正文」——那是当时唯一
    * 能想到的办法，但代价太大：路径会出现在对话正文里（用户与模型都看得见），
-   * 而且把本机目录结构泄露给模型。现在走宿主原生的图片内容块
-   * `{type:'image', data, mimeType}`，服务端会经 attachment store 转成内容寻址
-   * 的持久引用，正文一个字节都不用改（取证 app.asar：`SdkPromptContentBlock`
-   * 接受普通持久内容加上 `SdkEncodedImageBlock`；Queue/Steer 也允许带 image parts）。
+   * 而且把本机目录结构泄露给模型。现在图片走宿主原生的图片内容块，正文一个字节都不用改。
+   *
+   * ## 这里传的是**手机侧形状**，不是内核形状（2026-10-06 真机事故订正）
+   *
+   * `data` + `mimeType` 是**我们自己**的入参口径；载体负责整成内核入口形状
+   * `{type:'image', mediaType, data}`（字段名是 `mediaType`），**再交内核自己的
+   * admission**（`sessionController.commands.prompt` 或 `attachments.admitPromptContent`）。
+   *
+   * 为什么不许把 `{type:'image', data, mimeType}` 直接塞进 `followup`：内核里有两种
+   * 图片块，入口那块（base64 原文）必须经 admission 变成 `{type:'image', attachment}`
+   * 才是内部能用的形状。跳过这一步，内核序列化时会读 `block.attachment.attachmentId`
+   * 而 `attachment` 是 undefined —— 整个回合以
+   * `Cannot read properties of undefined (reading 'attachmentId')` 收场，
+   * 用户侧就是"这一轮没有产出回复，内核报错（UNKNOWN）"。取证见 carrier-services 的
+   * `submitWithImages`。
    *
    * 可选是为了**不打破既有实现**：签名更少的载具（mock、e2e 夹具）照样满足这个接口，
    * 运行时据此判断能不能带图——带不了就明确拒绝，而不是悄悄把图丢掉。

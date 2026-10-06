@@ -270,14 +270,26 @@ export class HostRuntime {
           //
           // 以前是「落盘 + 把绝对路径追加进 prompt 正文」：路径会出现在对话正文里，
           // 用户和模型都看得见，还把本机目录结构泄露给模型。现在按宿主原生的图片
-          // 内容块送进去 {type:image, data, mimeType}，服务端会经 attachment store
-          // 转成内容寻址的持久引用 —— 正文一个字节都不用改。
+          // 内容块送进去，正文一个字节都不用改。
           //
           // 也不再落盘：宿主的 attachment store 已经负责持久化，我们再存一份只是
           // 让同一个文件在本机有两个副本，还平白多一个 uploadDir 闸门。
+          //
+          // **这里还是手机侧形状**（`{data, mimeType}`）：整成内核入口形状
+          // （`{type:'image', mediaType, data}`）并送进内核 admission 是载体的活
+          // （`carrier-services.submitWithImages`）—— 这一层不认识内核符号，
+          // 也不该认识（分层红线）。
           const imageBlocks = images
             .filter((one) => one && typeof one.data === 'string' && one.data !== '')
             .map((one) => ({ data: one.data, mimeType: one.mediaType || 'image/jpeg' }))
+          // 手机说"我发了 N 张图"却一张都送不出去时，**不许把正文照发**。
+          // 静默丢掉图的那次形态是：照片选好了、发送键也按了、模型对这张图只字不提，
+          // 而用户完全看不出发生过什么 —— 比明确失败难查得多（判据见
+          // 「主机的载体不许把带图请求悄悄降级成纯文本」那条）。
+          if (images.length > 0 && imageBlocks.length === 0) {
+            reply(false, { message: `这 ${images.length} 张图片都没带出数据（多半是相册读取失败），请重新选一次` })
+            return
+          }
           // 文件附件：同一条通路（落盘 + 路径写进正文），差别在 uploads.ts 头注。
           const files: FileAttachment[] = Array.isArray(cmd.files) ? cmd.files : []
           if (files.length > 0) {
@@ -358,6 +370,12 @@ export class HostRuntime {
             reply(false, { message: '主机这一代不支持新建会话（内核端口没有 newSession 能力）' })
             return
           }
+          // ⚠️ 这里**不读** `cmd.workspace`（手机指明分组）：该字段在 `dsh-remote-protocol` 里已加
+          // （可选、向后兼容），但插件按精确版本钉着 npm 上的 `dsh-remote-wire`，那份还没发版，
+          // 而 `parseCmdPayload` 会把不认识的键 strip 掉。所以**在 wire 发版 + 改钉之前，
+          // 这里读到的永远是 undefined**——与其写一段读不到值的代码，不如先由主机自己推断
+          // （见 carrier-services 的 newSession：最后操作过的会话 → 往前扫带 cwd 的会话）。
+          // 发版后的接线顺序见 HANDOFF §0「新建会话落点」。
           const made = await create.call(this.kernel)
           if (!made.ok || !made.sessionId) {
             reply(false, { message: made.message ?? '新建会话失败' })

@@ -2104,6 +2104,31 @@ test('send_prompt 只发图不发字：正文不许塞一个空文本块（模�
   assert.equal(sent.attachments?.length, 1, '只发图也要把图送进去')
 })
 
+/**
+ * 手机说"我发了图"却一张都送不出来时，整条失败，不许把正文照发。
+ *
+ * 这一条与 2026-10-06 的真机事故同源：用户按了发送、照片在输入区里显示得好好的，
+ * 而正文照发、图被静默丢掉，模型对这张图只字不提 —— 用户完全看不出发生过什么。
+ * 明确失败至少能在聊天框里留下一句"图没送出去"，并让他重试。
+ */
+test('图片一条都没带出数据：整条失败，且不许把正文当成纯文本发出去', async () => {
+  const f = fixture()
+  f.runtime.start()
+  await settle()
+  f.transport.pair('c_ffffffff22')
+  await f.runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+      sessionId: 'ses_img',
+      text: '看这张报错',
+      images: [{ name: 'a.jpg', mediaType: 'image/jpeg', data: '' }],
+    }),
+    'c_ffffffff22',
+  )
+  assert.equal(f.kernel.calls.sendPrompt.length, 0, '正文照发了：用户会以为图也一起发出去了')
+  assert.match(lastReplyText(f.transport), /false/, '必须回一条失败，手机上才有东西可看')
+  assert.match(lastReplyText(f.transport), /图片/, '失败理由要点名图片')
+})
+
 /* ── 2026-10-06 缺陷修复：结算纪律 / 撤回 / 停机 / 补发口径 ──────────────── */
 
 test('平台已经撤销（signal 已 abort）的审批：当场交还桌面，不发卡、不挂锁、不占满超时窗口', async () => {
