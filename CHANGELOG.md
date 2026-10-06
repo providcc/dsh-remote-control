@@ -5,6 +5,195 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.11] - 2026-10-06
+
+### 新增：`tokenMeter` 探针进 `status.json`（`d6ba43f`）+ 按名查包（`597872f`）
+
+10-06 主机普查发现 `ctx.tokenMeter` 一直坐在出货 composition 里
+（`dsh-token-meter` 及其 `sessionProjections` 依赖都在 `desktop-runtime.json`）：
+重放 durable 会话日志量上下文压力，不调模型、不添模型可见物。
+这一跳只加探针、不加手机可见的数字——顺序是刻意的：
+真机上第一问是"到底读不读得到"，答不上来就和 `approvalCalls=0` 那次一样，
+红了也不知道是哪一层坏的。探针调一次无会话 `measure`
+（抛了在这里现形，而不是在手机上变成一个静默的 0），
+只报可读性、不报数值（每条消息都变的数，落进 `status.json` 只会闪）。
+
+紧接着修掉探针自己的误报（`597872f`）：包在不在原来读的是截到 2600 字的
+`loaderRows`，截断点之后的一律读成"没加载"——当天差点据此断言 token-meter 缺席。
+现在 `probe.wanted` 按名逐包答 `true/false`：短、不截断、能从同一份 loader 条目重算。
+
+### 新增：重试与压缩上屏（`93b4009`，依赖抬到 `dsh-remote-wire ^1.8.1`）
+
+真机十二份日志里 `llm/retry` 与 `compaction/end` 各出现 18 次，插件两条都不认——
+明明在重试 / 压缩的一回合，在手机上与死掉长得一模一样，用户读成卡死就手工打断。
+
+- `llm/retry` 取 `retry / maxRetries / failure.{code,message}`，
+手机拼出"retrying 2/5: TRANSPORT"；原因取 `code` 不取 `message`
+（"Connection error." 对人不说明任何事），`policyKey` 那坨策略 JSON 留在主机；
+- `compaction/end` 带可选 `error`
+（见过 `summarization produced no text summary content`），
+失败与完成是两个状态，不合并；
+- `workspace/changes` 故意不接：66 个样本全只带 `{turn}`，
+文件清单在中继够不着的鉴权路由后面，"变了但说不出是哪些"比不说更糟。
+
+### 修复：顶栏"当前模型"补发 + 待办在历史回放里整块消失（`4213374`）
+
+两个都是"只在跑起来的那一轮才有数据"的字段，打开已有会话就空着。
+
+模型是 `9511904` 的附带损伤：那次修提问弹窗（`mapQuestion` 不能吐空 question/label，
+否则 `nonEmpty` 把整帧静默丢掉、mp 卡不出来），顺手把 `broadcastModel()` 从
+"读宿主全局默认模型并广播"改成"广播这个事件带来的模型"，
+而 `pushSessions()` 里那个 call site 被删掉、没有跟着改。
+后果是模型只剩内核 `request/header` 一个数据源，而它每轮一条——
+空闲会话永远不发，mp 的 `modelName` 从 `''` 起算、顶栏直接不渲染。
+修法是 per-session 缓存 + 随会话列表补发（不是退回读
+`agentDefaultModel.currentSelection()`：那是"新建会话用哪个"，
+别的会话切一次模型本会话就跟着变——2026-10-05 用户实测的串台
+`space-bunny-free` 变 `muse-spark` 就是它）。
+挂在 `pushSessions` 上是因为它本来就是"状态变了就推一次"的唯一入口，
+而 `reason: 'list'`（mp 重连发 `cmd.list_sessions` 时）不走合并窗口，重连那路白拿；
+缓存不按会话列表裁剪（`LISTING_LIMIT=100` 截断会误删，
+换 `MODEL_CACHE_MAX=256` 与 voided / PairingSlots 同一套上限）。
+
+待办是 `isHistoryWorthy` 只放行 delta 与 tool，`todo` 在进历史页之前就被丢掉——
+`historyWireItem` 的 todo 分支是死代码，`_replayTodos` 恒为 undefined，
+顶部那颗条子只在"页面正好开着、又正好推来一帧实时 `ev.todo`"时才出现。
+修法是放行 + 一页只留最后一份（全量快照直接放行会塞几十条冗余、把正文挤出预算；
+塌缩必须在预算循环之前，否则丢掉的已经计进账面）。
+"最后一份"是用户拍板的：**空清单也是一份快照**，照样保留——
+内核清空后历史里最后一份就是空的，mp 因此不显示那颗条子，
+这是忠实语义不是漏数据，判据里钉死了，免得下次有人"顺手修好"。
+
+判据：宿主 4 条（先红后绿）+ mp 侧 2 条（`dsh-remote-mp` 仓）。plugin 379/379（原 372）。
+
+### 修复：证据通道停止说谎——inbox 撤出映射表 + `eventTypes` 不再截断（`af12313`）
+
+两处都是诊断面本身在骗人，"排错第一步"就错在错的地方。
+
+`agent/inbox/spliced` 登记了映射（`{kind:'inbox'}`，35 行注释说它是
+"用户在 DSH 里发的消息"唯一可靠信号），`MAPPED_SESSION_EVENTS` 也加了它——
+但 `HostRuntime.onKernelEvent` 的 switch 里**没有 `case 'inbox'`**，
+事件从末尾掉出去被丢弃，而 `runtime.ts` 还留着"见下面的 inbox 分支"的注释，
+那个分支不存在。更糟的是那张表只驱动 `status.json` 记账、不驱动 switch，
+于是"内核发了我们没认"被报成"一切正常"（HANDOFF §4 取证陷阱的翻版）。
+用户可见后果：在 DSH 桌面里排队的消息，手机上完全看不到。
+完整接线要动三处（协议加 inbox 载荷并发版 + mp 加处理器 + 登记回表），不在本次范围，
+所以先**撤出映射表**，让 `status.json` 如实报 `unmapped`——
+排错第一步就能分清"内核没发"与"我们没接"。同时反转 2026-10-05 那条"必须登记"的判据，
+理由写在原地。
+
+`eventTypes` 的 `.slice(-24)`：Set 保插入顺序，见过 24 种类型这个字符串就永久冻结——
+现场：重启前 23 种、含 permission/preset，重启后 24 种、permission/preset 消失、
+尾部多了 `llm/retry` 等。而它与 `unmappedEventTypes` 喂的是同一个 Set，
+"被记成没认"却"在 eventTypes 里查不到"本身就是矛盾信号——
+这恰恰是这个字段存在的理由。去截断是安全的：
+事件类型来自内核有限词表（实测 59 种），不是随输入增长的集合，
+加 slice 只是自造截断，改成排序输出。
+
+判据：穷举自检（`MAPPED_SESSION_EVENTS` 每种都灌进真 `HostRuntime`、断言都有出站面；
+`INTENTIONAL_DROPS` 登记 `approval/asked、approval/decided`——
+按设计只记账不翻译，"故意丢"与"忘了接"的分界；
+映射表新增条目必须同时补样本）+ 事件账本 2 条
+（24 种以上最早的不许消失；记成 unmapped 的必须也出现在 eventTypes 里）
++ inbox 证据 1 条。plugin 381/381（原 372），mp 101/101。
+
+### 变更
+
+- **chore: 2.0.11（`013cd1c`）**：纯版本号对齐，无功能改动——
+`packages/plugin/package.json` 2.0.10→2.0.11，追平已经装进 Harness 的那份 bundle。
+npm 最新仍是 2.0.10，本版尚未发包。
+
+## [2.0.10] - 2026-10-06
+
+### 修复：图片走原生内容块，不再把路径写进正文（`c959c9e`）
+
+原来附件图片落盘后把路径追加进 prompt 正文：正文里多出一截主机目录，
+用户与模型都看得见，还泄露了本机布局。主机本来就收内联图片块
+（`{type: image, data, mimeType}`，经 attachment store 转成内容寻址引用），
+所以正文现在原样过，什么都不写进 `uploadDir`。
+
+### 变更：pill 文案收敛 + `uploads.ts` 图片那半删除（`6a634a5`、`51a4d89`）
+
+"手机离线"那一行原来三句话（"配对还在 小程序回前台会自动重连 不用重新扫码"），
+用户在那一屏唯一要做的判断是"要不要扫码"，答案是不用——
+现在只留托住这个决策的那几个字。结论本身保留：
+2026-10-04 有用户看到"手机离线"就去扫一张不需要扫的码，
+一条判据把结论钉住、不钉字句。
+
+`uploads.ts` 图片那半（`saveImageAttachments / appendImageNote`、JPEG 魔数、
+`maxImageBytes` 整条链路）随上条一起成为死代码，一并删除；文件那半保留。
+
+### 变更
+
+- **chore: 2.0.10（`3f718c0`）**：纯版本号，
+`packages/plugin/package.json` 2.0.9→2.0.10。
+
+## [2.0.9] - 2026-10-05
+
+### 新增：排队三连——主机建队、重做、落成真行（`420066f` → `08fdad6` → `64adde4`）
+
+注：其中 2.0.8（`762a03a`）只推了版本号、未立 tag、npm 也无此版本，
+下面三跳随 2.0.9 一起发出（tag `v2.0.9` 落在 `e82fa78`）。
+
+- `420066f` 主机接管排队：`PromptQueue` + `ev.queue` 快照 + `cmd.drop_queued`
+（对 wire 1.7.0）；
+- `08fdad6` 队列重做：`sent` 只在内核真跑起来时标（不再是"发出就标"），
+主机造的 turn 同步到手机，`sent` 可经 `interrupt` 取消——
+"诚实状态、host-turn 同步、所有状态可取消"（`762a03a` 的 release note 原话）；
+- `64adde4` 把 `agent/inbox/spliced` 落成真 queue 行（不再是猜的），
+补 `cmd.get_queue` 拉取（对 wire 1.8.0），版本号 2.0.8→2.0.9。
+
+### 破坏性变更：主机队列整套删除（`011450e feat!`）
+
+`PromptQueue` 删除（`src/shell/queue.ts` 264 行拿掉），
+`send_prompt` 改为直发、发不出去如实报错。
+建完当天即删：排队这条路在"谁拥有真相"上绕了一整天，
+最后回到"主机直发 + 失败明说"（wire 1.8.1 同步删协议半，见线协议 1.8.1）。
+
+### 修复
+
+- 提问卡空值整帧被吞（`9511904`）：`mapQuestion` 吐出空 question/label 时，
+schema 的 `nonEmpty` 让整帧解析失败、静默丢掉，mp 卡永远不出来——现在永不吐空；
+- 解配读成离线（`6eac6be`）：中继 `peer-left` 带 `unpaired`（对 wire 1.8.1 的帧），
+会话一并作废，pill 从"手机离线"回到"未配对"（2026-10-05 用户报：
+"mp 端解除配对，dsh 端执行的是手机离线"）。
+
+### 变更
+
+- 依赖改吃发布的线协议：`dsh-remote-wire ^1.8.0`（`e82fa78`），不再用 `file:` 树；
+- `format:check` 不再误报 `dist/`（`ec32422`，prettier 指到仓根 ignore）。
+
+## [2.0.7] - 2026-10-05
+
+### 新增：文件附件落盘（`e00de50`，对线协议 1.6.0）
+
+`saveFileAttachments / appendFileNote` + `maxFileBytes` 配置：
+落盘名保留扩展名（Agent 认文件靠它），正文后追加
+"[文件附件 N 个，已存到本机]"清单（含手机带来的类型标签）。
+图片那套不动；空正文只带附件的消息同样可用。
+
+## [2.0.6] - 2026-10-05
+
+### 修复：屏上那张码绝不能是已经用过的（`7cd5461`）
+
+用户一口气报三件事：手机离线太久连不上、dsh 端解配后新二维码也连不上
+（要等下一次刷新）、手机解配后 dsh 不再同步状态（第三件此前修过一次）。
+根因是配对码一次性的：中继 `claim()` 里标掉，重放永远 `already_used`，
+而屏上那张（`status.json` 的 `active.pairing`、pill 二维码、`/pairing/new` 现发的）
+只靠 `markConsumed` 与 `wrappedPublish` 维护——真正死掉的那一刻没人退休它：
+`unpairAll` 作废了会话却留着那张码，pill 继续展示手机刚用过的那张，
+扫了就是 `already_used`；而 `pairOnStartSec` 默认 0，窗口不 tick、没人换上新的，
+只能等 TTL。修法是已耗 token 台账守住每条发码路径：用掉就退役；
+解配当场退役展示中的那张并现铸一张顶上（而不是留白），
+二维码出现的那一刻就是可用的，不用等下一次刷新。
+判据走真中继 + 真 runtime + 真小程序客户端（只有这样才看得出中继拒不拒这张码）。
+plugin 351/0，伞仓 e2e 168 项、`run.mjs` 17 步。
+
+### 变更
+
+- **chore: 2.0.6（`ac79aea`）**：纯版本号，
+`packages/plugin/package.json` 2.0.5→2.0.6。
+
 ## [2.0.5] - 2026-10-05
 
 ### 修复：配对码的剩余寿命常显，中继不在线时不再画死码
@@ -426,7 +615,12 @@ bundle，不直接 import 那个纯函数）**、**`waiting` 缺席（老版宿�
 - 发布产物收窄为 `dist/bundle` + `cordis.patch.yml`。`exports` 只指向自包含单文件，
   之前 tarball 里的 `dist/src`、`dist/tests`（约 90 个文件、449 KB）全是消费方拿不到的东西。
 
-[未发布]: https://github.com/providcc/dsh-remote-control/compare/v1.2.0...HEAD
+[未发布]: https://github.com/providcc/dsh-remote-control/compare/v2.0.10...HEAD
+[2.0.10]: https://github.com/providcc/dsh-remote-control/compare/v2.0.9...v2.0.10
+[2.0.9]: https://github.com/providcc/dsh-remote-control/compare/v2.0.7...v2.0.9
+[2.0.7]: https://github.com/providcc/dsh-remote-control/compare/v2.0.6...v2.0.7
+[2.0.6]: https://github.com/providcc/dsh-remote-control/compare/v2.0.5...v2.0.6
+[2.0.5]: https://github.com/providcc/dsh-remote-control/compare/v2.0.4...v2.0.5
 [1.2.0]: https://github.com/providcc/dsh-remote-control/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/providcc/dsh-remote-control/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/providcc/dsh-remote-control/releases/tag/v1.0.0
