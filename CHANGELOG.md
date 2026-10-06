@@ -5,6 +5,46 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [1.0.0-rc.1] - 2026-10-06
+
+> **首个开源候选版。** 四仓统一用这一个版本号；此前的 2.0.x 是私有期编号。
+
+### 新增：会话状态接上 `awaiting-permission` / `awaiting-answer`
+
+协议里这两个状态一直有、小程序的「等你处理」区与「待审批/待回答」徽标也只认这两个
+字符串，而这里只产出 `archived | running | idle` —— 真机上那个区**永远不出现**
+（e2e 是自造状态喂进去的，测试绿、真机空）。现在由 runtime 的挂起表经 index.ts 注入
+给 carrier；审批优先于提问（180s vs 300s）。
+
+### 修复（rc1 前逐行审计的产出，每条都有判据在旧代码上验过会红）
+
+- **真 cordis ctx 上 `typeof ctx.off === 'function'` 会抛错**（get trap），把 sessions
+  那条 inject 回调整段打断——真机 `status.json` 里已经复现，只是被下一个回调侥幸救回。
+- **on/off 绑定移出 accept + 支持 on 晚到补订阅**：原来若宿主在 apply 时就能
+  `ctx.get('sessions')`，内核会在任何 inject 回调之前启动，带恢复会话时 subscribe 读到
+  `services.on === undefined` 就**永久关闭流式**（无重试，而 `describe()` 现读 `hasOn`
+  显示 true 掩盖真相）。
+- **附件总量闸**：主机原来只卡单文件 512KB，schema 允许 4 个 → 最坏约 2.7MB 进一帧，
+  超中继 1MB 就是 socket 1009 断开（不合规客户端能掐断主机自己的中继连接）。
+- **平台已 abort 的审批/提问当场结算**：`addEventListener('abort')` 对**已经 abort** 的
+  signal 永不触发，于是卡照发、锁照挂，整个超时窗口（180/300 秒）手机上是可点的死卡。
+- **`pushSessions` 全程 try/catch + 调用点 catch**：原来 13 处 `void` 调用任一处抛出即
+  未捕获 rejection（Node≥15 默认终止进程），违反"绝不带崩宿主"。
+- 结算校验 `item.kind`（跨类 requestId 原来会串类结算且回 ok:true）；审批决定改白名单
+  （只认 `approve`）——原来是 fail-open，未知词一律**放行**；`stop()` 收卡；挂锁改
+  `finally` 配对；`start()` 两步都成功才置位；模型补发只与列表求交。
+- 落盘与权限：`status.json` 补 `chmod 0600`（那个文件在开启动发码时含有效配对码+PSK）；
+  pair-store 写失败保持脏标记（原来 PSK 会静默不落盘且永不重试）；`pairTtlMs` 折 Infinity；
+  死配置键 `carrierGraceMs` 删除；`pair-fail` 接线（换码退避）。
+- 浏览器面：倒计时不再每秒重建二维码页（每秒重编码一张 QR）；首帧 `/status` 未落地时
+  点开面板**不发码**（原来已配对的主机也会被发一张新码）；`/status` 非 200 留 warn；
+  轮询加超时与 in-flight 守卫；注入样式补 `data-plugin`（会被宿主 HMR 当成别人的删掉）；
+  配对码不再进 stdout 日志；跨站 Origin 白名单化。
+- 文档口径对齐（`uploadDir` 默认值、`maxImageBytes` 其实是 `maxFileBytes`、
+  `status.json` 的 pairing 与 `pairOnStartSec` 无关等）。
+
+判据：410 → **448** 条。
+
 ## [2.0.13] - 2026-10-06
 
 ### 新增：`cmd.get_pending`——手机主动拉还挂着的审批/提问（wire 1.9.0）
