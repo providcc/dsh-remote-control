@@ -114,6 +114,37 @@ export type KernelEvent =
       sessionId: string
       todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[]
     }
+  | {
+      /**
+       * 模型正在重试（内核 `llm/retry` / `llm/retry-started`）。
+       *
+       * 2026-10-06 取证（真机 session log，18 次）：这两个事件一直在发，
+       * 但插件没映射，手机上模型卡住时**一片空白** —— 用户以为死了，
+       * 而宿主其实正在重试。`llm/retry` 的 data 带 retry / maxRetries /
+       * failure.{code,message}，够拼出一句人话。
+       */
+      kind: 'retry'
+      sessionId: string
+      attempt: number
+      max: number
+      reason?: string
+    }
+  | {
+      /**
+       * 上下文压缩的起止（内核 `compaction/start` / `compaction/end`）。
+       *
+       * 取证：start 带 {compactionId, turn}，end 带同样两个 **外加可选 error**
+       * （真机见过 `summarization produced no text summary content`）。
+       * 这一段手机上是完全静默的，没有事件也没有运行态变化。
+       *
+       * end 带 error 要单独表达：那不是"压缩完了"，是**压缩失败了**，
+       * 两者对用户的含义完全不同。
+       */
+      kind: 'compaction'
+      sessionId: string
+      state: 'started' | 'ended' | 'failed'
+      error?: string
+    }
   | { kind: 'title'; sessionId: string; title: string }
   | { kind: 'sessions-changed'; reason?: string }
 

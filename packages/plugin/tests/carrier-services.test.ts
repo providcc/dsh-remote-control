@@ -20,7 +20,12 @@ import type { KernelEvent } from '../src/ports/index.js'
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServicesKernel, historyPageFromLog, type ServicesBundle } from '../src/platform/carrier-services.js'
+import {
+  createServicesKernel,
+  historyPageFromLog,
+  sessionEventKernelEvents,
+  type ServicesBundle,
+} from '../src/platform/carrier-services.js'
 import { FakeClock } from '../src/core/clock.js'
 import { parseEvPayload } from 'dsh-remote-wire'
 import { questionRequest } from 'dsh-remote-wire'
@@ -1336,4 +1341,91 @@ test('没有 tokenMeter 的那一代：describe 正常，只是脸面说 absent'
   assert.equal(described.contextUsageFace, 'absent', '宿主没有这一代能力时要如实说 absent')
   // 其余能力一点没受影响：载体仍然能列会话
   assert.equal(typeof described.carrier, 'string', '一个读数缺失就把整个载体拖垮了')
+})
+/**
+ * 重试 → 手机看得见（2026-10-06）。
+ *
+ * 真机取证：内核 `llm/retry` 带 retry / maxRetries / failure。
+ * 以前插件没映射它，手机上模型卡住时一片空白——用户以为它死了。
+ *
+ * 判据钉三件容易做错的事：
+ *   1. 失败原因取 code 而不是 message（「Connection error.」对人没有信息量）；
+ *   2. policyKey 那段策略 JSON **不许**出站；
+ *   3. 没有 failure 时不编一个空原因（渲染出来是「因为：」这种半截话）。
+ */
+test('llm/retry → 一次重试带「第几次 / 共几次 / 什么原因」', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'ses_live',
+    type: 'llm/retry',
+    seq: 1774,
+    data: {
+      retryId: 'f13bae00',
+      turn: 11,
+      step: 13,
+      provider: 'stepfun',
+      mode: 'normal',
+      policyKey: '["normal",5,[...]]',
+      retry: 2,
+      maxRetries: 5,
+      delayMs: 507.3,
+      failure: { message: 'Connection error.', code: 'TRANSPORT' },
+    },
+  })
+  assert.deepEqual(events, [{ kind: 'retry', sessionId: 'ses_live', attempt: 2, max: 5, reason: 'TRANSPORT' }])
+})
+
+test('llm/retry：没有 failure 就不给 reason（不许编一个空原因）', () => {
+  const events = sessionEventKernelEvents({
+    sessionId: 'ses_live',
+    type: 'llm/retry',
+    seq: 2,
+    data: { retry: 1, maxRetries: 5 },
+  })
+  assert.equal(events.length, 1)
+  assert.equal(
+    'reason' in (events[0] as Record<string, unknown>),
+    false,
+    '没有失败原因却给了一个空串：手机上会渲染成「因为：」这种半截话',
+  )
+})
+
+/**
+ * 压缩 → 手机看得见（2026-10-06）。
+ *
+ * 真机取证：`compaction/start` 带 {compactionId, turn}；
+ * `compaction/end` 带同样两个**外加可选 error**（见过
+ * `summarization produced no text summary content`）。
+ *
+ * failed 与 ended 必须是两个状态：上下文已经烂掉而用户以为一切正常，
+ * 比看不见更糟。
+ */
+test('compaction：start/end 成对，end 带 error 时是 failed 不是 ended', () => {
+  const start = sessionEventKernelEvents({
+    sessionId: 'ses_live',
+    type: 'compaction/start',
+    seq: 2170,
+    data: { compactionId: '03324cec', turn: 11 },
+  })
+  assert.deepEqual(start, [{ kind: 'compaction', sessionId: 'ses_live', state: 'started' }])
+
+  const ok = sessionEventKernelEvents({
+    sessionId: 'ses_live',
+    type: 'compaction/end',
+    seq: 2171,
+    data: { compactionId: '03324cec', turn: 11 },
+  })
+  assert.deepEqual(ok, [{ kind: 'compaction', sessionId: 'ses_live', state: 'ended' }])
+
+  const bad = sessionEventKernelEvents({
+    sessionId: 'ses_live',
+    type: 'compaction/end',
+    seq: 2172,
+    data: { compactionId: 'd036a23e', turn: 11, error: 'summarization produced no text summary content' },
+  })
+  assert.equal(bad[0]?.kind, 'compaction')
+  assert.equal(
+    (bad[0] as { state?: string }).state,
+    'failed',
+    '压缩失败被当成压缩完了：上下文已经烂掉，而用户以为一切正常',
+  )
 })

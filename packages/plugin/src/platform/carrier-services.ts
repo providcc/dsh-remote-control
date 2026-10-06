@@ -1307,6 +1307,11 @@ export const MAPPED_SESSION_EVENTS = new Set([
   // mp 端只能显示宿主全局默认模型——那正是 2026-10-05 用户实测到的串台
   // （本会话在用 space-bunny-free，却显示别的会话切出来的 muse-spark）。
   'request/header',
+  // 模型重试与上下文压缩（2026-10-06 取证：真机 session log 各 18 次，一直没映射）。
+  // 前者让「模型卡住」变成「正在重试」，后者让压缩这段静默期看得见。
+  'llm/retry',
+  'compaction/start',
+  'compaction/end',
 ])
 
 export function sessionEventKernelEvents(input: {
@@ -1367,6 +1372,41 @@ export function sessionEventKernelEvents(input: {
           text: textOf(data),
           role: 'user',
           done: true,
+        },
+      ]
+    }
+    case 'llm/retry': {
+      // 取证 data：{retryId, turn, step, provider, mode, policyKey,
+      //              retry, maxRetries, delayMs, failure:{message, code}}
+      // policyKey 是一段策略 JSON、对用户毫无意义，不出站。
+      const failure = data.failure as LooseObject | undefined
+      const code = typeof failure?.code === 'string' ? failure.code : ''
+      const message = typeof failure?.message === 'string' ? failure.message : ''
+      const attempt = typeof data.retry === 'number' ? data.retry : 1
+      const max = typeof data.maxRetries === 'number' ? data.maxRetries : attempt
+      return [
+        {
+          kind: 'retry',
+          sessionId,
+          attempt,
+          max,
+          // 只在有话可说时带原因：空的 reason 会渲染成「因为：」这种半截话。
+          ...(code || message ? { reason: (code || message).slice(0, 120) } : {}),
+        },
+      ]
+    }
+    case 'compaction/start':
+      return [{ kind: 'compaction', sessionId, state: 'started' }]
+    case 'compaction/end': {
+      // end 带 error = **压缩失败了**，与「压缩完了」对用户是两件事（真机见过
+      // `summarization produced no text summary content`）。
+      const error = typeof data.error === 'string' ? data.error.trim() : ''
+      return [
+        {
+          kind: 'compaction',
+          sessionId,
+          state: error ? 'failed' : 'ended',
+          ...(error ? { error: error.slice(0, 160) } : {}),
         },
       ]
     }

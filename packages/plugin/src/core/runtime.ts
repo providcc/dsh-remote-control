@@ -43,6 +43,8 @@ import {
   sessionChanged,
   sessionHistory,
   todoList,
+  retryNotice,
+  compactionNotice,
   toolEvent,
 } from 'dsh-remote-wire/outbound'
 import type { ApprovalDecision, AskUserQuestionAnswerValue, KernelEvent, KernelPort } from '../ports/index.js'
@@ -442,6 +444,17 @@ export class HostRuntime {
         this.window.flushSession(event.sessionId)
         this.broadcast(todoList({ todos: event.todos, sessionId: event.sessionId }))
         this.sleep.markActive()
+        return
+      case 'retry':
+        // 「模型卡住」与「模型正在重试」对用户是两件事（2026-10-06）：
+        // 以前这条不映射，手机上一片空白，用户以为它死了还去手动中断。
+        this.broadcast(
+          retryNotice({ sessionId: event.sessionId, attempt: event.attempt, max: event.max, reason: event.reason }),
+        )
+        return
+      case 'compaction':
+        // 压缩这段静默期以前完全看不见。
+        this.broadcast(compactionNotice({ sessionId: event.sessionId, state: event.state, error: event.error }))
         return
       case 'title':
         void this.pushSessions('title')
