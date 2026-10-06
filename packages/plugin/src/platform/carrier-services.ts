@@ -172,6 +172,19 @@ export interface ServicesOptions {
    * 用户项目，GUI 的列表按项目分组就看不见它（用户 2026-10-04 实测）。
    */
   newSessionCwd?: string
+  /**
+   * 这条会话此刻**有没有人在等它**（2026-10-06 接上）。
+   *
+   * **为什么需要**：协议里的 `SESSION_STATES` 一直有 `awaiting-permission` /
+   * `awaiting-answer` 两个值，小程序的会话列表与「等你处理」区只认这两个字符串——
+   * 而这里原来只产出 `archived | running | idle`，于是那两个状态在真机上**永不出现**，
+   * 小程序那个区是"测试绿、真机空"（e2e 是自造状态喂进去的）。
+   *
+   * 数据源不在本文件（分层红线）：内核只能回答"这条会话在不在跑"，回答不了
+   * "有没有一张卡在等人点"。所以由调用方（index.ts）注入一个查询回调，carrier
+   * 只问不判断；**回调不可用时一律回 undefined**，行为与修复前完全一致。
+   */
+  pendingKindForSession?: (sessionId: string) => 'approval' | 'question' | undefined
 }
 
 const MAX_TITLE_BATCH_DEFAULT = 25
@@ -352,10 +365,32 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     return typeof status === 'string' ? status : 'idle'
   }
 
+  /**
+   * 这条会话此刻的状态（2026-10-06 接上 `awaiting-*`）。
+   *
+   * 优先级：归档 > 有人在等 > 在跑 > 空闲。**「有人在等」压过「在跑」**——
+   * 那条回合正停在这张卡上，手机把它显示成"运行中"就等于没在说有人等你；
+   * 而"运行中"压过"空闲"是修复前就有的语义。
+   *
+   * 回调可能抛（它接的是 runtime 的 pending 表）：抛了就当没人等，列表本身不能因此坏掉。
+   */
+  function sessionState(sessionId: string, running: boolean, archived: Set<string>): SessionSummary['state'] {
+    if (archived.has(sessionId)) return 'archived'
+    let pending: 'approval' | 'question' | undefined
+    try {
+      pending = options.pendingKindForSession?.(sessionId)
+    } catch (error) {
+      log('pending query failed', { sessionId, message: String((error as Error)?.message ?? error) })
+    }
+    if (pending === 'approval') return 'awaiting-permission'
+    if (pending === 'question') return 'awaiting-answer'
+    return running ? 'running' : 'idle'
+  }
+
   function toSummary(record: ListedSession, archived: Set<string>): SessionSummary {
     const cached = titleCache.get(record.id)
     const running = agentStatus(record.id) === 'running'
-    const state: SessionSummary['state'] = archived.has(record.id) ? 'archived' : running ? 'running' : 'idle'
+    const state = sessionState(record.id, running, archived)
     const updatedAt = cached ? iso(record.headerTime) : undefined
     return {
       id: record.id,
@@ -1261,8 +1296,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     listSessions,
     async runState(sessionId: string) {
       const running = agentStatus(sessionId) === 'running'
-      const archived = archivedIds().has(sessionId)
-      return { running, state: archived ? 'archived' : running ? 'running' : 'idle' }
+      const archived = archivedIds()
+      return { running, state: sessionState(sessionId, running, archived) }
     },
     sendPrompt,
     interrupt,

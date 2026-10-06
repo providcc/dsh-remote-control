@@ -47,7 +47,13 @@ interface Fixture {
   kernel(services: ServicesBundle): ReturnType<typeof createServicesKernel>
 }
 
-function fixture(options: { newSessionCwd?: string } = {}): Fixture {
+function fixture(
+  options: {
+    newSessionCwd?: string
+    /** 这条会话此刻有没有人在等它（awaiting-* 会话状态的数据源，见 pendingKindForSession）。 */
+    pendingKindForSession?: (sessionId: string) => 'approval' | 'question' | undefined
+  } = {},
+): Fixture {
   const calls: Calls = { resume: [], unarchive: [], followup: [], steer: [], cancel: [] }
   const clock = new FakeClock()
   const liveAgent: Record<string, unknown> = {
@@ -84,7 +90,12 @@ function fixture(options: { newSessionCwd?: string } = {}): Fixture {
     liveAgent,
     bundle,
     kernel: (services) =>
-      createServicesKernel(services, { clock, log: () => {}, newSessionCwd: options.newSessionCwd }),
+      createServicesKernel(services, {
+        clock,
+        log: () => {},
+        newSessionCwd: options.newSessionCwd,
+        pendingKindForSession: options.pendingKindForSession,
+      }),
   }
 }
 
@@ -1694,4 +1705,71 @@ test('提问 id 为空串时补一个稳定值：协议是 nonEmpty，空 id 会
     null,
     '产出的整帧过不了协议解析：手机上永远不弹这张卡',
   )
+})
+
+// ── awaiting-* 会话状态（2026-10-06 接上）─────────────────────────────────
+//
+// 协议里 `SESSION_STATES` 一直有 awaiting-permission / awaiting-answer，
+// 小程序的会话列表与「等你处理」区也只认这两个字符串；而 carrier 只产出
+// archived | running | idle —— 于是那两个状态在真机上永不出现，那个区是
+// "测试绿、真机空"（e2e 里是自造状态喂进去的）。数据源只有 runtime 的挂起表。
+
+function sessionsWith(id: string, running = false): ServicesBundle {
+  return {
+    sessions: {
+      list: () => [{ id, title: '一条', updatedAt: 1_700_000_000_000, running }],
+      get: () => undefined,
+    },
+    agents: { get: () => ({ status: running ? 'running' : 'idle' }) },
+    sessionQuery: { listSessions: () => Promise.resolve([{ header: { id, createdAt: 1_700_000_000_000 } }]) },
+    agentDefaultModel: {},
+    workspaceRegistry: { archivedSessionIds: [] },
+  } as unknown as ServicesBundle
+}
+
+test('会话状态：挂着的审批压过"在跑" → awaiting-permission（小程序只认这个字符串）', async () => {
+  const f = fixture({ pendingKindForSession: () => 'approval' })
+  const kernel = f.kernel(sessionsWith('ses_a', true))
+  const rows = await kernel.listSessions(50)
+  assert.equal(rows[0]!.summary.state, 'awaiting-permission', `实得 ${String(rows[0]!.summary.state)}`)
+  assert.equal(rows[0]!.summary.running, true, 'running 字段另说"在不在跑"，不能被状态覆盖掉')
+})
+
+test('会话状态：挂着的提问 → awaiting-answer', async () => {
+  const f = fixture({ pendingKindForSession: () => 'question' })
+  const kernel = f.kernel(sessionsWith('ses_q', true))
+  const rows = await kernel.listSessions(50)
+  assert.equal(rows[0]!.summary.state, 'awaiting-answer')
+})
+
+test('会话状态：两项都挂时审批优先（它 180s 超时，提问 300s）', async () => {
+  const f = fixture({ pendingKindForSession: () => 'question' })
+  const kernel = f.kernel(sessionsWith('ses_both', true))
+  assert.equal((await kernel.listSessions(50))[0]!.summary.state, 'awaiting-answer')
+  const g = fixture({ pendingKindForSession: () => 'approval' })
+  assert.equal(
+    (await g.kernel(sessionsWith('ses_both', true)).listSessions(50))[0]!.summary.state,
+    'awaiting-permission',
+  )
+})
+
+test('会话状态：没人等就是修复前的口径（idle / running / archived），回调没有也照常', async () => {
+  const none = fixture()
+  const kernel = none.kernel(sessionsWith('ses_idle'))
+  assert.equal((await kernel.listSessions(50))[0]!.summary.state, 'idle')
+  const running = none.kernel(sessionsWith('ses_run', true))
+  assert.equal((await running.listSessions(50))[0]!.summary.state, 'running')
+  // 回调抛也不能让列表坏掉：当成没人等。
+  const boom = fixture({
+    pendingKindForSession: () => {
+      throw new Error('boom')
+    },
+  })
+  assert.equal((await boom.kernel(sessionsWith('ses_x')).listSessions(50))[0]!.summary.state, 'idle')
+})
+
+test('runState 也报同一个状态（它与列表必须一致）', async () => {
+  const f = fixture({ pendingKindForSession: () => 'approval' })
+  const kernel = f.kernel(sessionsWith('ses_a', true))
+  assert.equal((await kernel.runState('ses_a')).state, 'awaiting-permission')
 })

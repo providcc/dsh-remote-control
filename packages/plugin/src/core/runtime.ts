@@ -455,6 +455,26 @@ export class HostRuntime {
     return { count: this.pending.size, oldestSec: oldest }
   }
 
+  /**
+   * 某条会话此刻有没有人在等它（2026-10-06 接上 `awaiting-*` 会话状态）。
+   *
+   * **给 carrier 用**：内核回答不了这件事——它只知道会话在不在跑，不知道有一张
+   * 审批/提问卡正等人点。分层上 carrier 不 import runtime，所以由 index.ts 把这个
+   * 方法作为回调注进去（见 carrier-services 的 `pendingKindForSession`）。
+   *
+   * 同时挂着审批与提问时**审批优先**：审批 180s 超时、提问 300s，前者更急。
+   */
+  pendingKindForSession(sessionId: string): 'approval' | 'question' | undefined {
+    let approval = false
+    let question = false
+    for (const item of this.pending.values()) {
+      if (item.sessionId !== sessionId) continue
+      if (item.kind === 'approval') approval = true
+      else question = true
+    }
+    return approval ? 'approval' : question ? 'question' : undefined
+  }
+
   private countOutbound(payload: EvPayload, sent?: boolean): void {
     const key = payload.t.replace(/^ev\./, '')
     this.outboundCount[key] = (this.outboundCount[key] ?? 0) + 1

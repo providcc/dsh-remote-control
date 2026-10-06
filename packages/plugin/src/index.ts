@@ -722,6 +722,11 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
           log,
           clock,
           newSessionCwd: config.newSessionCwd,
+          // `awaiting-permission` / `awaiting-answer` 这两个会话状态只有 runtime 知道
+          //（内核只答得出"在不在跑"），而小程序列表与「等你处理」区只认这两个字符串——
+          // 不接上它们，真机上那个区永远是空的（判据见 carrier 的 pendingKindForSession
+          // 注释）。collect 早于 start，所以这里传的是一个**惰性查询**而不是值。
+          pendingKindForSession: (sessionId) => runtime?.pendingKindForSession(sessionId),
         }),
       )
       return
