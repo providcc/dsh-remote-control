@@ -156,6 +156,34 @@ test('maxCharsPerFrame 是出站硬上限：一次 push 就写超也要切，不
   )
 })
 
+test('切帧不许把一个代理对劈成两半：一个 emoji 被切成两片会变成两个乱码方块', () => {
+  const { frames, win } = harness({ windowMs: 10_000, maxCharsPerFrame: 3 })
+  // 😀 = U+1F600 = 高位代理 + 低位代理，**占两个 UTF-16 码元**（索引 2 与 3）。
+  // 上限 3 正好把切点落在两半之间，旧写法切出 "ab\ud83d" 与 "\ude00cd"：
+  // 密封走 `utf8(JSON.stringify(payload))`，ES2019 的 well-formed stringify 把孤立代理
+  // 转义成 \udXXX，接收端 JSON.parse 拿回来的仍是**孤立代理**——手机上就是两个豆腐块，
+  // 那个表情从此消失。AI 输出里 emoji 极常见，而切点位置由流式节奏决定、完全随机，
+  // 所以这不是"理论上可能"，是一条会话跑久了必然踩到的路。
+  const input = 'ab\u{1F600}cd' // 长度 6；按上限 3 切 → 第 3 片起点正落在 😀 的两半之间
+  win.push('ses_a', 'msg_1', input)
+  win.complete('ses_a', 'msg_1')
+
+  const joined = frames.map((frame) => frame.delta).join('')
+  assert.equal(joined, input, '切帧后拼回来的正文必须与输入逐码元相等（孤立代理会在这一条上现形）')
+  for (const frame of frames) {
+    assert.doesNotMatch(
+      frame.delta,
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+      `这一帧里出现了孤立代理：${JSON.stringify(frame.delta)}——emoji 被劈成了两半`,
+    )
+  }
+  // 代理对允许让这一片多 1 个码元（cap+1），但仍必须受"上限量级"约束，不能整段放行。
+  assert.ok(
+    frames.every((frame) => frame.delta.length <= 4),
+    `代理对让切帧失控：${JSON.stringify(frames.map((f) => f.delta.length))}`,
+  )
+})
+
 test('part 跨 flush 连续：同一条消息被窗口切成两帧时，序号不能归零', async () => {
   const { clock, frames, win } = harness({ windowMs: 120 })
   win.push('ses_a', 'msg_1', '第一段')

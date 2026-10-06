@@ -26,7 +26,24 @@
  * 本模块是纯逻辑：不认 socket、不认 cordis、时钟与发布动作都由调用方注入，
  * 所以上面四条判据每一条都有单测（旧实现这三条**一条都没测过**）。
  */
+import { createHash } from 'node:crypto'
 import type { Clock } from '../ports/index.js'
+
+/**
+ * 一张码在日志里的**代号**：码文本的 sha256 前 8 位。
+ *
+ * 为什么日志里不能出现那个 6 位码（2026-10-06 审计）：它**就是认领凭据本身**，
+ * 而插件的日志落在 stdout——`HANDOFF.md` §2 与 `pill/routes.ts` 那条注释都写着
+ * "stdout 是会被翻出来贴进 issue 的那种地方"，同一条纪律在 `pill/routes.ts` 里已经
+ * 落实成 `tokenLength` + `epoch`。本文件与 `index.ts` 的 `publishPairing` 当时漏了，
+ * 变成**同一个 stdout 上一半守纪律一半不守**。
+ *
+ * 取哈希而不是干脆不记，是因为"是哪一版码"在排错时真的有用（同一个代号能把
+ * 发布、消费、被拒这三条行串起来），而 sha256 前 8 位推不回 10⁶ 空间里的任何一码。
+ */
+export function tokenHandle(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 8)
+}
 
 /** 当前挂在 status.json 里的那张码。 */
 export interface ActivePair {
@@ -100,7 +117,7 @@ export class PairingWindow {
   /** 这张码已被某部手机用掉（`peer-joined` 带回的 token 就是它）。 */
   markConsumed(pairingToken: string): void {
     if (this.active?.token === pairingToken) {
-      this.deps.log('pairing code consumed, publishing a fresh one', { token: pairingToken })
+      this.deps.log('pairing code consumed, publishing a fresh one', { code: tokenHandle(pairingToken) })
       this.active = null
     }
   }
@@ -113,7 +130,7 @@ export class PairingWindow {
    */
   forget(pairingToken: string): void {
     if (this.active?.token === pairingToken) {
-      this.deps.log('pairing code rejected by the relay, dropping it', { token: pairingToken })
+      this.deps.log('pairing code rejected by the relay, dropping it', { code: tokenHandle(pairingToken) })
       this.active = null
     }
   }
@@ -169,7 +186,10 @@ export class PairingWindow {
         ttlMs,
       })
       if (!reason) {
-        // 不需要新码，但服务端 TTL 可能刚到：把已挂出那张的过期时间按权威值重算。
+        // 不需要新码。`expiresAt` 已由 `applyServerTtl` 在那张码的 `pair-ready` 到达时
+        // 按服务端权威值重算过（见它的注释），这里**刻意不再**算第二遍：同一个 ttlMs
+        // 在两个地方各算一次，迟早会算出两个不同的 expiresAt，而那种分歧的表现是
+        // "手机上这张码看起来还剩很久、实际刚过期"——比少一条注释难查得多。
         return published
       }
       const created = this.deps.publish(ttlMs)
@@ -178,7 +198,7 @@ export class PairingWindow {
         return published
       }
       this.active = { ...created, generation: this.deps.generation() }
-      this.deps.log('pairing published', { reason, token: created.token, ttlMs })
+      this.deps.log('pairing published', { reason, code: tokenHandle(created.token), ttlMs })
       published = true
     }
     return published

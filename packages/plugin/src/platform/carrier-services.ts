@@ -64,6 +64,16 @@ export interface ServicesBundle {
    */
   sessionController?: LooseObject
   /**
+   * 持久附件存储（`ctx.attachments`，`@deepseek-ai/dsh-attachment` 的 `AttachmentStore`）。
+   *
+   * **带图发提示必须经它或 `commands.prompt` 的 admission**（取证与理由见本文件
+   * `submitWithImages`）：内核序列化图片块时读的是 `block.attachment.attachmentId`，
+   * 而那个 `attachment` 只可能由这里的 `admitPromptContent()` 产出。
+   * 桌面宿主挂的是本地实现（`dsh-attachment-local`）；缺它只是发不了图，
+   * 不该把整条载体判定拖垮，所以是可选服务。
+   */
+  attachments?: LooseObject
+  /**
    * cordis 的事件注册口；对 waterfall 是**参与式**监听。
    *
    * 第三个参数是 `EventOptions`（`{ global?, prepend? }`）。两条参与面（审批与提问）
@@ -192,7 +202,26 @@ const TITLE_TIMEOUT_DEFAULT = 4000
 const HISTORY_TIMEOUT_DEFAULT = 15_000
 /** 新建会话的超时。创建要分配 id、可能还要挂 workspace，比读标题慢，但也不该让手机干等。 */
 const CREATE_TIMEOUT_DEFAULT = 8000
+/**
+ * 带图提示交内核入口的超时。比普通指令宽：admission 要把图片**解码校验并落盘**
+ * （内容寻址存储 + 可能的缩放派生），几百 KB 的图在这台机器上并不总是毫秒级。
+ * 超时的代价是"手机说发出去了、主机没收到"，所以给得比标题/历史都宽。
+ */
+const PROMPT_TIMEOUT_DEFAULT = 30_000
+/** 只有 attachments 这一条路时的超时（落盘是唯一可能慢的那一步）。 */
+const ADMIT_TIMEOUT_DEFAULT = PROMPT_TIMEOUT_DEFAULT
 const LIST_LIMIT_DEFAULT = 100
+
+/**
+ * 新建会话时，为了推断"用户此刻在哪个项目下"而扫多少条会话。
+ *
+ * 取 20 而不是 1：列表按 `createdAt` 排，而**最新建的那条完全可能没有 cwd**
+ * （它自己就是从手机在旧版本里不带 cwd 建出来的那一条）。只看第一条时，
+ * 推断会直接落空 → 内核退回宿主默认目录 → 会话落进 DSH 的**未分组**。
+ * 扫前 20 条找第一条带 cwd 的，既够（真正"最近在用的项目"不会排在 20 名之后，
+ * 那说明这台机器上有几百条从未再碰过的历史会话），又便宜（列表本来就是一次调用）。
+ */
+const NEW_SESSION_SCAN = 20
 
 /**
  * 猜「模型面」可能叫什么。**这是探测清单，不是接口声明** —— 内核各代际命名不同，
@@ -247,6 +276,22 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    * 不合并的话，用户新建完回到列表会发现那条会话不在里面。
    */
   const freshSessions = new Map<string, ListedSession>()
+
+  /**
+   * 「最后操作的那个会话」与它的目录（2026-10-06 用户："新建要落在最后操作的分组里"）。
+   *
+   * 为什么不直接用 `listSessions(1)`：那份列表按 `createdAt` 排，"第一条"是**最新建的**，
+   * 而不是**最近在动的**。这两件事在真实使用里差得很远——用户上午建了 10 条会话，
+   * 下午一直在上午建的第 3 条里干活，那么"最后操作的分组"是第 3 条的目录，
+   * 而 `listSessions(1)[0]` 会指向第 10 条（多半还是别的项目）。
+   *
+   * 这里是**主机自己观察到的**：任何一条 session 事件（delta / 工具 / 标题 / 运行态）都经过
+   * `translateSessionEvent`，因此"用户此刻正在动哪条会话"这件事不需要任何新数据源。
+   * 目录本身取自 `listSessions` 填的 `sessionId → cwd` 表（那才是内核的权威），
+   * 所以这里只记 id、不猜目录。
+   */
+  let lastTouchedSessionId = ''
+  const cwdBySession = new Map<string, string>()
   /** 取证用：内核实际发过来的会话事件类型，以及我们**没有映射**的那些（进 status.json）。 */
   const seenEventTypes = new Set<string>()
   const unmappedEventTypes = new Set<string>()
@@ -494,6 +539,14 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       else records.push(row)
     }
     records.sort((a, b) => createdAtOf(b) - createdAtOf(a))
+    // 顺手记下 `sessionId → cwd`：新建会话要按"最后操作的那个分组"落点，
+    // 而"最后操作"这个信号来自事件流（lastTouchedSessionId），目录本身只能从这里取。
+    // 只写不算，不读这页的话新表也是空的——所以放在 sort 之后、slice 之前，
+    // 保证**全量**记录都进表（slice 只是给人看的分页）。
+    for (const row of records) {
+      const cwd = String(row.cwd ?? '').trim()
+      if (cwd) cwdBySession.set(row.id, cwd)
+    }
     const page = records.slice(0, cap)
     await loadTitles(page.map((row) => row.id).filter((id) => !titleCache.has(id)))
     return page.map((row) => ({
@@ -533,21 +586,54 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       // 于是会话挂在一个不属于任何用户项目的目录里，GUI 的列表按项目分组自然看不见它
       // （手机侧照能用，只是主机那一面"新建了却不在列表里"）。
       //
-      // 三级取值：配置点名的 > 最近一条会话的目录（用户此刻在做的项目，列表本来就带 cwd）
-      //        > 还是不给（宿主自己安排，日志留痕）。
+      // 三级取值（2026-10-06 用户报"落在未分组"，根因是旧实现只看第一条）：
+      //   ① 配置点名的 `DRC_NEW_SESSION_CWD`（运维在配置文件里写下的一句钉）；
+      //   ② **最后操作过的那条会话**的目录（主机自己从事件流观察到的，不猜）；
+      //   ③ 往前扫若干条，找第一条带 cwd 的（"最近建过但没挂目录"的那类会话）；
+      //   ④ 还是不给（宿主自己安排，日志留痕）。
+      //
+      // ②③ 都必须存在：旧实现只有一个退化版本（`listSessions(1)[0]`，而那份列表按 createdAt 排），
+      // "最新建的那条"完全可能没有 cwd（它自己可能就是手机在旧版本里不带 cwd 建出来的那条），
+      // 于是推断直接落空、cwd 为空、内核退回 `/`——用户看到的就是**未分组**。
+      //
       // ⚠️ 仍然永远不给 sessionId（那会让内核复用旧会话而不是新建），
       // 也永远不与 workspaceId 同时给（两者并存会被内核当场拒 gateway/bad-request）。
-      let cwd = String(options.newSessionCwd ?? '').trim()
+      const pinned = String(options.newSessionCwd ?? '').trim()
+      let cwd = ''
+      let cwdFrom = ''
+      if (pinned) {
+        cwd = pinned
+        cwdFrom = 'config'
+      }
+      if (!cwd) {
+        // ②：主机观察到"用户此刻在动哪条会话"，直接用它的目录。
+        // cwdBySession 由 listSessions 填；表空（还没列过一次）时自然落到 ③。
+        const touched = cwdBySession.get(lastTouchedSessionId)
+        if (touched && !badWorkspace(touched)) {
+          cwd = touched
+          cwdFrom = 'last-touched'
+        }
+      }
       if (!cwd) {
         try {
-          const newest = (await listSessions(1))[0]
-          cwd = String(newest?.summary?.workspace ?? '').trim()
+          // ③：多取几条。列表本身按 createdAt 排，"第一条"未必是用户最近在用的那一条，
+          // 但它至少是一条**真实的**会话，比落空好。
+          const recent = await listSessions(NEW_SESSION_SCAN)
+          for (const row of recent) {
+            const candidate = String(row.summary?.workspace ?? '').trim()
+            if (candidate && !badWorkspace(candidate)) {
+              cwd = candidate
+              cwdFrom = 'recent-session'
+              break
+            }
+          }
         } catch {
           // 列表读失败不挡新建：退回旧行为（宿主默认目录），日志由 listSessions 自己记。
         }
       }
       const request: Record<string, unknown> = cwd === '' ? {} : { cwd }
       if (cwd === '') log('new session without explicit cwd; host default applies', {})
+      else log('new session cwd resolved', { from: cwdFrom, cwd: tailOfPath(cwd) })
       const made = (await withTimeout(
         Promise.resolve(create.call(commands, request)),
         options.createTimeoutMs ?? CREATE_TIMEOUT_DEFAULT,
@@ -555,7 +641,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       const id = typeof made?.sessionId === 'string' ? made.sessionId : ''
       if (!id) return { ok: false, message: `新建会话没有返回 sessionId（拿到 ${shapeOf(made)}）` }
       // 先记进 freshSessions：下一条列表推送就能带上它（见 listSessions 里的合并）。
-      freshSessions.set(id, { id, createdAt: options.clock.now() })
+      freshSessions.set(id, { id, createdAt: options.clock.now(), ...(cwd ? { cwd } : {}) })
       return { ok: true, sessionId: id }
     } catch (error) {
       return { ok: false, message: messageOf(error) }
@@ -563,30 +649,45 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   }
 
   /**
+   * 一个目录路径能不能当工作区用。返回 '' = 可以，否则是一句人话原因。
+   *
+   * 手机传来的 `workspace` 是不可信输入（它就是一条 JSON 里的字符串）。这里只做**形状**判定，
+   * 不去 stat：这个进程可能被限制成看不到用户的目录树（`ProtectHome`、容器），
+   * 一次 `existsSync` 得到的"不存在"会是个**假否定**，而假否定会让新建直接失败——
+   * 比把它交给内核、让内核按自己的规则处理要坏得多。
+   */
+  function badWorkspace(raw: string): string {
+    if (raw.length > 1024) return 'too long'
+    if (raw.includes('\0')) return 'contains NUL'
+    if (!raw.startsWith('/')) return 'not an absolute path'
+    // 只收 POSIX 绝对路径：这一代内核就在 POSIX 上（Windows 明确不实现，见 DESIGN §8），
+    // 而 `C:\...` 这种混进来的字符串会让内核自己抛一条没人看得懂的错误。
+    if (/^[A-Za-z]:[\\/]/.test(raw)) return 'looks like a Windows path'
+    return ''
+  }
+
+  /** 日志里只留目录最后一段：完整路径对排错没用、对日志是泄露（见 log.ts 的 MAX_LOG_VALUE_CHARS）。 */
+  function tailOfPath(raw: string): string {
+    const parts = raw.split('/')
+    return parts[parts.length - 1] || '/'
+  }
+
+  /**
    * 用户消息形状：优先用平台工厂（它会补 id 与规范化），拿不到退回最小可用对象。
    *
-   * `attachments` 是图片附件，会被拼成宿主原生的图片内容块
-   * `{type:'image', data, mimeType}`（2026-10-05 用户：正文里不要再出现路径）。
+   * 收的 `content` 必须是**内核认的那个形状**，本函数不再自己拼图片块：
+   * `{type:'image', data, mimeType}` 这种裸块进不了内核（见 sendPrompt 的取证），
+   * 而 `{type:'image', attachment}` 那种块只能由内核自己的 attachment store 产出。
+   * 拼装入口统一在 sendPrompt 里做，这里只负责"给内容块套一个消息壳"。
    *
-   * 为什么不写进正文：以前是「落盘 + 把绝对路径追加到 prompt」——路径会出现在
-   * 对话正文里，用户和模型都看得见，还把本机目录结构泄露给模型。宿主原生的
-   * 图片块会经 attachment store 转成内容寻址的持久引用，正文保持干净。
+   * 正文原样透传，一个字节都不许多（2026-10-05 用户：正文里不要再出现路径）：
+   * 以前图片的通路是「主机落盘 + 把绝对路径追加进正文」，路径会出现在对话正文里，
+   * 用户和模型都看得见，还把本机目录结构泄露给模型。
    *
-   * 空正文且只有图片时**不塞空文本块**：一个空的 text 块会让模型看到一句空话，
+   * 空正文时**不塞空文本块**：一个空的 text 块会让模型看到一句空话，
    * 而「只发图不说话」本来就是合法的输入。
    */
-  async function buildUserMessage(
-    text: string,
-    attachments: ReadonlyArray<{ data: string; mimeType: string }> = [],
-  ): Promise<LooseObject> {
-    const head = String(text || '').trim()
-    const content: LooseObject[] = []
-    if (head !== '') content.push({ type: 'text', text: head })
-    for (const one of attachments) {
-      content.push({ type: 'image', data: one.data, mimeType: one.mimeType })
-    }
-    // 一个内容块都没有：连空正文也不该发（调用方会先拒掉，见 sendPrompt 的守卫）
-    if (content.length === 0) content.push({ type: 'text', text: '' })
+  async function buildUserMessage(content: LooseObject[]): Promise<LooseObject> {
     try {
       // 用变量而不是字面量：这个包不是本插件的依赖，由宿主在运行时提供，
       // 写死路径会让类型检查去找一个根本不存在的声明（旧实现同样用变量绕开）。
@@ -685,6 +786,169 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     }
   }
 
+  /**
+   * 图片通路的探测结果，进 status.json。
+   *
+   * 三态与 `sendPrompt` 的降级顺序一一对应，不许合并：
+   * `commands.prompt`（内核完整入口：resume + 模型能力闸 + 文件回执 + admission）
+   * → `attachments.admitPromptContent`（只有那座桥，后面的事自己做）
+   * → `absent`（明确拒绝发图，绝不退回裸块硬发）。
+   */
+  function attachmentFace(): string {
+    if (typeof fn(services.sessionController?.commands, 'prompt') === 'function') return 'commands.prompt'
+    if (typeof fn(services.attachments, 'admitPromptContent') === 'function') return 'attachments.admitPromptContent'
+    return `absent (commands=${shapeOf(services.sessionController?.commands)} attachments=${shapeOf(
+      services.attachments,
+    )})`.slice(0, 160)
+  }
+
+  /**
+   * 命令入口要的 `requestId`（`SessionRequestId`，内核用它做同一请求的幂等去重）。
+   *
+   * 必须**逐条不同**且**重连后不重复**：内核见到重复的 requestId 会当成重投直接返回
+   * accepted（`SessionCommandController.prompt` 的 `hasPromptRequest` 分支），
+   * 于是这一条用户的图会被静默丢掉。所以时间戳之外还带一个进程内自增序号。
+   */
+  let promptRequestSeq = 0
+  function nextPromptRequestId(sessionId: string): string {
+    promptRequestSeq += 1
+    return `drc_prompt_${sessionId}_${options.clock.now().toString(36)}_${promptRequestSeq.toString(36)}`
+  }
+
+  /**
+   * 把一条**已经装好内容块**的消息交给 agent（followup 优先，退 steer）。
+   *
+   * 拆出来是因为带图与不带图两条路到这里汇合：带图那条的内容块由内核的
+   * admission 产出（可能来自命令入口，也可能来自 `attachments` 服务），
+   * 不带图那条是纯文本 —— 投递方式两者相同。
+   */
+  function deliverPrompt(
+    agent: LooseObject,
+    message: LooseObject,
+    followup: ((...args: any[]) => unknown) | undefined,
+    steer: ((...args: any[]) => unknown) | undefined,
+  ): { ok: boolean; message?: string } {
+    if (followup) {
+      followup.call(agent, message)
+      return { ok: true }
+    }
+    if (!steer) return { ok: false, message: 'agent 既没有 followup 也没有 steer' }
+    steer.call(agent, message)
+    return { ok: true }
+  }
+
+  /** 带图时走内核入口的结果：已投递 / 拿到 admitted 内容块 / 被拒。 */
+  type ImageSubmit =
+    { kind: 'delivered' } | { kind: 'admitted'; content: LooseObject[] } | { kind: 'rejected'; message: string }
+
+  /**
+   * 带图的提示必须**经内核自己的 admission**，不能把裸 image 块塞进 followup。
+   *
+   * ## 取证（app.asar 里 `@deepseek-ai/*` 的真实产物，2026-10-06）
+   *
+   * 内核里有**两种**图片内容块，形状不兼容，而旧实现把它们混成了一个：
+   *
+   * | 代际 | 形状 | 谁能产出 |
+   * |---|---|---|
+   * | 入口（PromptContentPart） | `{type:'image', mediaType, data, name?}` | 客户端 / 命令层，**base64 原文** |
+   * | 内部（ImageBlock） | `{type:'image', attachment: ImageAttachmentRef}` | 只能由 attachment store 的 `admitPromptContent` 产出 |
+   *
+   * 取证位置：
+   * - 入口形状：`@deepseek-ai/dsh-api-session-controller/lib/typert.host.js:1981`
+   *   （`PromptContentPart`）与 `:2237`（`SessionPromptRequest`）。
+   * - 内部形状：`@deepseek-ai/dsh-llm/lib/typert.host.js:329`
+   *   （`export interface ImageBlock { type: 'image'; attachment: ImageAttachmentRef }`）。
+   * - 两者之间那座桥：`@deepseek-ai/dsh-attachment/lib/types/index.js:58-73`
+   *   的 `admitPromptContent()` —— 入口块进去，内部块出来，**顺序一一对应**。
+   *
+   * ## 崩在哪（真机现象的完整解释）
+   *
+   * 旧实现发的是 `{type:'image', data, mimeType}`：**字段名错**（内核叫 `mediaType`）
+   * **而且压根没经过那座桥**，块里没有 `attachment`。回合走到内核序列化那一步时：
+   *
+   * ```js
+   * // @deepseek-ai/dsh-llm-deepseek/lib/index.js:1587（serialize() 内）
+   * const version = images.get(block.attachment.attachmentId)
+   * ```
+   *
+   * `block.attachment` 是 undefined → `Cannot read properties of undefined (reading 'attachmentId')`。
+   * 这一步在 turn 的请求准备里，于是整回合以 error 收场：手机上看到的是
+   * 「这一轮没有产出回复，内核报错（UNKNOWN）」，而图从头到尾没进过任何持久化。
+   *
+   * 两条路，按"内核自己的入口优先"排：
+   *
+   * 1. `ctx.sessionController.commands.prompt(request)`（`SessionCommandController.prompt`，
+   *    `dsh-api-session-controller/lib/types/commands.js:290`）—— 这是客户端那条路，
+   *    里面已经做了：resume 冷会话、模型能力闸（`inputModalities` 不含 image 就拒）、
+   *    file receipt 解析、`admitPromptContent`、`createUserMessage`、投递。
+   *    走它等于让内核按自己的规矩收这条提示，错误也是内核自己的话。
+   * 2. 没有该命令时退回 `ctx.attachments.admitPromptContent(content)` —— 就是那座桥本身，
+   *    之后我们自己 `createUserMessage` + `followup`。
+   *
+   * **两个面都没有时明确拒绝，绝不退回"裸块硬发"**：那不是降级，是拿用户的回合去赌
+   * 内核别崩（崩了用户只看到一句看不懂的 UNKNOWN）。
+   */
+  async function submitWithImages(
+    sessionId: string,
+    content: LooseObject[],
+    mode: 'queue' | 'steer',
+  ): Promise<ImageSubmit> {
+    const controller = services.sessionController as LooseObject | undefined
+    const commands = controller?.commands as LooseObject | undefined
+    const prompt = fn(commands, 'prompt')
+    if (prompt) {
+      try {
+        await withTimeout(
+          Promise.resolve(
+            prompt.call(commands, { requestId: nextPromptRequestId(sessionId), sessionId, mode, content }),
+          ),
+          PROMPT_TIMEOUT_DEFAULT,
+        )
+        log('prompt with images accepted by sessionController.commands.prompt', {
+          sessionId,
+          mode,
+          images: content.filter((part) => part.type === 'image').length,
+        })
+        return { kind: 'delivered' }
+      } catch (error) {
+        // 内核的拒绝理由比我们在外面猜的准，原样带回去（外层会加中文前缀）。
+        log('prompt with images rejected by kernel', { sessionId, message: messageOf(error) })
+        return { kind: 'rejected', message: messageOf(error) }
+      }
+    }
+    const attachments = services.attachments
+    const admit = fn(attachments, 'admitPromptContent')
+    if (!admit) {
+      return {
+        kind: 'rejected',
+        message: `这台主机的内核没有图片通路（commands=${shapeOf(commands)} attachments=${shapeOf(
+          attachments,
+        )}），请把图片存成文件再发`,
+      }
+    }
+    try {
+      const admitted = (await withTimeout(
+        Promise.resolve(admit.call(attachments, content)) as Promise<LooseObject[]>,
+        ADMIT_TIMEOUT_DEFAULT,
+      )) as LooseObject[]
+      if (!Array.isArray(admitted) || admitted.some((part) => part?.type === 'image' && !part.attachment)) {
+        // 没拿到 durable ref 就等于没 admission：这条必须当失败，不能往前送。
+        return {
+          kind: 'rejected',
+          message: `内核的 attachments.admitPromptContent 没给出图片的持久引用（拿到 ${shapeOf(admitted)}）`,
+        }
+      }
+      log('prompt with images admitted by attachments.admitPromptContent', {
+        sessionId,
+        images: content.filter((part) => part.type === 'image').length,
+      })
+      return { kind: 'admitted', content: admitted }
+    } catch (error) {
+      log('prompt with images rejected by attachment store', { sessionId, message: messageOf(error) })
+      return { kind: 'rejected', message: messageOf(error) }
+    }
+  }
+
   async function sendPrompt(
     sessionId: string,
     text: string,
@@ -696,40 +960,36 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       // 没有可用模型时必须主动拒绝，理由见 currentSelection() 的注释。
       return { ok: false, message: '拿不到当前模型选择（agentDefaultModel.currentSelection 缺失）' }
     }
-    // 图必须能真正送出去才接：这张主机接不住图，硬发一条没有图的正文，
-    // 用户看到的是"我发了张图，模型完全没提"——比明确报错坏得多。
     const followup = fn(agent, 'followup')
     const steer = fn(agent, 'steer')
     if (!followup && !steer) {
       return { ok: false, message: `agent 既没有 followup 也没有 steer（keys=[${shapeOf(agent)}]）` }
     }
-    if (attachments.length > 0 && !supportsInlineImages(agent)) {
-      return { ok: false, message: '这台主机的 agent 不支持内联图片附件，请把图片存到文件后再发' }
-    }
-    const message = await buildUserMessage(text, attachments)
-    if (followup) {
-      followup.call(agent, message)
-      return { ok: true }
-    }
-    // 上面已经断言过 steer 存在；这里再判一次是为了让 TS 能收窄（它不跟踪跨函数的守卫）
-    if (!steer) return { ok: false, message: 'agent 既没有 followup 也没有 steer' }
-    steer.call(agent, message)
-    return { ok: true }
-  }
 
-  /**
-   * 这个 agent 能不能吃内联图片块。
-   *
-   * 为什么要探测：图片走内容块是宿主的原生能力（`SdkEncodedImageBlock`），
-   * 但那是**较新的一代**才有。发一条带 image 块的消息到只认纯文本的载具上，
-   * 结果要么被静默丢弃（图没了，用户以为发出去了），要么整条被拒但原因不明。
-   * 所以这里先问一句：带不了就明确拒绝，别让图凭空消失。
-   */
-  function supportsInlineImages(agent: LooseObject): boolean {
-    // 能构造用户消息的载具都走同一条内容块通路，这里只做保守判断：
-    // 消息体形状由 buildUserMessage 保证，载具是否接受由宿主自己校验并报错——
-    // 那种错误会带着宿主的原因回来，比我们在这里猜要准。
-    return !!agent
+    const head = String(text || '').trim()
+    const content: LooseObject[] = []
+    // 空正文不占块位：只发图不说话是合法输入，塞一个空 text 块等于让模型读一句空话。
+    if (head !== '') content.push({ type: 'text', text: head })
+
+    if (attachments.length === 0) {
+      if (content.length === 0) content.push({ type: 'text', text: '' })
+      return deliverPrompt(agent, await buildUserMessage(content), followup, steer)
+    }
+
+    // 带图：先把手机送来的东西整成**内核入口形状**（mediaType + 规范 base64），
+    // 再交内核 admission。理由与取证见 submitWithImages 的注释。
+    const prepared = prepareImageParts(attachments)
+    if (!prepared.ok) {
+      log('prompt with images refused before kernel call', { sessionId, message: prepared.message })
+      return { ok: false, message: prepared.message }
+    }
+    // 这一处断言只跨"我们自己定义的精确形状"与"内核面用的宽松形状"：
+    // 内容块最终要交给不认识的第三方方法，所以从这一行起就按 LooseObject 走。
+    content.push(...(prepared.parts as unknown as LooseObject[]))
+    const submitted = await submitWithImages(sessionId, content, followup ? 'queue' : 'steer')
+    if (submitted.kind === 'delivered') return { ok: true }
+    if (submitted.kind === 'rejected') return { ok: false, message: `图片附件被内核拒绝：${submitted.message}` }
+    return deliverPrompt(agent, await buildUserMessage(submitted.content), followup, steer)
   }
 
   async function interrupt(sessionId: string): Promise<{ ok: boolean; message?: string }> {
@@ -968,6 +1228,9 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const type = event?.type
     if (!sessionId || !type) return
     seenEventTypes.add(type)
+    // "最后操作的会话"：任何一条事件都算（哪怕它随后被 INTENTIONAL_DROPS 丢掉、
+    // 或者是一条我们不翻译的类型）——用户确实在那条会话里干了活，这就是我们要的信号。
+    lastTouchedSessionId = sessionId
     const data = (event?.data ?? {}) as LooseObject
     // 审批的审计面对象：`asked` 带 toolName，`decided` 带 outcome。这里只记账不翻译——
     // 卡片本身走 `approval/request` 那条 waterfall，见 attachInteractionSink。
@@ -1345,6 +1608,11 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         // 第二条换模型的可能路径：命令控制器上自带的方法（`setModel` / `switchModel`…），
         // 以及活agent 自己暴露的模型字段。前者能列出来就说明这条路通不通。
         commandsFace: shapeOf(services.sessionController?.commands),
+        // **图片通路**（2026-10-06 真机事故后加）。真机现场是"发图 → 这一轮没有产出回复，
+        // 内核报错 Cannot read properties of undefined (reading 'attachmentId')"，
+        // 而 status.json 里当时没有任何一个字段能回答"这台主机到底能不能收图"。
+        // 三态要分得开：走命令 / 只能自己过 attachment store / 两个面都没有。
+        attachmentFace: attachmentFace(),
         agentModelFields: (() => {
           const first = firstLiveAgent()
           if (!first) return 'no-live-agent'
@@ -1675,6 +1943,18 @@ export function sessionEventKernelEvents(input: {
 }
 
 /**
+ * 旧插件（2026-10-06 之前）留下的"坏图片消息"在内核里的报错形状。
+ *
+ * 取证：`~/.dsh/sessions/.../session-3ca94040…/session.v4.jsonl.zstd` —— 修复后新发的
+ * 图已经是 `{type:'image', attachment:{attachmentId:'sha256:…'}}`（对的），而同一条会话
+ * 历史里还留着修复前那两条 `{type:'image', data, mimeType}`。内核每轮都要遍历
+ * **全部**历史消息求图片版本（`assertImagesFit` → `versions.get(block.attachment.attachmentId)`，
+ * `@deepseek-ai/dsh-llm-deepseek/lib/index.js:1436`），于是第一条坏块就把**之后每一轮**
+ * 全部打死 —— 连纯文本消息也一样（日志里 21:34:14 那条纯文本就是这么崩的）。
+ */
+const POISONED_IMAGE_HISTORY = /reading 'attachmentId'/
+
+/**
  * 回合失败时给手机看的那句话。
  *
  * 中文打底 + 原始原因照抄：只说"失败了"用户无从下手，只贴英文栈又看不懂。
@@ -1684,6 +1964,14 @@ function turnErrorText(reason: { kind?: string; error?: { message?: string; code
   const raw = String(reason?.error?.message ?? reason?.kind ?? '未知错误')
     .replace(/\s+/g, ' ')
     .trim()
+  // 这一条要**可操作**：用户能做的事只有"新建一条会话"，说清楚比报 UNKNOWN 有用。
+  // 不许在这里承诺"我们已经修好了"——那条坏消息在会话日志里，只有换会话能绕开。
+  if (POISONED_IMAGE_HISTORY.test(raw)) {
+    return (
+      '这一轮没有产出回复：这条会话的历史里有一条没走通的图片消息（修复前留下的数据，缺持久引用），内核每轮都要读它，连纯文本消息也会被拖崩。请新建一条会话再试。原始报错：' +
+      raw.slice(0, 80)
+    )
+  }
   const code = reason?.error?.code ? `（${String(reason.error.code)}）` : ''
   return `这一轮没有产出回复，内核报错${code}：${raw.slice(0, 240)}`
 }
@@ -1992,6 +2280,114 @@ export function stripToolCallXml(text: string): string {
   // 只剩空白（整条都是 XML + 换行）就归还真正的空串：mp 对空串不建块，
   // 对一个 '\n' 却会建（真机上那是一排只有 padding 的空白窄条）。
   return stripped.trim() === '' ? '' : stripped
+}
+
+/* ── 图片附件：手机送来的东西 → 内核入口形状（PromptContentPart）──────────── */
+
+/**
+ * 内核这一代只认这四种图片类型。
+ *
+ * 取证：`@deepseek-ai/dsh-llm/lib/typert.host.js:333`
+ * `export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'`
+ * —— 部署的 attachment store 还会再按 `imageLimits.mediaTypes` 过滤一次
+ * （`dsh-attachment/lib/types/index.js:32`），不在单子里的会带着
+ * `UNSUPPORTED_IMAGE_TYPE` 被拒。与其让整回合以 error 收场，不如在进内核前说清楚。
+ */
+export const KERNEL_IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const
+
+/** 声明的媒体类型 → 内核口径。`image/jpg` 是野生写法（wx 与各家客户端都这么写），折成 jpeg。 */
+function normalizeMediaType(raw: unknown): string | undefined {
+  const text = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .split(';')[0]!
+    .trim()
+  if (text === 'image/jpg') return 'image/jpeg'
+  return (KERNEL_IMAGE_MEDIA_TYPES as readonly string[]).includes(text) ? text : undefined
+}
+
+/**
+ * 按**字节**判定图片类型，而不是信手机上那个声明。
+ *
+ * 为什么不信声明：入口形状里类型错了，内核只会回一句 `UNSUPPORTED_IMAGE_TYPE`
+ * （用户看到的是"发图失败"，完全不知道是相册给错了类型还是我们认错了）；
+ * 而我们手上就有字节，魔数判据是零成本的。声明只当魔数认不出来时的兜底。
+ */
+function sniffImageMediaType(bytes: Buffer): string | undefined {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png'
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 6 && bytes.subarray(0, 6).toString('latin1') === 'GIF8') return 'image/gif'
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString('latin1') === 'RIFF' &&
+    bytes.subarray(8, 12).toString('latin1') === 'WEBP'
+  ) {
+    return 'image/webp'
+  }
+  return undefined
+}
+
+/**
+ * 解成**规范 base64**（内核的硬要求）。
+ *
+ * 取证：`@deepseek-ai/dsh-attachment/lib/types/admission.js:5-14`
+ * `decodeCanonicalBase64()`：`Buffer.from(data,'base64').toString('base64') !== data`
+ * 就抛 `INVALID_IMAGE_BASE64`。所以带换行、带空白、带 data-URI 前缀的都要先规整——
+ * 这些形态在手机侧都可能发生（e2e 夹具里就出现过 `data:image/png;base64,…` 当 payload）。
+ *
+ * 这里选择**规整而不是直接拒**：解码后重新编码与原文不同，多半只是空白或前缀，
+ * 字节本身是好的；只有解不出字节（非法字符集 / 解出来是空的）才拒绝。
+ */
+function decodeImageBase64(raw: unknown): { data: string; bytes: Buffer } | undefined {
+  let text = String(raw ?? '').trim()
+  if (/^data:/i.test(text)) {
+    const comma = text.indexOf(',')
+    if (comma < 0) return undefined
+    text = text.slice(comma + 1)
+  }
+  text = text.replace(/\s+/g, '')
+  if (text === '' || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return undefined
+  const bytes = Buffer.from(text, 'base64')
+  if (bytes.length === 0 || bytes.toString('base64') !== text) return undefined
+  return { data: bytes.toString('base64'), bytes }
+}
+
+/** 内核入口形状的一个图片块（`PromptContentPart` 的 image 变体）。 */
+export interface KernelImagePart {
+  type: 'image'
+  /** 内核叫 `mediaType`，**不是** `mimeType`（取证见文件里 submitWithImages 的表）。 */
+  mediaType: string
+  /** 规范 base64（无空白、无前缀）。 */
+  data: string
+}
+
+/**
+ * 一批手机图片 → 内核入口形状的图片块。
+ *
+ * 整批先验后返：任何一张不合格就整条拒绝并说明是哪一张第几张，
+ * 而不是让内核在自己的回合里抛一句 UNKNOWN（那正是这次事故的用户可见形态）。
+ */
+export function prepareImageParts(
+  attachments: ReadonlyArray<{ data: string; mimeType: string }>,
+): { ok: true; parts: KernelImagePart[] } | { ok: false; message: string } {
+  const parts: KernelImagePart[] = []
+  for (const [index, one] of (attachments ?? []).entries()) {
+    const decoded = decodeImageBase64(one?.data)
+    if (!decoded) {
+      return { ok: false, message: `第 ${index + 1} 张图片的数据不是合法的 base64，请重新选一次` }
+    }
+    const mediaType = sniffImageMediaType(decoded.bytes) ?? normalizeMediaType(one?.mimeType)
+    if (!mediaType) {
+      return {
+        ok: false,
+        message: `第 ${index + 1} 张图片的类型是 ${String(one?.mimeType || '未知')}，这台主机只收 ${KERNEL_IMAGE_MEDIA_TYPES.join(' / ')}`,
+      }
+    }
+    parts.push({ type: 'image', mediaType, data: decoded.data })
+  }
+  return { ok: true, parts }
 }
 
 /**

@@ -20,7 +20,7 @@ import { type CmdPayload, type EvPayload, buildPairingUri } from 'dsh-remote-wir
 import { HostRuntime, type RuntimeTransport } from './core/runtime.js'
 import { KeepAwake } from './core/sleep-policy.js'
 import { PairingSlots } from './core/keys.js'
-import { PairingWindow } from './core/pairing-window.js'
+import { PairingWindow, tokenHandle } from './core/pairing-window.js'
 import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
@@ -80,6 +80,11 @@ const SERVICE_NAMES = [
   'workspaceRegistry',
   'userQuestions',
   'sessionController',
+  // 图片附件的持久存储（2026-10-06 真机事故后接上）。
+  // 带图发提示必须经 `attachments.admitPromptContent()` 或 `sessionController.commands.prompt`，
+  // 否则内核序列化时读 `block.attachment.attachmentId` 会把整个回合打成
+  // `Cannot read properties of undefined (reading 'attachmentId')`。
+  'attachments',
 ]
 
 /**
@@ -411,7 +416,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     // 发不出去就不算一张码：`raw()` 对非 OPEN 的 socket 是静默丢弃，
     // 只记本地会留下"status.json 显示有效、中继那边根本没收到"的死码（取证 §6.2）。
     if (!relay.publishPairing(slot)) {
-      log('pairing published to a socket that is not open', { token: slot.token })
+      log('pairing published to a socket that is not open', { code: tokenHandle(slot.token) })
       return null
     }
     const qr = buildPairingUri({

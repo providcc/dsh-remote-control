@@ -53,6 +53,10 @@ interface Entry {
   timer: unknown
 }
 
+/** UTF-16 代理区间的两个判定（见 splitToCap 的注释：切帧不许劈开代理对）。 */
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff
+
 export class DeltaWindow {
   private readonly entries = new Map<string, Entry>()
   /**
@@ -178,12 +182,35 @@ export class DeltaWindow {
    * 第一版只在 `entry.text.length >= cap` 时"触发一次 flush"，而 flush 是整串发出去的：
    * 一次 push 就写进 5 万字符时，出站的那一帧仍然是 5 万字符——上限只管了时机、没管大小，
    * 于是手机可能顶到中继的帧上限（`MAX_FRAME_BYTES`）而被整条连接断开。
+   *
+   * ## 为什么切点不许落在代理对中间（2026-10-06 审计）
+   *
+   * `cap` 数的是 UTF-16 **码元**，而一个 emoji（U+1F600 之类）是高位代理 + 低位代理**两个**
+   * 码元。切点正好落在两半之间时，两片各自带着一个**孤立代理**出站；密封走
+   * `utf8(JSON.stringify(payload))`，ES2019 的 well-formed stringify 会把孤立代理转义成
+   * `\udXXX`，于是字节层面完全合法、接收端 `JSON.parse` 也"成功"——但手机拿到的是两个
+   * 豆腐块，那个表情凭空消失，还没有任何一层会报错。
+   *
+   * 不是理论问题：切点位置由流式节奏决定（delta 多大、窗口何时到期），完全随机，
+   * 而 AI 输出里 emoji 极常见，一条长会话跑下来一定会撞上。
+   *
+   * 修法是让这一片**多带 1 个码元**，把低位代理并进前一片。上界因此变成 `cap + 1`，
+   * 仍然远低于中继的帧预算，不影响"上限是为了别顶爆帧"这件事。
    */
   private splitToCap(text: string): string[] {
     const cap = this.options.maxCharsPerFrame
     if (!Number.isFinite(cap) || cap <= 0 || text.length <= cap) return text.length === 0 ? [] : [text]
     const parts: string[] = []
-    for (let at = 0; at < text.length; at += cap) parts.push(text.slice(at, at + cap))
+    let at = 0
+    while (at < text.length) {
+      let end = Math.min(at + cap, text.length)
+      // 切点落在"高位代理之后、低位代理之前"时，把低位代理并进这一片。
+      if (end < text.length && isLowSurrogate(text.charCodeAt(end)) && isHighSurrogate(text.charCodeAt(end - 1))) {
+        end += 1
+      }
+      parts.push(text.slice(at, end))
+      at = end
+    }
     return parts
   }
 

@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { PairingWindow, staleReason, type ActivePair } from '../src/core/pairing-window.js'
+import { PairingWindow, staleReason, tokenHandle, type ActivePair } from '../src/core/pairing-window.js'
 import { FakeClock } from '../src/core/clock.js'
 
 interface Harness {
@@ -19,6 +19,8 @@ interface Harness {
   window: PairingWindow
   published: number[]
   logs: string[]
+  /** 连字段一起留：日志里**不许**出现那个 6 位码（它就是认领凭据本身），判据要能查字段。 */
+  logRecords: Array<{ message: string; fields: Record<string, unknown> }>
   setOnline(online: boolean): void
   setGeneration(generation: number): void
   failPublish(fail?: boolean): void
@@ -29,6 +31,7 @@ function harness(pairSec = 60, overrides: { online?: boolean; publishReturnsNow?
   const clock = new FakeClock()
   const published: number[] = []
   const logs: string[] = []
+  const logRecords: Array<{ message: string; fields: Record<string, unknown> }> = []
   const state = { online: overrides.online ?? true, generation: 1, failPublish: false }
   const window = new PairingWindow(
     {
@@ -39,9 +42,14 @@ function harness(pairSec = 60, overrides: { online?: boolean; publishReturnsNow?
         if (state.failPublish) return null
         published.push(ttlMs)
         const createdAt = clock.now()
-        return { token: `T${published.length}`, createdAt, expiresAt: createdAt + ttlMs }
+        // 真码是 6 位十进制（formatPairingToken）；这里用可预测的 6 位数，别用 'T1' 那种
+        // 一眼假的占位——判据要拿真发出去的码去比对，占位符会让那条比对悄悄失效。
+        return { token: String(400000 + published.length), createdAt, expiresAt: createdAt + ttlMs }
       },
-      log: (message) => logs.push(message),
+      log: (message, fields) => {
+        logs.push(message)
+        logRecords.push({ message, fields: { ...(fields ?? {}) } })
+      },
     },
     pairSec,
   )
@@ -50,6 +58,7 @@ function harness(pairSec = 60, overrides: { online?: boolean; publishReturnsNow?
     window,
     published,
     logs,
+    logRecords,
     setOnline: (online) => {
       state.online = online
     },
@@ -76,7 +85,7 @@ test('没有活动码就发一张，并把当前代次记进去（判据一：�
   assert.equal(h.window.tick(), true, '第一次 tick 就该发一张')
   assert.deepEqual(h.published, [60_000], 'TTL 用请求值（pairOnStartSec × 1000）')
   const active = h.window.active as unknown as ActivePair
-  assert.equal(active.token, 'T1')
+  assert.equal(active.token, '400001')
   assert.equal(active.generation, 1, '代次必须记进去：中继重启后要靠它判死')
   assert.equal(h.window.tick(), false, '仍然有效时不该重复发：每 3 秒发一张会把中继的 pending 表打满')
 })
@@ -138,7 +147,7 @@ test('剩余寿命不足半程才重发，仍在半程内不动（判据三：�
   // 判据一与判据三的动作相同（都要换新），但**原因必须分得开**：
   // 一张走到"已过期"的码说明半程刷新没做成（多半是发布一直失败），排查方向完全不同。
   const dead: ActivePair = {
-    token: 'T1',
+    token: '400001',
     createdAt: h.clock.now() - 120_000,
     expiresAt: h.clock.now() - 60_000,
     generation: 1,
@@ -172,7 +181,7 @@ test('服务端权威 TTL 覆盖请求值，并把已挂出那张的过期时间
   h.window.tick()
   const createdAt = (h.window.active as unknown as ActivePair).createdAt
 
-  h.window.applyServerTtl('T1', 90_000) // 中继说这张还能活 90s
+  h.window.applyServerTtl('400001', 90_000) // 中继说这张还能活 90s
   assert.equal(
     (h.window.active as unknown as ActivePair).expiresAt,
     createdAt + 90_000,
@@ -180,7 +189,7 @@ test('服务端权威 TTL 覆盖请求值，并把已挂出那张的过期时间
   )
 
   // 之后每张都按服务端值发（请求值只在 pair-ready 落地前用）。
-  h.window.markConsumed('T1')
+  h.window.markConsumed('400001')
   h.window.tick()
   assert.deepEqual(h.published, [60_000, 90_000], `第二张用的还是请求值：${JSON.stringify(h.published)}`)
 })
@@ -225,7 +234,7 @@ test('pairOnStartSec=0（默认）时"中继重启换码"这条判据也必须�
     '代次变了却不换码：用户点"刷新"拿到的还是同一张死码，只能干等 TTL（而 pairOnStartSec 默认 0）',
   )
   assert.deepEqual(h.published, [120_000], '这一档的 TTL 基线要用常规 pairTtlMs（默认 120000），不是 pairSec*1000=1s')
-  assert.equal((h.window.active as unknown as ActivePair).token, 'T1')
+  assert.equal((h.window.active as unknown as ActivePair).token, '400001')
 })
 
 test('pairOnStartSec=0 时"过半程"同样要换：那张码按常规 TTL 老化，不会每 tick 换一张', async () => {
@@ -245,4 +254,42 @@ test('staleNow() 与 tick() 同一套判据：刷新按钮据此拒发死码，�
   assert.equal(h.published.length, 0, 'staleNow 不许发布任何东西')
   h.setGeneration(5)
   assert.equal(h.window.staleNow(), 'relay-generation-changed', '代次变了必须能判出来（这就是那条死码）')
+})
+
+test('日志里不许出现那个 6 位码（它就是认领凭据本身），只留一个可对账的代号', async () => {
+  // 与 `pill/routes.ts` 的 `tokenLength + epoch` 同一条纪律：`stdout` 是会被翻出来
+  // 贴进 issue 的那种地方，中继侧 D2 也为此把完整码降到 debug。本文件与 index.ts
+  // 的 publishPairing 当时漏了，于是同一个 stdout 上一半守纪律一半不守。
+  //
+  // ⚠️ 断言必须覆盖**三条**会带上码的路径（被用掉 / 被中继拒 / 发布新码），且那条
+  // "发布"要拿真发出去的那张码来比——第一版只断言了两个手写的码，而 publish 走的是
+  // 夹具给的 `T1`，于是把发布那行改回 `token:` 变异验证时判据**没红**。
+  // 判据自己骗自己比没有判据更糟（§0.3 第 2 条）。
+  const h = harness(60)
+  const used = '418302'
+  const rejected = '905517'
+  h.window.adopt({ token: used, createdAt: h.clock.now(), expiresAt: h.clock.now() + 120_000 })
+  h.window.markConsumed(used)
+  h.window.adopt({ token: rejected, createdAt: h.clock.now(), expiresAt: h.clock.now() + 120_000 })
+  h.window.forget(rejected)
+  h.window.tick()
+  const published = h.window.active?.token ?? ''
+  h.window.markConsumed(published)
+
+  assert.ok(
+    [used, rejected, published].every((code) => /^\d{6}$/.test(code)),
+    `三条路径上的码都得是真实的 6 位数（实得 ${used} / ${rejected} / ${published}），否则下面那条比对等于没做`,
+  )
+  assert.ok(h.logRecords.length >= 4, `这三条路径都没留日志（实得 ${h.logRecords.length} 条），判据自己没跑到点上`)
+  const blob = JSON.stringify(h.logRecords)
+  for (const secret of [used, rejected, published]) {
+    assert.ok(
+      !blob.includes(secret),
+      `日志里出现了完整的配对码 ${secret}：凭据与"屏幕上的那张码"两项同时到位即可在 TTL 内配对（D2 的原话）`,
+    )
+  }
+  // 代号必须真的能用：同一个码的各条日志要能串起来，不同的码不能撞成同一个。
+  assert.equal(tokenHandle(used), tokenHandle(used), '同一个码的代号必须稳定')
+  assert.notEqual(tokenHandle(used), tokenHandle(rejected), '不同码的代号不能一样')
+  assert.match(tokenHandle(used), /^[0-9a-f]{8}$/, '代号固定 8 位十六进制：够对账，又推不回 10^6 空间里的任何一码')
 })

@@ -37,15 +37,38 @@ interface Calls {
   followup: unknown[]
   steer: unknown[]
   cancel: unknown[][]
+  /** 带图提示交 `sessionController.commands.prompt` 的入参（逐字记下来）。 */
+  prompt: Array<Record<string, unknown>>
+  /** 带图提示交 `attachments.admitPromptContent` 的入参。 */
+  admit: unknown[][]
 }
 
 interface Fixture {
   calls: Calls
   /** 活的 agent 是**同一个对象**：测试要能在它身上删成员（每次 get 返回新对象的话删了也没用）。 */
   readonly liveAgent: Record<string, unknown>
-  bundle(overrides?: { live?: boolean; model?: { provider: string; model: string } | undefined }): ServicesBundle
+  bundle(overrides?: BundleOverrides): ServicesBundle
   kernel(services: ServicesBundle): ReturnType<typeof createServicesKernel>
 }
+
+/**
+ * 夹具可开关的三个面。
+ *
+ * 默认**两个图片面都没有**（promptFace / admitFace 都是 false）：这是"这台主机接不住图"
+ * 的形状，判据里必须能拿到它——不然真机事故那一条（发图 → 回合以内核报错收场）
+ * 在测试里根本复现不出来。纯文本的用例不受影响，它们本来就不看图片面。
+ */
+interface BundleOverrides {
+  live?: boolean
+  model?: { provider: string; model: string } | undefined
+  /** 有 `sessionController.commands.prompt`（内核的完整入口）。 */
+  promptFace?: boolean
+  /** 只有 `attachments.admitPromptContent`（那座桥）。 */
+  admitFace?: boolean
+}
+
+/** 一张 4 字节的最小 JPEG：够过魔数判定，不占测试体积。 */
+const TINY_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xdb]).toString('base64')
 
 function fixture(
   options: {
@@ -54,19 +77,17 @@ function fixture(
     pendingKindForSession?: (sessionId: string) => 'approval' | 'question' | undefined
   } = {},
 ): Fixture {
-  const calls: Calls = { resume: [], unarchive: [], followup: [], steer: [], cancel: [] }
+  const calls: Calls = { resume: [], unarchive: [], followup: [], steer: [], cancel: [], prompt: [], admit: [] }
   const clock = new FakeClock()
   const liveAgent: Record<string, unknown> = {
     followup: (message: unknown) => calls.followup.push(message),
     steer: (message: unknown) => calls.steer.push(message),
     cancel: (...args: unknown[]) => calls.cancel.push(args),
   }
-  const bundle = (
-    overrides: { live?: boolean; model?: { provider: string; model: string } | undefined } = {},
-  ): ServicesBundle => {
+  const bundle = (overrides: BundleOverrides = {}): ServicesBundle => {
     const live = overrides.live ?? false
     const model = 'model' in overrides ? overrides.model : { provider: 'stepfun', model: 'step-5-preview' }
-    return {
+    const out: ServicesBundle = {
       sessions: { list: () => [], get: () => undefined },
       agents: {
         get: () => (live ? liveAgent : undefined),
@@ -84,6 +105,36 @@ function fixture(
         },
       },
     }
+    if (overrides.promptFace) {
+      out.sessionController = {
+        commands: {
+          prompt: (request: Record<string, unknown>) => {
+            calls.prompt.push(request)
+            return Promise.resolve({ accepted: true })
+          },
+        },
+      }
+    }
+    if (overrides.admitFace) {
+      // 复刻内核那座桥的**形状契约**：入口块进去、内部块出来、顺序一一对应。
+      // 少了 attachment 的图片块在真机上会让内核崩（判据见下面那组测试的注释）。
+      out.attachments = {
+        admitPromptContent: (content: unknown[]) => {
+          calls.admit.push(content)
+          return Promise.resolve(
+            content.map((part, index) => {
+              const one = part as { type: string; text?: string; mediaType?: string; data?: string }
+              if (one.type !== 'image') return { ...one }
+              return {
+                type: 'image',
+                attachment: { attachmentId: `sha256:${'0'.repeat(56)}${index + 1}`, mediaType: one.mediaType },
+              }
+            }),
+          )
+        },
+      }
+    }
+    return out
   }
   return {
     calls,
@@ -1124,6 +1175,145 @@ test('新建会话的 cwd：配置点名优先于"跟着最近一条会话走"',
   assert.deepEqual(asked, [{ cwd: '/Users/linbin/other-proj' }], '配置点名的目录优先')
 })
 
+test('回归：最新建的会话没有 cwd 时，往前扫一条也要给出 cwd（2026-10-06 用户报"落在未分组"）', async () => {
+  // 旧实现只取 listSessions(1)[0]，而那份列表按 createdAt 排。"最新建的那条"完全可能
+  // 没有 cwd——它自己就是手机在旧版本里不带 cwd 建出来的那条。于是推断落空、
+  // request 变成 {}、内核退回 process.cwd()（真机上是 `/`），DSH 的列表里那条
+  // 就归到**未分组**：手机侧照常能用（它按 id 过滤），用户到电脑前却找不到。
+  const f = fixture()
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () =>
+      Promise.resolve([
+        { header: { id: 'ses_new_no_cwd', createdAt: 1_700_000_900_000 } }, // 最新、没有目录
+        { header: { id: 'ses_with_cwd', createdAt: 1_700_000_000_000, cwd: '/Users/linbin/dsh-remote-control' } },
+      ]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-scan' })
+      },
+    },
+  }
+  const made = await f.kernel(services).newSession!()
+  assert.equal(made.ok, true)
+  assert.deepEqual(
+    asked,
+    [{ cwd: '/Users/linbin/dsh-remote-control' }],
+    '往前扫到一条带 cwd 的就必须用它：request 为 {} 等于把落点交给宿主默认，也就是未分组',
+  )
+})
+
+test('最后操作过的会话优先于"最新建的"：人在哪条会话里干活就在哪个分组新建', async () => {
+  // createdAt 排出来的第一条是"最新建的"，而用户此刻在动的往往不是它——
+  // 上午建了 10 条、下午一直在第 3 条里干活，那么"最后操作的分组"是第 3 条的目录。
+  // 主机不需要任何新数据源就能知道这件事：每一条 session 事件都经过 translateSessionEvent。
+  const f = fixture()
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () =>
+      Promise.resolve([
+        { header: { id: 'ses_newest', createdAt: 1_700_000_900_000, cwd: '/w/just-created' } },
+        { header: { id: 'ses_working', createdAt: 1_700_000_000_000, cwd: '/w/actually-working' } },
+      ]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-touched' })
+      },
+    },
+  }
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  // 先列一次把 sessionId → cwd 填上（真实运行时列表是被定时刷新推动的）。
+  await kernel.listSessions(50)
+  // ⚠️ 必须 subscribe：`session/event` 是在 subscribe 里绑的（见 bindAll），
+  // 不订阅就没人调 translateSessionEvent，"最后操作"这个信号也就根本不存在。
+  kernel.subscribe(() => {})
+  // 用户在 ses_working 里发了一句话 —— 这条事件就是"最后操作"的全部证据。
+  listeners['session/event']?.(
+    { id: 'ses_working' },
+    { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '继续' }], role: 'user', id: 'u-1' } },
+  )
+  assert.ok(listeners['session/event'], 'session/event 没绑上（没 subscribe 就是这样）')
+
+  await kernel.newSession!()
+  assert.deepEqual(
+    asked,
+    [{ cwd: '/w/actually-working' }],
+    '落点必须是用户最后在动的那个分组，而不是 createdAt 最新那个',
+  )
+})
+
+test('没观测到任何事件时退回"往前扫"，而不是落空（未分组）', async () => {
+  const f = fixture()
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () => Promise.resolve([{ header: { id: 'ses_a', createdAt: 2, cwd: '/w/a' } }]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-fallback' })
+      },
+    },
+  }
+  await f.kernel(services).newSession!()
+  assert.deepEqual(asked, [{ cwd: '/w/a' }], 'lastTouched 为空时必须落到扫描那一档，而不是 {}')
+})
+
+test('新建出来的会话自带落点：列表里立刻能看出它归在哪个分组', async () => {
+  // 不带 cwd 的话，刚建的那条在列表里 workspace 是空的——用户会看到它孤零零地
+  // 待在"未分组"那一栏，而实际上内核已经把它放在 /w/proj 下了。这与"落点选错"
+  // 是同一个故障的两种表现，必须一起修。
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () => Promise.resolve([{ header: { id: 'ses_old', createdAt: 1, cwd: '/w/proj' } }]),
+  }
+  services.sessionController = { commands: { create: () => Promise.resolve({ sessionId: 'ses_fresh' }) } }
+  const kernel = f.kernel(services)
+
+  await kernel.newSession!()
+  const fresh = (await kernel.listSessions(50)).find((item) => item.summary.id === 'ses_fresh')
+  assert.equal(fresh?.summary.workspace, '/w/proj', '新建那条的列表摘要必须带上 cwd：空 workspace 在 DSH 侧就是未分组')
+})
+
+test('cwd 形状不对就不采用（落回下一档），而不是把脏路径交给内核', async () => {
+  const f = fixture()
+  const asked: unknown[] = []
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () =>
+      Promise.resolve([
+        { header: { id: 'ses_bad', createdAt: 3, cwd: 'relative/not/absolute' } }, // 不是绝对路径
+        { header: { id: 'ses_ok', createdAt: 2, cwd: '/w/good' } },
+      ]),
+  }
+  services.sessionController = {
+    commands: {
+      create: (request: unknown) => {
+        asked.push(request)
+        return Promise.resolve({ sessionId: 'session-shape' })
+      },
+    },
+  }
+  await f.kernel(services).newSession!()
+  assert.deepEqual(asked, [{ cwd: '/w/good' }], '相对路径不能直接交给内核，要先跳过它')
+})
+
 test('新建的空会话必须出现在列表里 —— 持久化那面还没它，而它已经不是"不存在"', async () => {
   const f = fixture()
   const services = f.bundle({ live: true })
@@ -1312,21 +1502,34 @@ test('提问卡：宿主字段名对不上时，产出的帧仍必须能过协�
 })
 
 /**
- * 图片必须以**内容块**进消息，正文不许出现路径（2026-10-05 用户）。
+ * 带图发提示必须走**内核自己的入口**，图片块是 `PromptContentPart` 的形状。
  *
- * 这一条钉的是真正的落点：runtime 只是把附件转交下去，真正把它变成
- * `{type:'image', data, mimeType}` 的是这里的 buildUserMessage。判据直接看
- * followup 收到的那个消息对象 —— 那是宿主真正会读的东西。
+ * ## 这组判据钉的是 2026-10-06 的真机事故
+ *
+ * 现场：手机发图 → 「这一轮没有产出回复，内核报错（UNKNOWN）：
+ * Cannot read properties of undefined (reading 'attachmentId')」。
+ *
+ * 根因不是内核坏了，是我们把**入口形状**当成了**内部形状**发进去：
+ * 内核序列化图片块时读 `block.attachment.attachmentId`
+ * （`@deepseek-ai/dsh-llm-deepseek/lib/index.js:1587`），而那个 `attachment`
+ * 只能由 `admitPromptContent()` 产出。旧实现既没经过它，字段名还用的是 `mimeType`
+ * （内核叫 `mediaType`）—— 于是回合在请求准备阶段崩掉。
+ *
+ * 判据看的是**真正会被内核读到的那份内容块**，不是我们内部的中间形状。
  */
-test('图片走内容块进消息：正文里一个字都不许多，正文后面才是图片块', async () => {
+test('图片走内核入口：优先 sessionController.commands.prompt，块是 {type:image, mediaType, data}', async () => {
   const f = fixture()
-  const kernel = f.kernel(f.bundle({ live: true }))
-  const image = { data: '/9j/4AAQSkZJRg==', mimeType: 'image/jpeg' }
-  const sent = await kernel.sendPrompt('ses_live', '看这张报错', [image])
+  const kernel = f.kernel(f.bundle({ live: true, promptFace: true }))
+  const sent = await kernel.sendPrompt('ses_live', '看这张报错', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
   assert.equal(sent.ok, true, sent.message ?? '')
-  assert.equal(f.calls.followup.length, 1, '图没被拒就必须真的送进去')
+  assert.equal(f.calls.prompt.length, 1, '没走内核的 prompt 入口：图片会被内核当成裸块，回合必崩')
+  assert.equal(f.calls.followup.length, 0, '命令入口已经投递过了，再 followup 一次就是把这张图发两遍')
 
-  const content = (f.calls.followup[0] as unknown as { content?: Array<Record<string, unknown>> }).content ?? []
+  const request = f.calls.prompt[0]!
+  assert.equal(request.sessionId, 'ses_live', 'sessionId 逐字传')
+  assert.equal(request.mode, 'queue', 'mode 必须是 queue（有 followup 时），steer 会插进当前步')
+  assert.equal(typeof request.requestId, 'string', 'requestId 必填：内核靠它做幂等去重')
+  const content = request.content as Array<Record<string, unknown>>
   assert.deepEqual(
     content[0],
     { type: 'text', text: '看这张报错' },
@@ -1334,21 +1537,147 @@ test('图片走内容块进消息：正文里一个字都不许多，正文后�
   )
   assert.deepEqual(
     content[1],
-    { type: 'image', data: image.data, mimeType: image.mimeType },
-    '图片没按宿主原生的形状进去：这一代认的是 {type:image, data, mimeType}',
+    { type: 'image', mediaType: 'image/jpeg', data: TINY_JPEG },
+    '图片块不是内核入口形状：字段名必须是 mediaType（内核不认 mimeType），data 必须是裸 base64',
   )
-  assert.equal(content.length, 2, `正文里混进了落盘那套痕迹（附件说明、绝对路径……）——现在正文必须原样透传`)
+  assert.equal(content.length, 2, `正文里混进了落盘那套痕迹（附件说明、绝对路径……）——正文必须原样透传`)
+  assert.ok(!JSON.stringify(content).includes('mimeType'), '内容块里还留着 mimeType：这个字段内核不读，类型判定会落空')
 })
 
-test('只发图不发字：不要塞一个空文本块（模型看到的是一句空话）', async () => {
+test('同一张图连发两条：requestId 必须逐条不同（重复会让内核当成重投静默丢图）', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true, promptFace: true }))
+  await kernel.sendPrompt('ses_live', '第一张', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
+  await kernel.sendPrompt('ses_live', '第二张', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
+  const ids = f.calls.prompt.map((one) => String(one.requestId))
+  assert.equal(ids.length, 2)
+  assert.notEqual(ids[0], ids[1], 'requestId 重复了：内核的 hasPromptRequest 会把第二条当成重投直接返回 accepted')
+})
+
+test('没有命令入口时退回 attachments.admitPromptContent：followup 收到的是内核内部形状', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true, admitFace: true }))
+  const sent = await kernel.sendPrompt('ses_live', '看这张报错', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
+  assert.equal(sent.ok, true, sent.message ?? '')
+  assert.equal(f.calls.admit.length, 1, '没经过那座桥：admission 产出 attachment，绕过它内核必崩')
+  assert.equal(f.calls.prompt.length, 0, '这代没有命令入口，不该去调一个不存在的方法')
+
+  const content = (f.calls.followup[0] as { content?: Array<Record<string, unknown>> }).content ?? []
+  assert.deepEqual(content[0], { type: 'text', text: '看这张报错' }, '正文原样透传')
+  assert.equal(content[1]?.type, 'image')
+  assert.equal(
+    typeof (content[1]?.attachment as { attachmentId?: string } | undefined)?.attachmentId,
+    'string',
+    `图片块没有 attachment：内核序列化时读 block.attachment.attachmentId 会抛（真机现象：reading 'attachmentId'）`,
+  )
+  assert.equal(content[1]?.data, undefined, '入口块的 base64 原文不许漏进内部形状：它只该留在 store 里')
+})
+
+/**
+ * 真机事故的正判据：**两个图片面都没有时必须明确拒绝**。
+ *
+ * 旧实现在这里"乐观降级"——照样把裸 `{type:'image', data, mimeType}` 塞进 followup，
+ * 结果不是图被悄悄丢掉，而是整个回合在内核里以 error 收场：手机上只看到
+ * 「这一轮没有产出回复，内核报错（UNKNOWN）」，图从头到尾没进过任何持久化。
+ * 明确拒绝 + 指一条能走通的路（存成文件），比拿用户的回合去赌好得多。
+ */
+test('这台主机没有图片通路：明确拒绝，且一次内核投递都不许发生', async () => {
   const f = fixture()
   const kernel = f.kernel(f.bundle({ live: true }))
-  const sent = await kernel.sendPrompt('ses_live', '   ', [{ data: 'AAA', mimeType: 'image/jpeg' }])
-  assert.equal(sent.ok, true, sent.message ?? '')
-  const content = (f.calls.followup[0] as unknown as { content?: Array<Record<string, unknown>> }).content ?? []
-  assert.equal(content.length, 1, '一个空 text 块 + 一个 image 块：空话不该占一个块位')
-  assert.equal(content[0]?.type, 'image')
+  const sent = await kernel.sendPrompt('ses_live', '看这张报错', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
+  assert.equal(sent.ok, false, '没有 admission 还把裸 image 块塞进去 = 真机那次崩溃')
+  assert.match(sent.message ?? '', /图片/, '拒绝理由要点名图片，否则手机上只有一句看不懂的话')
+  assert.match(sent.message ?? '', /文件/, '拒绝理由要指一条能走通的路（存成文件再发）')
+  assert.equal(f.calls.followup.length, 0, '拒绝之后还投递：用户会以为发出去了')
+  assert.equal(f.calls.steer.length, 0, '同上，steer 也是投递')
 })
+
+test('admission 没给出 attachment 时必须当失败：不能把"以为过了"的块继续往下送', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  // 复刻一个"什么都没干"的 store：返回的还是入口块（没有 attachment）。
+  services.attachments = {
+    admitPromptContent: (content: unknown[]) => {
+      f.calls.admit.push(content)
+      return Promise.resolve(content)
+    },
+  }
+  const sent = await f
+    .kernel(services)
+    .sendPrompt('ses_live', '看这张报错', [{ data: TINY_JPEG, mimeType: 'image/jpeg' }])
+  assert.equal(sent.ok, false, '没拿到持久引用就往下送 = 又一次真机崩溃')
+  assert.equal(f.calls.followup.length, 0, '不许投递')
+})
+
+test('手机送来的图片整成内核入口形状：data-URI 前缀剥掉、类型按字节判定', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true, promptFace: true }))
+  // 手机声明的是 image/png，字节其实是 JPEG：内核只认字节对应的类型与字节表里的 mediaTypes，
+  // 声明错了会变成一句用户看不懂的 UNSUPPORTED_IMAGE_TYPE。
+  const sent = await kernel.sendPrompt('ses_live', '', [
+    { data: `data:image/jpeg;base64,${TINY_JPEG}`, mimeType: 'image/png' },
+  ])
+  assert.equal(sent.ok, true, sent.message ?? '')
+  const content = f.calls.prompt[0]!.content as Array<Record<string, unknown>>
+  assert.equal(content.length, 1, '只发图时不许塞空文本块（模型会看到一句空话）')
+  assert.deepEqual(
+    content[0],
+    { type: 'image', mediaType: 'image/jpeg', data: TINY_JPEG },
+    'data-URI 前缀必须剥掉、类型按字节判定：内核的 base64 准入要求规范 base64',
+  )
+})
+
+test('非法的图片数据在进内核前就说清楚是哪一张第几张', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true, promptFace: true }))
+  const bad = await kernel.sendPrompt('ses_live', '', [{ data: '这不是 base64 !!', mimeType: 'image/jpeg' }])
+  assert.equal(bad.ok, false, '解不开的 base64 不该进内核（内核只会抛 INVALID_IMAGE_BASE64）')
+  assert.match(bad.message ?? '', /第 1 张/, '要说清是哪一张第几张，否则用户只能反复重试')
+
+  const bmp = await kernel.sendPrompt('ses_live', '', [
+    { data: Buffer.from('BM-not-an-image').toString('base64'), mimeType: 'image/bmp' },
+  ])
+  assert.equal(bmp.ok, false, '内核只收 png/jpeg/webp/gif，放行 bmp 就是拿回合去换一句 UNKNOWN')
+  assert.match(bmp.message ?? '', /image\/bmp/, '要说清被判成什么类型')
+
+  assert.equal(f.calls.prompt.length, 0, '被拒的批次一条都不许进内核')
+})
+
+test('不带图的指令不许绕道命令入口：纯文本还是直接 followup', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle({ live: true, promptFace: true }))
+  const sent = await kernel.sendPrompt('ses_live', '只回复 ok')
+  assert.equal(sent.ok, true)
+  assert.equal(f.calls.prompt.length, 0, '纯文本走命令入口多绕一层，还把重试语义搞复杂')
+  assert.equal(f.calls.followup.length, 1)
+})
+/**
+ * 图片通路的探测必须进 status.json（2026-10-06 真机事故后）。
+ *
+ * 现场那句话「这一轮没有产出回复，内核报错（UNKNOWN）」在事故当天**无法定位**，
+ * 因为 status.json 里没有任何字段能回答「这台主机到底能不能收图」。
+ * 三态与 sendPrompt 的降级顺序一一对应：
+ *   commands.prompt → attachments.admitPromptContent → absent(...)
+ */
+test('describe 里有 attachmentFace：能走哪条图片通路三态都要能说出来', () => {
+  const both = fixture()
+    .kernel(fixture().bundle({ promptFace: true, admitFace: true }))
+    .describe() as Record<string, unknown>
+  assert.equal(both.attachmentFace, 'commands.prompt', '有命令入口就该报它：那是内核的完整通路')
+
+  const bridge = fixture()
+    .kernel(fixture().bundle({ admitFace: true }))
+    .describe() as Record<string, unknown>
+  assert.equal(bridge.attachmentFace, 'attachments.admitPromptContent', '只有那座桥时报它')
+
+  const none = fixture().kernel(fixture().bundle()).describe() as Record<string, unknown>
+  assert.match(
+    String(none.attachmentFace),
+    /^absent \(commands=.*attachments=/,
+    `两个面都没有时报不出来：现场就分不清"这台主机发不了图"和"我们没调对"（拿到的值：${String(none.attachmentFace)}）`,
+  )
+})
+
 /**
  * 上下文占用的探测必须进 status.json（2026-10-06）。
  *
