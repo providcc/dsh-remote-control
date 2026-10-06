@@ -121,8 +121,17 @@ const DEFAULTS: RuntimeOptions = {
   approvalTimeoutMs: 180_000,
   questionTimeoutMs: 300_000,
   unarchiveOnPrompt: true,
-  // 图片附件：默认**不收**（uploadDir 空 = 拒收）。要放开必须在插件配置里显式
-  // 给一个目录——落盘是往用户磁盘写文件，不该由库默认值悄悄代劳。
+  /**
+   * 附件落盘目录。**留空 = 拒收文件附件**（下面那条 `reply(false, …)` 就是这条分支）。
+   *
+   * 为什么这里是留空而不是给个默认路径：这是纯构造器的默认值，直接 new 出来的实例
+   * （单测、将来的别的载具）不该自动往用户磁盘写文件。
+   *
+   * ⚠️ 但**生产路径上它永远非空**：`index.ts` 传的是 `resolveUploadDir(config)`，
+   * 而那个函数把 `''` 解析成 `status.json` 同目录的 `uploads/`（理由写在它自己文件头）。
+   * 所以"默认不收"只对**直接构造**成立，线上主机是收文件附件的——别照着这条注释
+   * 去判断线上行为，也别把 `index.ts` 那个解析去掉（去掉就真的会静默拒收一切附件）。
+   */
   uploadDir: '',
   maxFileBytes: 512 * 1024,
 }
