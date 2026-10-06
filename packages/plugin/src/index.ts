@@ -21,6 +21,7 @@ import { HostRuntime, type RuntimeTransport } from './core/runtime.js'
 import { KeepAwake } from './core/sleep-policy.js'
 import { PairingSlots } from './core/keys.js'
 import { PairingWindow, tokenHandle } from './core/pairing-window.js'
+import { buildLogRecord } from './shell/log-line.js'
 import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
@@ -168,15 +169,15 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * `shell/host-id.ts`）。`statusFile` 被清空（关掉快照）时不猜目录，退回一次性身份。
    */
   const hostId = resolveHostId(config.statusFile ? path.dirname(config.statusFile) : '', config.hostId)
+
   const log = (message: string, fields: Record<string, string | number | boolean | undefined> = {}): void => {
     try {
-      process.stdout.write(
-        `${JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: `dsh-remote-control ${message}`, ...fields })}\n`,
-      )
+      process.stdout.write(`${JSON.stringify(buildLogRecord(message, fields, new Date().toISOString()))}\n`)
     } catch {
       /* GUI 宿主里 stdout 可能不可用 */
     }
   }
+
   /**
    * 配对通道的密钥簿落盘（免扫码重连，见 `shell/pair-store.ts`）。
    *
