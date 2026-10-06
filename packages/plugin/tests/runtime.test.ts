@@ -842,6 +842,113 @@ test('提问收场发 ev.question_resolved：审批那两条不能顺手把提�
   assert.equal(resolved?.by, 'desktop')
 })
 
+// ── peer-joined 重发挂起卡（2026-10-06：手机退后台/断线/停在列表页期间错过的那一帧） ──
+//
+// 为什么值得测：审批/提问卡是"一次性、单会话、只在 chat 页"的一帧，错过就永远收不到，
+// 而主机还阻塞着等决定（审批 180 秒、提问 300 秒），超时后结算点还会主动擦掉。
+// 重发用同一个 requestId：手机按 requestId 收卡与覆盖，重发落在已有卡的手机上只是
+// 原地重写，不翻倍；结算点的精确作废帧新旧两份一起收，不留幽灵卡。
+
+test('replayPending：挂着的提问在新通道上按原样重发（同一 requestId、同一 expiresAt）', async () => {
+  const { runtime, kernel, transport } = fixture({ questionTimeoutMs: 60_000 })
+  runtime.start()
+  await settle()
+  transport.pair('c_old')
+  void kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+  })
+  await settle()
+  const first = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(first !== undefined, '首帧没发出去，后面测的就不是重发')
+  transport.pair('c_new')
+
+  const replayed = runtime.replayPending('c_new')
+  await settle()
+  assert.equal(replayed, 1, '挂着一张提问卡，重发必须恰好 1 条')
+  const again = transport.replies.filter(
+    (item) => item.conversationId === 'c_new' && item.payload.t === PAYLOAD_TYPES.evQuestionRequest,
+  )
+  assert.equal(again.length, 1, '重发必须发到新通道（旧通道已作废）')
+  const card = again[0]?.payload as Extract<EvPayload, { t: 'ev.question_request' }>
+  assert.equal(card.requestId, first.requestId, '必须同一 requestId：手机按它覆盖，不翻倍')
+  assert.equal(card.expiresAt, first.expiresAt, '到期时刻不许顺延：主机超时表从第一次问出就开始走')
+  assert.deepEqual(card.questions, first.questions, '题目必须原样')
+})
+
+test('replayPending：挂着的审批带着 action/reason 重发', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_old')
+  void kernel.sink?.approval({ sessionId: 'ses_live', action: 'rm -rf /tmp/x', reason: '清理缓存' })
+  await settle()
+  const first = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  assert.ok(first !== undefined, '首帧没发出去')
+  transport.pair('c_new')
+
+  assert.equal(runtime.replayPending('c_new'), 1)
+  await settle()
+  const card = transport.replies.filter(
+    (item) => item.conversationId === 'c_new' && item.payload.t === PAYLOAD_TYPES.evPermissionRequest,
+  )[0]?.payload as Extract<EvPayload, { t: 'ev.permission_request' }>
+  assert.equal(card.requestId, first.requestId, '必须同一 requestId')
+  assert.equal(card.action, 'rm -rf /tmp/x', '动作必须原样带回去，否则手机上那张卡说不清在批什么')
+  assert.equal(card.reason, '清理缓存')
+})
+
+test('replayPending：没挂起时一条都不发；新通道没有活对端时也不发', async () => {
+  const { runtime, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_idle')
+  assert.equal(runtime.replayPending('c_idle'), 0, '没挂起还发就是无事生非')
+  assert.equal(
+    transport.replies.filter(
+      (item) =>
+        item.payload.t === PAYLOAD_TYPES.evQuestionRequest || item.payload.t === PAYLOAD_TYPES.evPermissionRequest,
+    ).length,
+    0,
+  )
+  // 通道在但对端已走（peers 里没有）：发了也只是中继计一次丢帧，还不如不发。
+  assert.equal(runtime.replayPending('c_gone'), 0, '没有活对端的通道不许重发')
+})
+
+test('replayPending：已结算的不复活（settle 删掉的就该一直不在）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_old')
+  const controller = new AbortController()
+  const asked = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '要哪个', options: [{ id: 'o1', label: '甲' }] }],
+    signal: controller.signal,
+  })
+  await settle()
+  controller.abort('desktop')
+  assert.equal(await asked, null)
+  await settle()
+  transport.pair('c_new')
+  assert.equal(runtime.replayPending('c_new'), 0, '桌面已经答掉的问题重发就是诈尸')
+  assert.equal(
+    transport.replies.filter(
+      (item) => item.conversationId === 'c_new' && item.payload.t === PAYLOAD_TYPES.evQuestionRequest,
+    ).length,
+    0,
+  )
+})
+
 test('stop() 结算所有挂起交互：返回 decline 并释放每一次挂锁', async () => {
   const { runtime, kernel, transport, sleep } = fixture()
   runtime.start()

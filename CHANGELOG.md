@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.12] - 2026-10-06
+
+### 新增：配对那一刻重发还挂着的审批/提问（`replayPending`）
+
+2026-10-06 中午用户实测：主机问了问题，手机上什么都没弹，最后超时无应答。
+帧确实发出去了（`outbound.question_request=1`，无 `_no_peer`），但审批/提问卡是
+"一次性、单会话、只在 chat 页"的一帧——手机退后台、断线、停在列表页或别的会话时，
+这一帧过去就没了，而主机还阻塞着等决定（审批 180 秒、提问 300 秒）。
+
+现在 `peer-joined` 之后把 `pending` 里还挂着的按原样重发一遍：同一 `requestId`
+（手机按它覆盖，不翻倍；结算点的精确作废帧新旧两份一起收，不留幽灵卡），
+到期时刻用最初那一帧的（不顺延——主机超时表从第一次问出就开始走），
+已结算的不在 `pending` 里、不会复活，重发永不抛（走在配对流程里）。
+为此 `pending` 里多存了审批的 `action`/`reason` 与两类的 `expiresAt`。
+
+判据：`runtime.test.ts` +4（同一 requestId/同一 expiresAt/无活对端不发/已结算不复活）。
+
 ## [2.0.11] - 2026-10-06
 
 ### 新增：`tokenMeter` 探针进 `status.json`（`d6ba43f`）+ 按名查包（`597872f`）

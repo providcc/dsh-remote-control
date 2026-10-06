@@ -99,6 +99,17 @@ interface PendingInteraction {
   kind: 'approval' | 'question'
   /** 发出去的时刻（`clock.now()`），用来算"最久的那件已经等了多久"。 */
   askedAt: number
+  /**
+   * 重发（`replayPending`）时原样带回去的到期时刻。
+   *
+   * 存的是**最初那一帧的 expiresAt**，不是重发时刻重新算的：主机侧的超时表
+   * 从第一次问出就开始走，重发时把到期时刻往后顺延等于在骗手机的倒计时
+   * （主机 150 秒后就结算，手机却显示还剩 280 秒）。
+   */
+  expiresAt: string
+  /** 审批重发要原样带回去的动作与原因（提问那类存在 `options` 里）。 */
+  action?: string
+  reason?: string
 }
 
 const APPROVAL_OPTIONS = [
@@ -633,6 +644,9 @@ export class HostRuntime {
     if (!conversationId || !this.transport.hasClient(conversationId)) return 'decline'
     const id = `ap_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
+    // 到期时刻只算一次：首帧与将来可能的重发（`replayPending`）用同一个，
+    // 主机侧的超时表从第一次问出就开始走，重发时顺延等于骗手机的倒计时。
+    const expiresAt = new Date(Date.now() + this.options.approvalTimeoutMs).toISOString()
     const answered = await new Promise<ApprovalDecision>((resolve) => {
       const timer = this.clock.setTimeout(() => {
         this.settle(id, 'decline', 'timeout')
@@ -644,6 +658,9 @@ export class HostRuntime {
         timer,
         kind: 'approval',
         askedAt: this.clock.now(),
+        expiresAt,
+        action: info.action,
+        reason: info.reason,
       })
       // `reason` 是 `carrier-services.participate()` 打的标记：'desktop' = 桌面先答了，
       // 其余（'platform'）是宿主自己把这次请求撤了。两种都要让手机把卡收掉，
@@ -661,7 +678,7 @@ export class HostRuntime {
           action: info.action,
           ...(info.reason === undefined ? {} : { reason: info.reason }),
           options: APPROVAL_OPTIONS,
-          expiresAt: new Date(Date.now() + this.options.approvalTimeoutMs).toISOString(),
+          expiresAt,
         }),
       )
     })
@@ -683,6 +700,8 @@ export class HostRuntime {
     if (!conversationId || !this.transport.hasClient(conversationId)) return null
     const id = `q_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
+    // 到期时刻只算一次（理由见审批那条）：首帧与重发共用。
+    const expiresAt = new Date(Date.now() + this.options.questionTimeoutMs).toISOString()
     const answer = await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
       const timer = this.clock.setTimeout(() => {
         this.settle(id, null, 'timeout')
@@ -695,6 +714,7 @@ export class HostRuntime {
         options: info.questions,
         kind: 'question',
         askedAt: this.clock.now(),
+        expiresAt,
       })
       // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
       info.signal?.addEventListener(
@@ -710,7 +730,7 @@ export class HostRuntime {
           questions: info.questions,
           // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
           // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
-          expiresAt: new Date(Date.now() + this.options.questionTimeoutMs).toISOString(),
+          expiresAt,
         }),
       )
     })
@@ -797,6 +817,58 @@ export class HostRuntime {
       .catch(() => {
         emit(this.sessions.some((session) => session.id === item.sessionId && session.running === true))
       })
+  }
+
+  /**
+   * 把还挂着的审批/提问按原样重发一遍（调用方是 `peer-joined`）。
+   *
+   * 为什么需要：审批/提问卡是"一次性、单会话、只在 chat 页"的一帧——手机退后台、
+   * 断线、停在列表页或别的会话时，这一帧过去就没了，而主机那边还阻塞着等决定
+   * （审批 180 秒、提问 300 秒）。重配对回来后手机永远收不到，超时后还会被结算点
+   * 主动擦掉。重发补的就是这一帧。
+   *
+   * 为什么用**同一个 requestId**：手机按 requestId 收卡（`_onPermissionResolved` /
+   * `_onQuestionResolved`）与覆盖同卡——重发落在已经有这张卡的手机上只是原地重写，
+   * 不会翻倍；结算点（超时/桌面先答/撤回）发精确作废帧时新旧两份一起收，不留幽灵卡。
+   *
+   * 三条纪律：
+   * 1. 只重发 `pending` 里还挂着的：已结算的早被 `settle()` 删掉了，不会复活；
+   * 2. 到期时刻用最初那一帧的（`item.expiresAt`），不顺延——主机侧超时表从第一次问出
+   *    就开始走，重发时往后顺延等于骗手机的倒计时；
+   * 3. 永不抛：这一路走在配对流程里，任何一行炸了都只记一条日志，不能断掉配对。
+   */
+  replayPending(conversationId: string): number {
+    if (!this.transport.hasClient(conversationId)) return 0
+    let replayed = 0
+    for (const [id, item] of this.pending) {
+      try {
+        // 重配对时通道换了：旧 conversationId 已经作废，后续的结算作废帧要发到新通道。
+        item.conversationId = conversationId
+        this.replyTo(
+          conversationId,
+          item.kind === 'approval'
+            ? permissionRequest({
+                requestId: id,
+                sessionId: item.sessionId,
+                action: item.action ?? '操作',
+                ...(item.reason === undefined ? {} : { reason: item.reason }),
+                options: APPROVAL_OPTIONS,
+                expiresAt: item.expiresAt,
+              })
+            : questionRequest({
+                requestId: id,
+                sessionId: item.sessionId,
+                questions: item.options ?? [],
+                expiresAt: item.expiresAt,
+              }),
+        )
+        replayed += 1
+      } catch (error) {
+        this.log('pending replay failed', { requestId: id, message: messageOf(error) })
+      }
+    }
+    if (replayed > 0) this.log('pending replayed', { conversationId, count: replayed })
+    return replayed
   }
 
   /**

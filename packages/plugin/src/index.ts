@@ -275,6 +275,14 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         }
         runtime?.start()
         void runtime?.pushSessions('peer-joined')
+        // 挂着的审批/提问在配对那一刻重发一遍（同一 requestId）：手机退后台、断线、
+        // 停在列表页期间错过的那一帧，回来后靠这一遍补上；已结算的不在 pending 里，
+        // 不会复活。重发永不抛（见 replayPending 第三条纪律），这里不包第二层 try。
+        try {
+          runtime?.replayPending(conversationId)
+        } catch (error) {
+          log('pending replay crashed peer-joined', { message: error instanceof Error ? error.message : String(error) })
+        }
         // 一次性码用掉了就当场换一张新的（而不是等半程刷新）：第二部手机要的是一张新码，
         // 多轮真链路取证也靠这条才不用重启宿主。
         if (pairingToken) {
