@@ -61,6 +61,12 @@ interface LoadOptions {
   getThrows?: boolean
   /** `/status` 那条的回答。 */
   status?: Record<string, unknown>
+  /** `/status` 回非 200（路由没挂上时真机就是 404）。 */
+  statusHttp?: number
+  /** `/status` 直接抛（宿主转发层断了）。 */
+  statusThrows?: boolean
+  /** `/status` 一直不落地——演"宿主卡住"，用来钉 in-flight 守卫。 */
+  statusPending?: boolean
   /** `POST /pairing/new` 的回答。 */
   newAnswer?: Record<string, unknown>
   /** `POST /pairing/new` 直接抛（网络断了 / 路由没挂上）。 */
@@ -77,12 +83,16 @@ interface Harness {
   module: ClientModule
   /** fetch 收到的 URL。 */
   requests: string[]
+  /** 每条 fetch 收到的 `init.signal`——3 秒硬超时的判据（见 `signals()`）。 */
+  signals: unknown[]
   /** 被记下来的 console.error。 */
   errors: string[]
   /** 被记下来的 console.warn——pill 那一路的降级说的是 warn，不是 error。 */
   warnings: string[]
   /** 装载到现在创建的节拍个数（pill 挂了才有状态轮询）。 */
   timerCount(): number
+  /** **还活着**（没被 clearInterval 掉）的节拍个数：孤儿定时器的判据。 */
+  liveTimerCount(): number
   fire(index: number): void
   fireAndFlush(index: number): Promise<void>
   /** pill 注册进槽位时 `register` 收到的入参。 */
@@ -273,9 +283,16 @@ const DEFAULT_STATUS = {
 
 function load(options: LoadOptions = {}): Harness {
   const requests: string[] = []
+  const signals: unknown[] = []
   const errors: string[] = []
   const warnings: string[] = []
-  const timers: Array<() => void> = []
+  /**
+   * 节拍要**记下 id 并且真的清掉**（原来 `clearInterval: () => {}` 是个空实现，
+   * 于是"离开二维码那一屏 / 关面板 / 卸载之后定时器有没有清"这件事完全没测——
+   * 2026-10-06 修）。`timerCount()` 仍然数"创建过几个"（老断言的语义），
+   * 还活着的用 `liveTimerCount()`。
+   */
+  const timers: Array<{ id: number; callback: () => void; cleared: boolean }> = []
   const slotRegisters: Array<{ definition: Record<string, unknown>; component?: () => unknown }> = []
   const doc = new FakeDocument(options.hidden ? 'hidden' : 'visible')
   if (options.staleStyle) {
@@ -294,13 +311,20 @@ function load(options: LoadOptions = {}): Harness {
       log: () => {},
     },
     document: doc,
+    // 真浏览器有 `AbortSignal.timeout`，pill 拿它做每条请求的 3 秒硬超时。
+    // 夹具不给它的话，那条路在 vm 里会静悄悄退回"没有 signal"，判据也就测了个空。
+    AbortSignal,
     setInterval: (callback: () => void) => {
-      timers.push(callback)
+      timers.push({ id: timers.length + 1, callback, cleared: false })
       return timers.length
     },
-    clearInterval: () => {},
-    fetch: async (url: string, init?: { method?: string; headers?: Record<string, string> }) => {
+    clearInterval: (id: number) => {
+      const timer = timers.find((candidate) => candidate.id === id)
+      if (timer) timer.cleared = true
+    },
+    fetch: async (url: string, init?: { method?: string; headers?: Record<string, string>; signal?: unknown }) => {
       requests.push(url)
+      signals.push(init?.signal)
       const method = init?.method ?? 'GET'
       if (url.startsWith(PAIR_NEW_ROUTE)) {
         assert.equal(method, 'POST', '发码那条只接受 POST')
@@ -319,9 +343,11 @@ function load(options: LoadOptions = {}): Harness {
         }
       }
       if (url.startsWith(PAIR_STATUS_ROUTE)) {
+        if (options.statusPending) return new Promise(() => {})
+        if (options.statusThrows) throw new Error('状态那条断了')
         return {
           ok: true,
-          status: 200,
+          status: options.statusHttp ?? 200,
           json: async () => options.status ?? DEFAULT_STATUS,
         }
       }
@@ -415,15 +441,17 @@ function load(options: LoadOptions = {}): Harness {
   return {
     module,
     requests,
+    signals,
     errors,
     warnings,
     timerCount: () => timers.length,
+    liveTimerCount: () => timers.filter((timer) => !timer.cleared).length,
     fire: (index: number) => {
       assert.ok(timers[index], `第 ${index} 个节拍不存在（一共 ${timers.length} 个）`)
-      timers[index]!()
+      timers[index]!.callback()
     },
     async fireAndFlush(index: number) {
-      timers[index]?.()
+      timers[index]?.callback()
       await flush()
     },
     slotRegisters: () => slotRegisters,
@@ -1054,6 +1082,8 @@ test('码过期后**不再自动补一张**，就地说明白要人自己去按�
   assert.equal(harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length, 1)
   // 节拍次序：0 = pill 状态轮询，1 = 面板倒计时。倒计时走光后自清，所以那一刻仍是 2 个。
   assert.equal(harness.timerCount(), 2, '该有两个节拍')
+  const image = root.find('drc-qr')
+  assert.ok(image, '前提：图在屏上')
   await harness.fireAndFlush(1)
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
@@ -1062,6 +1092,10 @@ test('码过期后**不再自动补一张**，就地说明白要人自己去按�
   )
   assert.match(root.find('drc-note')!.textContent, /已过期/)
   assert.equal(root.find('drc-btn')!.textContent, '刷新', '要重发还是右上角那颗（出图时它叫刷新）')
+  // 过期那一刻**整块重画**了一次（note 要改口），但图仍然按 src 复用同一个元素：
+  // 重画不等于重新取图（`/pairing.png` 是 no-store，新元素必然回源并重新编码一整张 PNG）。
+  assert.equal(root.find('drc-qr'), image, '过期那一拍重画了面板，img 却不该被重建')
+  assert.equal(harness.liveTimerCount(), 1, '倒计时自清，只留状态轮询那一拍')
 })
 
 test('手机上刚扫完码：面板从二维码当场翻回状态视图，右上角那颗同时变成"退出配对"', async () => {
@@ -1151,4 +1185,299 @@ test('pill：「手机离线」那一屏要有一句「不用重新扫码」', (
     /'配对还在 小程序回前台会自动重连 不用重新扫码'/,
     '文案又长回去了：用户要的行动只有一个判断（要不要扫码），答案是不要，就只说不要',
   )
+})
+
+// ── 2026-10-06 那一轮修复的回归网 ────────────────────────────────────
+// 每一条都对应一处"看上去没坏、实际每秒/每次都在白烧东西"的缺陷；判据钉的是**可观察的形状**
+// （同一个 img 元素、同一个 warn 出口、定时器还活着几个），不是"代码里有没有那句话"。
+
+test('倒计时每秒只改那一行文本：img 与 6 位码原地不动（重建 = 每秒重新请求并重编码一张 PNG）', async () => {
+  // 现场：`/pairing.png` 是 `no-store`，而原来倒计时每秒 `paint()` 一次，
+  // 而 `paint()` 是 `panel.replaceChildren()` 整块重建——`<img>` 跟着被换掉，
+  // 于是屏幕上一张静止的码，后台每秒重新编码一整张 PNG。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 },
+  })
+  const root = harness.mountPill()
+  await openPairing(root)
+  const image = root.find('drc-qr')
+  const code = root.find('drc-code')
+  assert.ok(image, `前提：图在屏上（${root.allText()}）`)
+  assert.equal(root.find('drc-count')!.textContent, '1 分 0 秒后过期')
+
+  await harness.fireAndFlush(1)
+  assert.equal(root.find('drc-count')!.textContent, '59 秒后过期', '每秒要动的只有这一行')
+  assert.equal(
+    root.find('drc-qr'),
+    image,
+    'img 必须是同一个元素：`<img>` 重建 = 浏览器必然重新请求一次 no-store 的 /pairing.png + 服务端重新编码',
+  )
+  assert.equal(root.find('drc-code'), code, '整块 replaceChildren 会把码那行一起换掉——每秒重建一次不该发生')
+  assert.equal(harness.liveTimerCount(), 2, '还没过期：状态轮询与倒计时都该活着')
+})
+
+test('/status 非 200（路由没挂上就是 404）：要留一行 warn，pill 照常可用、下一拍照常问', async () => {
+  // 原来这条路上是静默 `return`——一行 warn 都不留，于是"那颗 pill 一动不动"在现场没有任何线索。
+  const harness = load({ react: FAKE_REACT, slots: true, statusHttp: 404 })
+  const root = harness.mountPill()
+  await flush()
+  assert.ok(root.find('drc-pill'), '路由没挂上不许影响那颗 pill 本身')
+  assert.equal(harness.errors.length, 0, '这是降级，不是故障')
+  assert.ok(
+    harness.warnings.some((line) => line.includes('status poll failed') && line.includes('404')),
+    `非 200 必须留痕（含状态码），实际：${harness.warnings.join(' | ')}`,
+  )
+  await harness.fireAndFlush(0)
+  assert.ok(
+    harness.requests.filter((url) => url.startsWith(PAIR_STATUS_ROUTE)).length >= 2,
+    '留痕不等于放弃：下一拍照常问',
+  )
+
+  // 面板正等着首次状态时那条路由一直 404：loading 必须落地成一句人话，而且**一颗码都不发**
+  // （连状态都读不到时"是不是已配对"根本无从判断，不能靠"读不到就当没配上"绕过那条红线）。
+  const waiting = load({ react: FAKE_REACT, slots: true, statusHttp: 404 })
+  const waitingRoot = waiting.mountPill()
+  waitingRoot.find('drc-pill')!.emit('click')
+  assert.match(waitingRoot.find('drc-note')!.textContent, /正在读取主机状态/, '先画 loading，不许停在空白上')
+  await flush()
+  assert.equal(
+    waiting.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '读不到状态就不许发码：已配对的主机不该因为我们读不到状态就白吃一张新码',
+  )
+  assert.match(waitingRoot.find('drc-note')!.textContent, /读不到主机状态/, 'loading 要落地成一句人话，不能永远转圈')
+})
+
+test('二维码那一屏换成"发不出码 / 失败"时倒计时要停：否则是个每秒还在重画的孤儿定时器', async () => {
+  const answer: Record<string, unknown> = { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 }
+  const harness = load({ react: FAKE_REACT, slots: true, newAnswer: answer })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.ok(root.find('drc-qr'), '前提：先有一张码在屏上')
+  // 节拍：0 = 状态轮询，1 = 倒计时。
+  assert.equal(harness.liveTimerCount(), 2, '码在屏上时倒计时必须活着')
+
+  // 中继在按下的这一刻说发不出码（路由回 200 + unavailable）→ 面板换成说明页。
+  answer.state = 'unavailable'
+  answer.reason = 'relay-offline'
+  root.find('drc-btn')!.emit('click')
+  await flush()
+  assert.equal(root.find('drc-qr'), undefined, '没有码了就不该留着那张图')
+  assert.match(root.find('drc-note')!.textContent, /中继还没连上/)
+  assert.equal(harness.liveTimerCount(), 1, '离开二维码那一屏：倒计时要停，只剩状态轮询那一拍')
+
+  // 失败那一支（fetch 抛 / 非 200 回答）同样要停表。
+  const failing: Record<string, unknown> = { state: 'ready', epoch: 'e2', token: '482913', expiresInMs: 60_000 }
+  const failed = load({ react: FAKE_REACT, slots: true, newAnswer: failing })
+  const failedRoot = failed.mountPill()
+  await openPairing(failedRoot)
+  assert.equal(failed.liveTimerCount(), 2, '前提：这张码的倒计时在跑')
+  delete failing.state
+  failing.error = 'request-not-trusted'
+  failedRoot.find('drc-btn')!.emit('click')
+  await flush()
+  assert.match(failedRoot.find('drc-note')!.textContent, /配对请求没成功/)
+  assert.equal(failed.liveTimerCount(), 1, '失败那一屏也不该留着那个每秒重画的节拍')
+})
+
+test('首次 /status 还没落地就点开面板：一颗码都不发，先画 loading；状态回来才按分支走', async () => {
+  // 现场：`pairingNow()` 读的是上一次轮询结果，第一次轮询还没回来时恒为 0。
+  // 旧实现在这个窗口里点开就会 POST /pairing/new——**已配对的主机也照发**，
+  // 服务端真出一张新码，与"已配对时点开一次码都不发"直接矛盾。
+  const paired = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
+  const pairedRoot = paired.mountPill()
+  pairedRoot.find('drc-pill')!.emit('click') // 比第一拍轮询还早
+  assert.ok(pairedRoot.find('drc-panel'), '面板要弹出来')
+  assert.match(pairedRoot.find('drc-note')!.textContent, /正在读取主机状态/, '这一屏先画 loading')
+  assert.equal(
+    paired.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '状态没回来之前一颗码都不发：这时根本不知道配没配上',
+  )
+  await flush()
+  assert.equal(
+    paired.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '状态回来说"已配对"：点开依旧一次码都不发',
+  )
+  assert.equal(pairedRoot.find('drc-head-label')!.textContent, '已连接')
+  assert.equal(pairedRoot.find('drc-qr'), undefined, '已配对那一屏不该有二维码')
+
+  // 真没配上那一侧：loading 只是等状态，状态一到就要发码（否则用户得多点一次那颗按钮）。
+  const fresh = load({ react: FAKE_REACT, slots: true })
+  const freshRoot = fresh.mountPill()
+  freshRoot.find('drc-pill')!.emit('click')
+  assert.equal(
+    fresh.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    0,
+    '状态没回来之前同样不许发（这一条对两侧都成立）',
+  )
+  await flush()
+  assert.equal(
+    fresh.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
+    1,
+    '状态回来说"真没配上"：这时才发码，且只发一次',
+  )
+  assert.ok(freshRoot.find('drc-qr'), `未配对点开就该落在二维码页：${freshRoot.allText()}`)
+})
+
+test('面板开着时普通状态变化也要跟着变：抬头与正文几行不许停在旧值上', async () => {
+  // 原来只有 `qr → offline` 与 `qr → info` 两个跃迁会重画面板，普通状态变化只更新那颗 pill，
+  // 于是面板抬头与正文（待处理 / 中继 / 状态 / 版本）一直显示点开那一刻的旧值。
+  const status: Record<string, unknown> = { ...DEFAULT_STATUS, paired: 1, pairings: 1 }
+  const harness = load({ react: FAKE_REACT, slots: true, status })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  assert.equal(root.find('drc-head-label')!.textContent, '已连接')
+  assert.deepEqual(
+    root.findAll('drc-info').map((row) => row.find('drc-key')!.textContent),
+    ['中继', '状态', '版本'],
+    '前提：此刻没有待处理',
+  )
+
+  // 中继转 connecting、手机上挂起 2 件事、版本也换了。
+  status.relay = 'connecting'
+  status.waiting = 2
+  status.waitingOldestSec = 252
+  status.version = '9.9.9-test'
+  await harness.fireAndFlush(0)
+
+  assert.equal(
+    root.find('drc-head-label')!.textContent,
+    '连接中',
+    '面板抬头与那颗 pill 读的是同一份状态，两处不许各说各的',
+  )
+  assert.equal(root.find('drc-label')!.textContent, '连接中')
+  assert.deepEqual(
+    root.findAll('drc-info').map((row) => [row.find('drc-key')!.textContent, row.find('drc-value')!.textContent]),
+    [
+      ['待处理', '2 件 最久 4 分 12 秒'],
+      ['中继', 'relay.example.com:443'],
+      ['状态', '连接中'],
+      ['版本', '9.9.9-test'],
+    ],
+    `面板正文要跟着轮询走：${root.allText()}`,
+  )
+})
+
+test('注入的 <style> 必须同时带 data-plugin 与 data-plugin-css：只带后者会被宿主算到别的插件头上', async () => {
+  // 宿主按 `data-plugin` 认领"这份样式是谁插的"（claimStyles）。缺了它，这份样式会被
+  // 算到别的插件名下，那个插件 HMR 时一句 removeOwnedStyles 就带走整颗 pill 的配色。
+  const harness = load({ react: FAKE_REACT, slots: true })
+  harness.mountPill()
+  await flush()
+  const style = harness.fakeDocument().head.children.find((node) => node.tag === 'style')
+  assert.ok(style, '样式要注入到 head')
+  assert.equal(style!.getAttribute('data-plugin'), 'dsh-remote-control', '宿主认领样式靠的就是它')
+  assert.equal(
+    style!.getAttribute('data-plugin-css'),
+    'dsh-remote-control/pill.css',
+    '我们自己的探针属性也要留着——按它把旧内容对齐成这一版',
+  )
+
+  // 上一版插的那份（只有 data-plugin-css）在热更路径上也要补上认领标记。
+  const stale = load({ react: FAKE_REACT, slots: true, staleStyle: true })
+  stale.mountPill()
+  await flush()
+  assert.equal(
+    stale.fakeDocument().seededStyle!.getAttribute('data-plugin'),
+    'dsh-remote-control',
+    '宿主热更这一半、文档没重载时，head 里那份旧 style 同样要补上 data-plugin',
+  )
+})
+
+test('CSS：.drc-note-block 必须排在 .drc-note 之后，否则那条 margin-top 是死规则', async () => {
+  // 两者同特异度（都只一个类），`margin: 4px 0 0` 写在后面就整条盖掉前面的 `margin-top: 10px`。
+  const harness = load({ react: FAKE_REACT, slots: true })
+  harness.mountPill()
+  await flush()
+  const css = harness.fakeDocument().head.children.find((node) => node.tag === 'style')?.textContent ?? ''
+  const noteAt = css.indexOf('.drc-note {')
+  const blockAt = css.indexOf('.drc-note-block')
+  assert.ok(noteAt >= 0 && blockAt >= 0, `两条规则都要在：${css.slice(0, 120)}`)
+  assert.ok(
+    blockAt > noteAt,
+    '同特异度下后来的赢：写在 .drc-note 前面的话，margin-top:10px 会被它的 margin:4px 0 0 覆盖成死规则',
+  )
+  assert.match(css.slice(blockAt, blockAt + 60), /margin-top: 10px/, '离线那一屏第一行靠它跟上面拉开距离')
+})
+
+test('每条请求都带 3 秒硬超时的 signal：宿主卡住时请求必须自己收场', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 } })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  root.find('drc-btn')!.emit('click') // 退出配对：这条写路由也要有超时
+  await flush()
+  assert.ok(harness.signals.length >= 3, `status / 发码 / 解配三条都要走到，实际只有 ${harness.signals.length} 条`)
+  for (const signal of harness.signals) {
+    assert.ok(
+      signal instanceof AbortSignal,
+      `每条 fetch 都要带 AbortSignal.timeout(3000) 的 signal，实际：${String(signal)}`,
+    )
+  }
+})
+
+test('轮询有 in-flight 守卫：上一发还没落地时，后面几拍不再叠请求', async () => {
+  const harness = load({ react: FAKE_REACT, slots: true, statusPending: true })
+  harness.mountPill()
+  await flush()
+  const statusRequests = (): number => harness.requests.filter((url) => url.startsWith(PAIR_STATUS_ROUTE)).length
+  assert.equal(statusRequests(), 1, '挂载时那一发')
+  await harness.fireAndFlush(0)
+  await harness.fireAndFlush(0)
+  assert.equal(statusRequests(), 1, '上一发还挂着（宿主卡住），后两拍不许再叠——原来每 2 秒就多一个永不落地的请求')
+})
+
+test('中继那一行只印 host:port：scheme / userinfo / path / query 都不许上屏', async () => {
+  const cases: Array<[unknown, string | undefined]> = [
+    ['wss://relay.example.com:443/relay', 'relay.example.com:443'],
+    ['relay.example.com:443', 'relay.example.com:443'],
+    // userinfo 是这一段里唯一可能带凭据的东西：面板上印 user:pass@host 等于把凭据抄给看屏幕的人。
+    ['wss://user:pass@relay.example.com:443/relay?token=1', 'relay.example.com:443'],
+    ['https://[::1]:8443/x', '[::1]:8443'],
+    // 拿不到值那一行不占地方（老版宿主没给 serverUrl）。
+    ['', undefined],
+  ]
+  for (const [serverUrl, expected] of cases) {
+    const harness = load({
+      react: FAKE_REACT,
+      slots: true,
+      status: { ...DEFAULT_STATUS, paired: 1, pairings: 1, serverUrl },
+    })
+    const root = harness.mountPill()
+    await flush()
+    root.find('drc-pill')!.emit('click')
+    await flush()
+    const row = root.findAll('drc-info').find((candidate) => candidate.find('drc-key')!.textContent === '中继')
+    const value = row ? row.find('drc-value')!.textContent : undefined
+    assert.equal(value, expected, `serverUrl=${JSON.stringify(serverUrl)} 时那一行写成了「${String(value)}」`)
+    assert.ok(!root.allText().includes('user:pass'), `面板里不许出现 userinfo：${root.allText().slice(0, 200)}`)
+  }
+})
+
+test('关面板与卸载都要把定时器清干净：倒计时不许变成孤儿节拍', async () => {
+  // 夹具原来 `clearInterval: () => {}` 是空实现、也不记 timer，于是"清没清"完全没测。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 },
+  })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.equal(harness.liveTimerCount(), 2, '码在屏上：状态轮询 + 倒计时')
+
+  root.find('drc-pill')!.emit('click') // 再按一次那颗 pill = 收面板
+  assert.equal(root.find('drc-panel'), undefined, '前提：面板关上了')
+  assert.equal(harness.liveTimerCount(), 1, '关面板要把倒计时清掉，只留状态轮询')
+
+  await openPairing(root)
+  assert.equal(harness.liveTimerCount(), 2, '重开一张码，倒计时重新起表')
+  harness.unmountPill()
+  assert.equal(harness.liveTimerCount(), 0, '卸载之后一个节拍都不许留（宿主重挂会再建一份，不清就是每次多一份）')
 })

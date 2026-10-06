@@ -18,7 +18,8 @@
  *   弹窗上印着 `origin-missing`：桌面宿主转发时会把 `origin` 删掉，"Origin 必须存在"这条前提
  *   在这台宿主上永远不成立。带自定义头则跨站必然先触发 CORS 预检，而这条服务既不响应 OPTIONS
  *   也不发 `Access-Control-*`，浏览器会拦下；HTML 表单更没有设头的口子。
- *   `Origin` 存在时仍要判：环回 http(s) 或宿主自己的自定义 scheme（`dsh-app://app`）算"自己"。
+ *   `Origin` 存在时仍要判：环回 http(s) 或宿主自己的自定义 scheme（`dsh-app://app`）算"自己"——
+ *   自定义 scheme 走的是**白名单**（`HOST_ORIGIN_SCHEMES`），别的扩展 scheme 一律不算。
  *
  * 为什么弹窗的图要我们自己出（而不是 `dsh-resource://file/...`）：那是右栏的文档预览页型
  * 认领的自定义 scheme，pill 里一个 `<img>` 能不能吃它**没有证据**，而
@@ -129,6 +130,16 @@ export async function renderPairingPng(qr: string): Promise<Buffer> {
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
+/**
+ * 宿主自己的自定义 scheme——**白名单**，不是"非 http(s) 一律放过"。
+ *
+ * 原来那条写的是 `url.protocol !== 'http:' && url.protocol !== 'https:'` 就放行，
+ * 于是 `chrome-extension://<别的扩展>`、`file://`、甚至任何自造 scheme 都算"宿主自己"
+ * （2026-10-06 修）。写路由靠 `x-drc-pair` 那个自定义头挡跨站，而装了扩展的浏览器里
+ * 扩展页面本来就发得出自定义头——Origin 这道就剩白名单这一层必须准。
+ */
+const HOST_ORIGIN_SCHEMES = new Set(['dsh-app:'])
+
 /** 去掉端口与 IPv6 方括号，只留主机名。 */
 function hostnameOf(host: string): string {
   const trimmed = host.trim().toLowerCase()
@@ -158,13 +169,14 @@ export function originIsLoopbackOrAbsent(origin: string | undefined): boolean {
 }
 
 /**
- * Origin 存在时它必须像"这台宿主自己"：环回的 http(s)，或宿主自己注册的自定义 scheme。
- * `dsh-app://app` 这类只有宿主自己能产生；`null`（file:// 文档开的页）不算。
+ * Origin 存在时它必须像"这台宿主自己"：环回的 http(s)，或**白名单里**那个宿主自定义 scheme。
+ * `dsh-app://app` 这类只有宿主自己能产生；`null`（file:// 文档开的页）与别的扩展 scheme 都不算。
  */
 function originLooksLikeTheHostItself(origin: string): boolean {
   try {
     const url = new URL(origin)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return origin.trim() !== 'null'
+    if (HOST_ORIGIN_SCHEMES.has(url.protocol)) return true
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
     return LOOPBACK_HOSTS.has(url.hostname)
   } catch {
     return false
@@ -214,10 +226,17 @@ export function pairNewHandler(deps: PillRouteDeps): (request: IncomingMessage, 
         json(response, 200, { state: 'unavailable', reason: 'relay-offline' })
         return
       }
-      deps.log('配对码经状态栏发出', { token: pairing.token })
+      const epoch = pairingEpoch(pairing.qr)
+      /**
+       * 日志里**不写那个 6 位码**：它就是认领凭据本身，而 stdout 是会被翻出来贴进 issue 的
+       * 那种地方（`status.json` 的启动快照同样承诺不含 token，见 `src/pill/start.ts` 那一侧
+       * 的 status 快照口径）。排查只需要知道"经状态栏发出了一张码、是哪一版"——epoch 与长度
+       * 足够回答这两件事，且都不是凭据。
+       */
+      deps.log('配对码经状态栏发出', { epoch: epoch.slice(0, 8), tokenLength: pairing.token.length })
       json(response, 200, {
         state: 'ready',
-        epoch: pairingEpoch(pairing.qr),
+        epoch,
         token: pairing.token,
         expiresInMs: Math.max(0, pairing.expiresAt - Date.now()),
       })
@@ -246,16 +265,30 @@ export function pairImageHandler(deps: PillRouteDeps) {
         response.end()
         return
       }
+      if (request.method === 'HEAD') {
+        // HEAD 只回头：**跳过渲染**。原来这里照样编码一整张 PNG 再丢掉，
+        // 而探活的请求会按节拍打过来（2026-10-06 修）。Content-Length 也一并省掉——
+        // HEAD 允许不带它，要拿到它就得先渲染，那正是这一条要避免的事。
+        response.writeHead(200, {
+          'Content-Type': 'image/png',
+          // 一张码会被就地换掉（半程刷新、被手机用掉），所以绝不许缓存。
+          'Cache-Control': 'no-store',
+          ETag: `"${pairingEpoch(pairing.qr)}"`,
+        })
+        response.end()
+        return
+      }
       const png = await renderPairingPng(pairing.qr)
       response.writeHead(200, {
         'Content-Type': 'image/png',
         'Content-Length': png.length,
         // 一张码会被就地换掉（半程刷新、被手机用掉），所以绝不许缓存。
-        // ETag 给的是这一版的哈希，pill 拿它判断要不要重画，省掉撕票式的刷新。
+        // ETag 只是这一版的哈希（排错用）：**pill 判断"换没换码"靠的是 URL 上那个
+        // `?e=<epoch>`**，`<img>` 拿不到 ETag，响应本身也是 no-store。
         'Cache-Control': 'no-store',
         ETag: `"${pairingEpoch(pairing.qr)}"`,
       })
-      response.end(request.method === 'HEAD' ? undefined : png)
+      response.end(png)
     } catch (error) {
       json(response, 500, { error: String((error as Error)?.message ?? error).slice(0, 200) })
     }

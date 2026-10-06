@@ -31,7 +31,15 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../src/index.js'
-import { PAIR_IMAGE_ROUTE, PAIR_NEW_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE } from '../src/pill/routes.js'
+import {
+  PAIR_IMAGE_ROUTE,
+  PAIR_NEW_ROUTE,
+  PAIR_STATUS_ROUTE,
+  PAIR_UNPAIR_ROUTE,
+  registerPillRoutes,
+  type PillRouteDeps,
+} from '../src/pill/routes.js'
+import { startPill } from '../src/pill/start.js'
 
 /** 一眼假的 token：仓库里不许出现真凭据，这条只验形状（同 status.test.ts）。 */
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
@@ -516,10 +524,120 @@ test('pill 那四条挂上去的就是带守卫的那四条（接线，不是又
     // 那条 assert 钉的就是 version.ts 的兜底，别哪天把它变成 undefined 送上屏幕。
     assert.equal(shown.version, 'dev', `源码直跑的版本必须是 dev：${String(shown.version)}`)
 
-    // 凭据红线：发码那条的回答里不许出现 PSK / 配对 URI。
+    // 凭据红线：这条走的是**挂上去的**那条发码路由。此刻中继不可达，所以它回的是
+    // `unavailable`——那种回答本来就不含 token，把凭据断言跑在它上面是**空断言**
+    // （2026-10-06 修：那时候 `!ok.body.includes('psk')` 永远成立，因为它连 token 都没有）。
+    // 这里只钉"发不出码的回答恰好是这两个字段"；真正的凭据红线钉在下面
+    // 「凭据红线：真发码那一条回答里只有 token」那一条上（那里喂的是一张真码）。
+    assert.deepEqual(
+      Object.keys(JSON.parse(ok.body)).sort(),
+      ['reason', 'state'],
+      `发不出码的回答只该有这两个字段：${ok.body}`,
+    )
     assert.ok(!ok.body.includes('psk'), `回答里出现了 psk：${ok.body}`)
     assert.ok(!ok.body.includes('dshr:'), `回答里出现了配对 URI：${ok.body}`)
   } finally {
     withWeb.dispose()
   }
+})
+
+test('凭据红线：真发码（state:"ready"）那一条回答里只有 token，没有 psk / dshr: / 完整 URI', async () => {
+  // 用**与插件同一个注册入口**（`registerPillRoutes`）挂上四条，再打那条发码路由：
+  // 只差"中继可达"这一个条件——中继在这套夹具里故意不可达，所以真码由 deps 直接给。
+  const fakePsk = 'A'.repeat(64)
+  const fakeToken = '482913'
+  const fakeQr = `dshr:/p?v=1&s=ws://relay&n=host&psk=${fakePsk}&t=${fakeToken}`
+  const live = { qr: fakeQr, token: fakeToken, expiresAt: Date.now() + 60_000 }
+  const handlers = new Map<string, (request: unknown, response: unknown) => unknown>()
+  const web = {
+    register: (route: { path: string; handler: (request: unknown, response: unknown) => unknown }) => {
+      handlers.set(route.path, route.handler)
+      return () => handlers.delete(route.path)
+    },
+  }
+  const unregister = registerPillRoutes(web as never, {
+    ensureFresh: () => live,
+    current: () => live,
+    status: () => ({
+      relay: 'online',
+      paired: 0,
+      pairings: 0,
+      serverUrl: 'wss://relay.example.com:443/relay',
+      version: 'dev',
+      waiting: 0,
+      waitingOldestSec: 0,
+    }),
+    unpair: () => 0,
+    log: () => {},
+  } satisfies PillRouteDeps)
+  let status = 0
+  let body = ''
+  const res = {
+    writeHead: (code: number) => {
+      status = code
+    },
+    end: (chunk?: unknown) => {
+      body = typeof chunk === 'string' ? chunk : ''
+    },
+  }
+  try {
+    const handler = handlers.get(PAIR_NEW_ROUTE)
+    assert.ok(handler, '发码那条必须挂上')
+    await handler!({ method: 'POST', url: '/', headers: { host: '127.0.0.1:5173', 'x-drc-pair': '1' } }, res)
+  } finally {
+    unregister()
+  }
+  assert.equal(status, 200, body)
+  const answer = JSON.parse(body) as Record<string, unknown>
+  assert.equal(answer.state, 'ready', '前提：这一次真的发了一张码')
+  assert.equal(answer.token, fakeToken, '6 位码要给——弹窗上"或手输这 6 位数字"靠它')
+  assert.deepEqual(
+    Object.keys(answer).sort(),
+    ['epoch', 'expiresInMs', 'state', 'token'],
+    `真发码的回答只该有这四个字段：${body}`,
+  )
+  for (const secret of [fakePsk, fakeQr, 'psk', 'dshr:']) {
+    assert.ok(!body.includes(secret), `真发码的回答里出现了 ${secret}：${body}`)
+  }
+})
+
+test('startPill：stop() 之后 available 必须变 false——路由都摘了还说入口在，主插件就不再报 warn:pill', () => {
+  const registered: string[] = []
+  let unregistered = 0
+  const web = {
+    register: (route: { path: string }) => {
+      registered.push(route.path)
+      return () => {
+        unregistered += 1
+      }
+    },
+  }
+  const handle = startPill({ get: fakeGet({ webServer: web }) }, {
+    enabled: true,
+    ensureFresh: () => null,
+    current: () => null,
+    status: () => ({
+      relay: 'idle',
+      paired: 0,
+      pairings: 0,
+      serverUrl: 'ws://127.0.0.1:1',
+      version: 'dev',
+      waiting: 0,
+      waitingOldestSec: 0,
+    }),
+    unpair: () => 0,
+    log: () => {},
+  } satisfies PillRouteDeps & { enabled: boolean })
+  assert.equal(handle.available, true, '四条挂上了就该说可用')
+  assert.deepEqual(registered, [PAIR_NEW_ROUTE, PAIR_IMAGE_ROUTE, PAIR_STATUS_ROUTE, PAIR_UNPAIR_ROUTE])
+  handle.stop()
+  assert.equal(unregistered, 4, '停机要把四条一起注销')
+  assert.equal(
+    handle.available,
+    false,
+    'stop() 之后仍说可用 = 快照会说"配对入口在"，而它已经被摘干净了（表现是"配不了对且没人说为什么"）',
+  )
+  assert.equal(handle.probe.routes, 'registered', 'probe 里"起过"的留痕可以留，但 available 必须跟着停')
+  handle.stop() // 幂等：再停一次不许变回 true
+  assert.equal(handle.available, false)
 })

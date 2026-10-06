@@ -49,7 +49,15 @@ const PILL_ID = 'dsh-remote-control'
 const PILL_ORDER = 20
 
 const STYLE_ID = 'dsh-remote-control/pill.css'
+/**
+ * 插件名。**注入 `<style>` 时必须一起打上 `data-plugin`**：宿主按它认领"这份样式是谁插的"
+ * （`claimStyles`），只有 `data-plugin-css` 的话这份样式会被算到别的插件头上，
+ * 那个插件 HMR 时一句 `removeOwnedStyles` 就把整颗 pill 的配色一起删了（2026-10-06 修）。
+ */
+const PLUGIN_ID = 'dsh-remote-control'
 const POLL_MS = 2000
+/** 每条请求的硬超时：宿主卡住时请求必须自己收场，否则 2 秒一轮会叠成一串未决请求。 */
+const FETCH_TIMEOUT_MS = 3000
 
 interface SlotRegistry {
   inject(slotName: string, callback: () => void): unknown
@@ -235,7 +243,15 @@ export function relayAddress(url: unknown): string {
   const withoutScheme = url.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
   // authority 就是 scheme 之后、第一个 `/` 或 `?` 之前那一段。
   const authority = /^[^/?]*/.exec(withoutScheme)?.[0] ?? ''
-  return authority.slice(0, 40)
+  /**
+   * **userinfo 必须剥掉**（`user:pass@host` → `host`）。
+   *
+   * 2026-10-06 修：原来只按"scheme 之后、第一个 `/` 或 `?` 之前"切，`wss://user:pass@host/x`
+   * 会把 `user:pass@host` 整段印进面板——上面那句注释写的是"只留 host:port"，
+   * 而 userinfo 恰恰是这一段里唯一可能带凭据的东西。
+   */
+  const host = authority.replace(/^[^@]*@/, '')
+  return host.slice(0, 40)
 }
 
 /**
@@ -319,14 +335,16 @@ const CSS = `
 .drc-count { margin: 8px 0 0; text-align: center; color: var(--dsw-alias-label-secondary, #5f6368);
     font-size: 12px; font-variant-numeric: tabular-nums; }
   .drc-count[data-kind="urgent"] { color: var(--dsw-alias-state-warn-primary, #faad14); font-weight: 600; }
-  /* 离线那一屏的两行说明：第一行是结论，整块居中、不挤。 */
-  .drc-note-block { margin-top: 10px; }
   .drc-code { margin: 8px 0 0; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 2px; }
   /* 引导行：比 note 重一档（第一次用的人要看清），但不加图标不加底色——
      这一屏的主角是二维码，多一个色块就成了推销而不是引导。 */
   .drc-guide { margin: 8px 0 0; text-align: center; color: var(--dsw-alias-label-secondary, #5f6368); font-size: 12px; }
   .drc-note { margin: 4px 0 0; text-align: center; color: var(--dsw-alias-label-tertiary); }
 .drc-note[data-kind="failed"] { color: var(--dsw-alias-state-error-primary, #ff4d4f); }
+  /* 离线那一屏的第一行说明要跟上面那行拉开一点。**必须写在 .drc-note 之后**：
+     两者特异度相同（都只一个类），后来的赢——写在前面的 margin-top 会被
+     .drc-note 的 margin: 4px 0 0 整条覆盖成死规则（2026-10-06 修）。 */
+  .drc-note-block { margin-top: 10px; }
 `
 
 /** 认得出 slots 服务吗：`inject`（认领槽位）与 `register`（往里放组件）两个函数都得在。 */
@@ -405,15 +423,34 @@ function ensureStyle(doc: Document): void {
        * （2026-10-03 用户截图：抬头那颗按钮掉到第二行居中，那是上一版 `.drc-actions` 的
        * `justify-content: center` 在管事）。这一条就是那次事故的修法。
        */
+      // `data-plugin` 也补一次：上一版只打了 `data-plugin-css`，而宿主 `claimStyles`
+      // 只认 `data-plugin`——不补的话这份样式会被算到别的插件头上（见 PLUGIN_ID 的注释）。
+      existing.setAttribute('data-plugin', PLUGIN_ID)
       if (existing.textContent !== CSS) existing.textContent = CSS
       return
     }
     const element = doc.createElement('style')
+    // 两个属性都要：`data-plugin-css` 是我们自己的探针（按它找回来对齐内容），
+    // `data-plugin` 是**宿主**认领这份样式的凭据——少了它，别的插件 HMR 会把我们这份删掉。
     element.setAttribute('data-plugin-css', STYLE_ID)
+    element.setAttribute('data-plugin', PLUGIN_ID)
     element.textContent = CSS
     doc.head.appendChild(element)
   } catch (error) {
     warn('样式注入失败（pill 仍可用，只是没配色）', error)
+  }
+}
+
+/**
+ * 每条请求的超时信号。**拿不到 `AbortSignal.timeout` 就不带 signal**（老环境 / vm 夹具），
+ * 而不是让这里抛出去——它的调用方在降级路径上，抛出去等于把"宿主卡住"升级成"面板坏了"。
+ */
+function requestSignal(): AbortSignal | undefined {
+  try {
+    const timeouts = (globalThis as { AbortSignal?: { timeout?: (ms: number) => AbortSignal } }).AbortSignal
+    return typeof timeouts?.timeout === 'function' ? timeouts.timeout(FETCH_TIMEOUT_MS) : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -454,6 +491,15 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   let view: PanelView = { kind: 'info' }
   let expiresInMs = 0
   let lastStatus: StatusAnswer | undefined
+  /** 面板开着等首次 `/status`：这段时间**一颗码都不发**（见 `openPanel` 那条注释）。 */
+  let awaitingStatus = false
+  /** 轮询的 in-flight 守卫：上一发还没落地时，下一拍不再发（宿主卡住时才不会叠请求）。 */
+  let polling = false
+  /** 倒计时那一行的文本节点；每秒那一拍只改它，不整块重画面板（见 `paintCountdown`）。 */
+  let countNode: HTMLElement | undefined
+  /** 二维码那张 `<img>` 与它的 src：同一个 src 复用同一个元素（见 `qrImage`）。 */
+  let imageNode: HTMLImageElement | undefined
+  let imageSrc = ''
   let disposed = false
 
   /** 面板上那颗按钮的文案要跟着抬头那句走，所以这里读的是同一份轮询结果。 */
@@ -464,6 +510,46 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
    * （抬头、按钮身份、点开发不发码、配好后翻不翻面）全都会说「未配对」。
    */
   const pairingNow = (): number => pairingCount(lastStatus)
+
+  /**
+   * 降级留痕：**注入的出口优先**，没接上才退回本文件那个 `warn()`。只写一处出口，
+   * 免得同一条降级在控制台里出现两遍。
+   *
+   * `deps.warn` 曾经是个死参数：`buildPill` 的唯一生产调用点（`mountPill`）只传了
+   * `fetchImpl`，于是"status 路由没挂上"这类降级在页面上一声不响（2026-10-06 修）。
+   */
+  const degrade = (message: string, error?: unknown): void => {
+    if (!deps.warn) {
+      warn(message, error)
+      return
+    }
+    try {
+      const detail = error instanceof Error ? error.message : error === undefined ? '' : String(error)
+      deps.warn(`${message} ${detail}`.trim())
+    } catch {
+      /* 出口自己抛了也不能连累页面 */
+    }
+  }
+
+  /**
+   * 每条请求都带 3 秒硬超时（`AbortSignal.timeout`）。
+   *
+   * 2026-10-06 修：原来所有 fetch 都没有超时，而轮询是 2 秒一拍——宿主转发层卡住时
+   * 表现是"每 2 秒叠一个永远不会落地的请求"，尾延迟越叠越长。
+   */
+  const fetchWithTimeout = (input: string, init: Record<string, unknown>): Promise<unknown> => {
+    const signal = requestSignal()
+    return deps.fetchImpl(input, signal ? { ...init, signal } : init)
+  }
+
+  /** 离开二维码那一屏时倒计时必须停：留着就是一个每秒还在重画的孤儿定时器。 */
+  const stopCountdown = (): void => {
+    if (countTimer !== undefined) {
+      clearInterval(countTimer)
+      countTimer = undefined
+    }
+    expiresInMs = 0
+  }
 
   const write = (): void => {
     const next = pillLabel(lastStatus)
@@ -505,11 +591,50 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
    * 现在剩余秒数一直在码的旁边，最后 30 秒还会变重（见 CSS 的 `data-kind`）。
    */
   const countdown = (): HTMLElement | null => {
+    // 每次重画都换一个新节点，所以旧引用必须先清掉：`paintCountdown` 只认最新那一个。
+    countNode = undefined
     if (view.kind !== 'qr') return null
     if (expiresInMs <= 0) return null
     const node = text('p', 'drc-count', `${secondsText(expiresInMs)}后过期`)
     if (expiresInMs <= 30_000) node.setAttribute('data-kind', 'urgent')
+    countNode = node
     return node
+  }
+
+  /**
+   * 倒计时那一拍：**只改这一行的文本**，不重画面板。
+   *
+   * 2026-10-06 修：原来每秒 `paint()` 一次，而 `paint()` 是 `panel.replaceChildren()`
+   * 整块重建——`<img>` 跟着被换掉，`/pairing.png` 又是 `no-store`，于是**每秒重新请求
+   * 并让服务端重新编码一整张 PNG**。现在每秒只有这一行文本在动，码与图原地不动；
+   * 只有走完最后 1 秒（那屏的话要改口）才整块重画一次，而那一刻 `<img>` 仍按 src 复用
+   * （见 `qrImage`），所以还是不会多请求一张图。
+   */
+  const paintCountdown = (): void => {
+    if (!panel || view.kind !== 'qr') return
+    const node = countNode
+    if (!node) {
+      paint()
+      return
+    }
+    node.textContent = `${secondsText(expiresInMs)}后过期`
+    if (expiresInMs <= 30_000) node.setAttribute('data-kind', 'urgent')
+  }
+
+  /**
+   * 二维码那张图。**同一个 src 复用同一个元素**：`/pairing.png` 是 `no-store`，
+   * 每新建一个 `<img>` 都必然重新请求、服务端重新编码一整张 PNG。
+   * 换码时 src 里那个 `?e=<epoch>` 会变，那时才建新元素——那时本来就该取新图。
+   */
+  const qrImage = (src: string): HTMLElement => {
+    if (imageNode && imageSrc === src) return imageNode
+    const image = doc.createElement('img')
+    image.className = 'drc-qr'
+    image.setAttribute('alt', '配对二维码')
+    image.src = src
+    imageNode = image
+    imageSrc = src
+    return image
   }
 
   /**
@@ -594,7 +719,9 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     panel.replaceChildren()
     panel.appendChild(header())
     if (view.kind === 'loading') {
-      panel.appendChild(text('p', 'drc-note', '正在生成配对码'))
+      // 两种 loading：等首次 `/status`（还没决定该不该发码）与正在发码。分开说，
+      // 因为"正在生成配对码"在等状态那几百毫秒里是句假话（那时一个请求都还没发）。
+      panel.appendChild(text('p', 'drc-note', awaitingStatus ? '正在读取主机状态' : '正在生成配对码'))
     } else if (view.kind === 'offline') {
       // 中继不在线：二维码这一屏整个不画。
       //
@@ -607,11 +734,9 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     } else if (view.kind === 'qr') {
       const count = countdown()
       if (count) panel.appendChild(count)
-      const image = doc.createElement('img')
-      image.className = 'drc-qr'
-      image.setAttribute('alt', '配对二维码')
-      image.src = view.imageSrc
-      panel.appendChild(image)
+      // 图按 src 复用：整块重画（倒计时走完那一拍、每 2 秒的轮询）都不该让浏览器重新
+      // 请求一次 `/pairing.png`——那条路由是 no-store，新元素必然回源并重新编码。
+      panel.appendChild(qrImage(view.imageSrc))
       // 第一次用的人唯一需要的那句话：这码是给谁扫的、扫完得到什么。
       // 一条、短、不带符号——侵入性比弹一次模态框小，但同样把人领进门
       // （2026-10-05 用户定的口径：引导但不侵入，文案要短）。
@@ -641,10 +766,10 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   }
 
   const closePanel = (): void => {
-    if (countTimer !== undefined) {
-      clearInterval(countTimer)
-      countTimer = undefined
-    }
+    // 关面板要连倒计时一起收（`stopCountdown` 顺带把 expiresInMs 归零：
+    // 再点开时那一屏要么重新发码、要么是状态页，都不该读到上一张码的剩余时间）。
+    awaitingStatus = false
+    stopCountdown()
     if (panel) {
       panel.remove()
       panel = undefined
@@ -652,14 +777,40 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     button.setAttribute('aria-expanded', 'false')
   }
 
+  /**
+   * 面板点开时该进哪一屏——**只在已经有 `/status` 结果时才走这里**（没有结果时见 `openPanel`）。
+   *
+   * 顺序就是优先级：中继不在线 → 只给说明（发出去也是死码）；已配对（读密钥簿）→ 只给状态，
+   * **一次码都不发**；其余（真没配上）→ 要一张码，那是这一屏唯一的内容。
+   */
+  const openPanelView = (): void => {
+    const relay = lastStatus?.relay
+    if (relay !== undefined && relay !== 'online') {
+      stopCountdown()
+      view = { kind: 'offline' }
+      paint()
+      return
+    }
+    if (pairingNow() > 0) {
+      stopCountdown()
+      view = { kind: 'info' }
+      paint()
+      return
+    }
+    void requestPairing()
+  }
+
   async function requestPairing(): Promise<void> {
     if (disposed || !panel) return
+    // 到这里面板已经自己决定了这一屏（loading / 二维码 / 说明），等首次状态那件事结束了。
+    awaitingStatus = false
     // 中继不在线就**根本不发码**：旧实现在这里也会打一个 POST，路由回
     // `state:"unavailable"`，于是同一件事在两条路上各判一次（客户端还要猜
     // `reason` 的字符串）。"现在不可能有码"这件事轮询里早就知道——2 秒一次的
     // `lastStatus.relay`，用它拦在发请求之前，用户看到的是"主机还没连上中继"
     // 而不是一张必然扫不出来的码（2026-10-05 线上取证，见 offline 分支的注释）。
     if (lastStatus && lastStatus.relay !== 'online' && lastStatus.relay !== undefined) {
+      stopCountdown()
       view = { kind: 'offline' }
       paint()
       return
@@ -672,7 +823,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       // 那个 `x-drc-pair` 头是**这条请求的 CSRF 判据**，不是装饰：桌面宿主会删掉转发请求的
       // `origin`，所以"Origin 必须存在"在真机上永远不成立（2026-10-03 那颗 pill 就是这么撞 403 的）。
       // 自定义头则只有同源脚本发得出——跨站要带它必然触发 CORS 预检，而这条服务不答应预检。
-      const response = (await deps.fetchImpl(NEW_ROUTE, {
+      const response = (await fetchWithTimeout(NEW_ROUTE, {
         method: 'POST',
         headers: { 'x-drc-pair': '1' },
         credentials: 'same-origin',
@@ -680,26 +831,40 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       httpStatus = typeof response?.status === 'number' ? response.status : 0
       answer = (await response?.json?.()) as NewAnswer | undefined
     } catch (error) {
+      stopCountdown()
       view = { kind: 'failed', detail: error instanceof Error ? error.message : String(error) }
       paint()
       return
     }
     if (disposed || !panel) return
     view = panelViewFor(answer, httpStatus)
-    if (view.kind === 'qr') {
-      expiresInMs = view.expiresInMs
-      if (countTimer === undefined) {
-        countTimer = setInterval(() => {
-          expiresInMs -= 1000
-          // 到点**换一张的能力没有了**（2026-10-03 拍板）：不自动补、也没有「换一张」按钮。
-          // 停表并就地把它说成"已过期"，重发与否由人再按一次那颗按钮决定。
-          if (expiresInMs <= 0) {
-            clearInterval(countTimer)
-            countTimer = undefined
-          }
+    if (view.kind !== 'qr') {
+      /**
+       * 非二维码的结果（`unavailable` / `failed`）：**倒计时必须停**。
+       *
+       * 2026-10-06 修：这条路上原来不清 `countTimer`，从二维码页切到"发不出码/失败"之后
+       * 那个定时器还在每秒跑 `paint()`——一个孤儿节拍，屏上早已没有码可倒计时。
+       */
+      stopCountdown()
+      paint()
+      return
+    }
+    expiresInMs = view.expiresInMs
+    if (countTimer === undefined) {
+      countTimer = setInterval(() => {
+        expiresInMs -= 1000
+        // 到点**换一张的能力没有了**（2026-10-03 拍板）：不自动补、也没有「换一张」按钮。
+        // 停表并就地把它说成"已过期"，重发与否由人再按一次那颗按钮决定。
+        if (expiresInMs <= 0) {
+          clearInterval(countTimer)
+          countTimer = undefined
+          // 走完最后 1 秒才整块重画这一屏（note 要改口"已过期"）。这一拍 `<img>` 仍按
+          // src 复用，所以不会多向 `/pairing.png` 要一张——每秒重画的问题见 `paintCountdown`。
           paint()
-        }, 1000)
-      }
+          return
+        }
+        paintCountdown()
+      }, 1000)
     }
     paint()
   }
@@ -711,37 +876,17 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
    * （轮询是 2 秒节拍，等它会让"按下没反应"成为错觉）。随后立刻补一次真轮询对账，
    * 万一宿主那边没作废掉（比如守卫拒了），下一次轮询会把真相带回来。
    */
-  /**
-   * 面板开着的时候，中继掉了要**当场**把二维码那屏换成 offline——
-   * 否则用户手里捏着一张已经发不出去的码，而它看上去和好码一模一样。
-   * 轮询（2 秒一次）已经在跑，这里只是它每次回来时多做一次判断。
-   */
-  const syncOfflineView = (): void => {
-    if (!panel) return
-    if (view.kind !== 'qr') return
-    if (!lastStatus) return
-    const relay = lastStatus.relay
-    if (relay === undefined || relay === 'online') return
-    view = { kind: 'offline' }
-    if (countTimer !== undefined) {
-      clearInterval(countTimer)
-      countTimer = undefined
-    }
-    expiresInMs = 0
-    paint()
-  }
-
   async function requestUnpair(): Promise<void> {
     if (disposed || !panel) return
     try {
       // 与发码同一条守卫：这是写路由，桌面宿主会删 `origin`，所以判据是那个自定义头。
-      await deps.fetchImpl(UNPAIR_ROUTE, {
+      await fetchWithTimeout(UNPAIR_ROUTE, {
         method: 'POST',
         headers: { 'x-drc-pair': '1' },
         credentials: 'same-origin',
       })
     } catch (error) {
-      warn('退出配对请求失败（面板会靠下一次轮询对账）', error)
+      degrade('退出配对请求失败（面板会靠下一次轮询对账）', error)
     }
     if (disposed || !panel) return
     // 配对簿同时清零：`POST /unpair` 作废的就是全部通道（会话簿里一条不剩），
@@ -782,17 +927,20 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
      *
      * `POST /pairing/new` 是幂等的：码还活着就还是那一张，所以下面这句在"重复点开"时
      * 不会把 pending 表堆成一串码。
+     *
+     * **首次 `/status` 还没落地时（点开比第一拍轮询还早）不走上面任何一支**：那一刻
+     * `pairingNow()` 恒为 0，直接发码会让**已配对的主机**也 POST `/pairing/new`，
+     * 服务端真发一张新码——上面那句"已配对时点开一次码都不发"当场作废
+     * （2026-10-06 修）。这时先画 loading、一颗码都不发，等首次轮询结果（≤2 秒）
+     * 回来再由 `settlePanel()` 按同一套优先级决定进哪一屏。
      */
-    // 中继不在线时**不点开就是死码页**：openPanel 一开始就走 offline 那一支。
-    // （旧行为是先打一个 POST 再收到 unavailable，白绕一圈还要客户端猜字符串。）
-    if (lastStatus && lastStatus.relay !== undefined && lastStatus.relay !== 'online') {
-      view = { kind: 'offline' }
-      paint()
-    } else if (pairingNow() > 0) {
-      view = { kind: 'info' }
+    if (!lastStatus) {
+      awaitingStatus = true
+      view = { kind: 'loading' }
       paint()
     } else {
-      void requestPairing()
+      // 中继不在线时**点开就是说明页**：那几条分支都在 openPanelView 里。
+      openPanelView()
     }
     try {
       panel.focus()
@@ -824,43 +972,95 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     if (event.key === 'Escape') closePanel()
   }
 
+  /**
+   * 轮询回来时把面板对齐到最新状态。
+   *
+   * **面板开着就重画**（2 秒一次，成本可控：文本节点重建，`<img>` 按 src 复用）——
+   * 2026-10-06 修：原来只有 `qr → offline` 与 `qr → info` 两个跃迁会重画，普通状态变化
+   * （在线↔断线、配对数、待处理数）只更新那颗 pill，面板抬头与正文几行停在旧值上，
+   * 与 `header()` 那句"面板开着时轮询一回来这句话就跟着变"正好相反。
+   */
+  const settlePanel = (): void => {
+    if (!panel || !lastStatus) return
+    if (view.kind === 'qr') {
+      const relay = lastStatus.relay
+      if (relay !== undefined && relay !== 'online') {
+        // 中继掉了：二维码那一屏整个换成说明——用户手里那张码已经发不出去，
+        // 而它看上去和好码一模一样（2026-10-05 线上取证）。
+        stopCountdown()
+        view = { kind: 'offline' }
+      } else if (pairingNow() > 0) {
+        // 手机上刚扫完码：那张码配上之后就没用了，继续占着面板会让人以为"还没成功、再扫一次"。
+        stopCountdown()
+        view = { kind: 'info' }
+      }
+      paint()
+      return
+    }
+    if (awaitingStatus) {
+      // 等首次 `/status` 的那一屏：现在才知道该不该发码（见 `openPanel`）。
+      awaitingStatus = false
+      openPanelView()
+      return
+    }
+    paint()
+  }
+
+  /**
+   * 首次 `/status` 就失败（路由没挂上就是 404）时，等状态那一屏必须落地。
+   *
+   * 停在"正在生成配对码"上会让人一直等一个永远不会来的东西。这里**不发码**：
+   * 连状态都读不到时 `pairingNow()` 是不是 0 无从判断，而"已配对的主机不该白吃一张新码"
+   * 这条不能被"读不到状态"绕过。
+   */
+  const settleFailedStatus = (reason: string): void => {
+    if (!panel || !awaitingStatus) return
+    awaitingStatus = false
+    stopCountdown()
+    view = { kind: 'failed', detail: `读不到主机状态（${reason}）` }
+    paint()
+  }
+
   async function pollStatus(): Promise<void> {
-    if (disposed) return
+    // `polling` 是 in-flight 守卫：宿主卡住时上一发还没落地，下一拍不许再叠一个（2026-10-06 修）。
+    if (disposed || polling) return
     try {
       if (doc.visibilityState === 'hidden') return
     } catch {
       /* 拿不到可见性就照常轮询 */
     }
+    polling = true
     try {
-      const response = (await deps.fetchImpl(`${STATUS_ROUTE}?t=${Date.now()}`, {
+      const response = (await fetchWithTimeout(`${STATUS_ROUTE}?t=${Date.now()}`, {
         headers: { accept: 'application/json' },
         credentials: 'same-origin',
       })) as { status?: number; json?(): Promise<unknown> } | undefined
-      if (!response || response.status !== 200) return
-      const body = (await response.json?.()) as StatusAnswer | undefined
-      if (!body || typeof body !== 'object') return
-      lastStatus = body
-      // 中继掉了：二维码那屏当场换成 offline（见 syncOfflineView 的注释）。
-      syncOfflineView()
-      /**
-       * 手机上刚扫完码：面板若还停在二维码上，当场翻回状态视图。
-       *
-       * 那一张码配上之后就没用了，继续占着面板会让人以为"还没成功、再扫一次"，而且抬头那句
-       * 已经翻成 `已配对`、右上角那颗也该换成 `退出配对` 了（2026-10-03 用户按真屏幕要的）。
-       */
-      if (view.kind === 'qr' && pairingNow() > 0) {
-        view = { kind: 'info' }
-        if (countTimer !== undefined) {
-          clearInterval(countTimer)
-          countTimer = undefined
-        }
-        if (panel) paint()
+      if (!response || response.status !== 200) {
+        /**
+         * 路由没挂上时是持续的 404：这是一条降级说明，不是故障——**但必须留痕**。
+         *
+         * 2026-10-06 修：原来这里静默 `return`，一行 warn 都没有，于是"那颗 pill 一动不动"
+         * 在现场没有任何线索；`deps.warn` 这个出口在生产里也从没接上过（见 `mountPill`）。
+         */
+        const reason = `HTTP ${typeof response?.status === 'number' ? response.status : 'no response'}`
+        degrade(`status poll failed（${reason}）`)
+        settleFailedStatus(reason)
+        return
       }
+      const body = (await response.json?.()) as StatusAnswer | undefined
+      if (!body || typeof body !== 'object') {
+        degrade('status poll failed（回答不是对象）')
+        settleFailedStatus('回答不是对象')
+        return
+      }
+      lastStatus = body
+      settlePanel()
       write()
     } catch (error) {
-      // 路由没挂上时是持续的 404/失败：这是一条降级说明，不是故障。
-      deps.warn?.('status poll failed')
-      warn('status poll failed（pill 会停在默认文案上）', error)
+      degrade('status poll failed（pill 会停在默认文案上）', error)
+      settleFailedStatus('请求失败')
+    } finally {
+      polling = false
     }
   }
 
@@ -917,6 +1117,15 @@ export function mountPill(ctx: PillHost, createElement: CreateElement | undefine
         ;(element as HTMLElement).style.position = 'relative'
         cleanup = buildPill(element, {
           fetchImpl: (input, init) => globalThis.fetch(input, init as RequestInit | undefined),
+          // 降级留痕的出口：不接上它，"status 路由没挂上"这类降级在页面上就一声不响
+          // （`deps.warn` 在那之前是个死参数，2026-10-06 修）。
+          warn: (message) => {
+            try {
+              console.warn(`[dsh-remote-control pill] ${message}`)
+            } catch {
+              /* 控制台也可能不可用 */
+            }
+          },
         })
       } else if (cleanup) {
         cleanup()

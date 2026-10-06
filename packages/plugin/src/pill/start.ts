@@ -143,7 +143,13 @@ export function startPill(ctx: LooseContext, deps: PillRouteDeps & { enabled: bo
     stop,
     probe,
     get available() {
-      return started && probe.routes === 'registered'
+      /**
+       * `!stopped` 不能省（2026-10-06 修）：`started` 与 `probe.routes` 都是"起过"的痕迹，
+       * `stop()` 不会把它们抹掉——少了这一条，停掉之后仍报 `available: true`，
+       * 而主插件正是拿它决定要不要报那条 `warn:pill`（`src/index.ts`），
+       * 表现就是"路由已经摘干净了，快照还说配对入口在"。
+       */
+      return !stopped && started && probe.routes === 'registered'
     },
   }
 }

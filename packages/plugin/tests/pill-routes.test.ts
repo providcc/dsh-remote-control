@@ -13,8 +13,12 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
+  hostIsLoopback,
   pairingEpoch,
   PAIR_IMAGE_ROUTE,
   PAIR_NEW_ROUTE,
@@ -198,8 +202,18 @@ test('跨站 Origin、`null` 来源与非环回 Host 都 → 403，各自报出�
     [{ ...LOOPBACK, origin: 'https://evil.example.com' }, 'origin-not-trusted'],
     [{ ...LOOPBACK, origin: 'null' }, 'origin-not-trusted'],
     [{ ...LOOPBACK, origin: 'not a url' }, 'origin-not-trusted'],
+    // 自定义 scheme 走**白名单**：只有宿主自己的 `dsh-app:` 算"自己"。
+    // 原来那条判据是"非 http(s) 一律放行"，于是别的浏览器扩展（跨站写请求发得出那个自定义头）
+    // 只要带个 chrome-extension:// 的 Origin 就能过（2026-10-06 修）。
+    [{ ...LOOPBACK, origin: 'chrome-extension://cnncmdfpacgibcdjkceegbjkkboijfhl' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'file://' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'data:text/html,<h1>x</h1>' }, 'origin-not-trusted'],
+    [{ ...LOOPBACK, origin: 'dsh-app-evil://app' }, 'origin-not-trusted'],
     [{ ...LOOPBACK, host: 'evil.example.com' }, 'host-not-loopback'],
     [{ host: 'attacker.local:8787', origin: 'http://localhost:8787', 'x-drc-pair': '1' }, 'host-not-loopback'],
+    // 缺 Host 头：不是"环回"，不许当自己人（代理/畸形请求的形状）。
+    [{ 'x-drc-pair': '1' }, 'host-not-loopback'],
+    [{ 'x-drc-pair': '1', origin: 'http://127.0.0.1:19387' }, 'host-not-loopback'],
   ]
   for (const [headers, guard] of cases) {
     const d = deps()
@@ -211,12 +225,74 @@ test('跨站 Origin、`null` 来源与非环回 Host 都 → 403，各自报出�
   }
 })
 
+test('只读那两条同样认这套白名单：chrome-extension / 缺 Host / 非环回 Host 都拒', async () => {
+  const cases: Array<[Record<string, string>, number]> = [
+    [{ host: '127.0.0.1:19387' }, 200],
+    [{ host: '127.0.0.1:19387', origin: 'chrome-extension://cnncmdfpacgibcdjkceegbjkkboijfhl' }, 403],
+    [{ host: '127.0.0.1:19387', origin: 'null' }, 403],
+    [{}, 403],
+    [{ host: '[::1]:19387' }, 200],
+    [{ host: '[fe80::1]:19387' }, 403],
+  ]
+  for (const [headers, expected] of cases) {
+    const image = response()
+    await pairImageHandler(deps())(request('GET', headers), image.res)
+    assert.equal(image.reply().status, expected, `图片路由 ${JSON.stringify(headers)}`)
+    const status = response()
+    await pillStatusHandler(deps())(request('GET', headers), status.res)
+    assert.equal(status.reply().status, expected, `状态路由 ${JSON.stringify(headers)}`)
+  }
+})
+
+test('IPv6 方括号那一支：`[::1]` 是环回，畸形方括号（缺 `]` / 端口不是数字）不是', () => {
+  // 这一段是手写解析（不用 `new URL`）：方括号分支写错的表现是"IPv6 环回被当成外站"，
+  // 而那在真机上是整颗 pill 点不动。
+  const loopback = ['[::1]:19387', '[::1]', '[::1]:0', '::1', '127.0.0.1:19387', 'localhost:19387']
+  for (const host of loopback) assert.equal(hostIsLoopback(host), true, `${host} 应当算环回`)
+  const foreign = ['[fe80::1]:19387', '[::1', '[::1]evil:80', '[::1]:notaport', 'evil.example.com', '', undefined]
+  for (const host of foreign) assert.equal(hostIsLoopback(host), false, `${String(host)} 不该算环回`)
+})
+
 test('中继不在线：200 + state:"unavailable"，不是 500（pill 要能显示"未连接"）', async () => {
   const d = deps({ ensureFresh: () => null })
   const { res, reply } = response()
   await pairNewHandler(d)(request('POST', LOOPBACK), res)
   assert.equal(reply().status, 200)
   assert.deepEqual(JSON.parse(reply().body), { state: 'unavailable', reason: 'relay-offline' })
+})
+
+test('ensureFresh() 自己抛错 → 500 且不外抛到宿主，回答里带上截断后的原因', async () => {
+  // 中继那边炸了不该表现成"整条路由把异常抛进宿主"，也不该回一个空白回答让 pill 卡在 loading 上。
+  const d = deps({
+    ensureFresh: () => {
+      throw new Error('中继 socket 已经拆了')
+    },
+  })
+  const { res, reply } = response()
+  await pairNewHandler(d)(request('POST', LOOPBACK), res)
+  assert.equal(reply().status, 500)
+  assert.match(JSON.parse(reply().body).error, /中继 socket/)
+})
+
+test('stdout 日志里不许出现那个 6 位码（token 就是认领凭据，stdout 会被贴进 issue）', async () => {
+  const logged: Array<Record<string, unknown>> = []
+  const d = deps({
+    log: (_message, fields) => {
+      logged.push({ ...(fields ?? {}) })
+    },
+  })
+  const { res, reply } = response()
+  await pairNewHandler(d)(request('POST', LOOPBACK), res)
+  assert.equal(reply().status, 200, '前提：这一次真发了一张码')
+  assert.ok(logged.length > 0, '发码要留一条日志')
+  const raw = JSON.stringify(logged)
+  assert.ok(!raw.includes(FAKE_TOKEN), `日志里出现了 6 位码本身：${raw}`)
+  assert.ok(!raw.includes('token:'), `日志字段名不许叫 token：${raw}`)
+  // 排查要的两件事还在：知道"发出去了"与"是哪一版码"。
+  assert.ok(
+    logged.some((fields) => typeof fields.epoch === 'string' || typeof fields.tokenLength === 'number'),
+    `日志要留下非凭据的标识（epoch / 长度）：${raw}`,
+  )
 })
 
 // ── GET /pairing.png ────────────────────────────────────────────────
@@ -256,12 +332,31 @@ test('图片路由只读：Origin 缺席放过，但非环回 Host 仍拒', asyn
   assert.equal(b.reply().status, 403)
 })
 
-test('HEAD 不写 body（宿主可能用它探活）', async () => {
+test('HEAD 不写 body（宿主可能用它探活），而且**跳过渲染**：编不出来的一张码照样 200', async () => {
   const d = deps()
   const { res, reply } = response()
   await pairImageHandler(d)(request('HEAD', { host: '127.0.0.1:19387' }), res)
   assert.equal(reply().status, 200)
   assert.equal(reply().raw.length, 0, 'HEAD 连一个字节都不该写出去')
+
+  // 反证：这一版码的 QR 容量超限、`renderPairingPng` 必抛（同一个 deps 上 GET 就是 500）。
+  // HEAD 若走了渲染，这里也会是 500——插件探活时白烧一次 PNG 编码。
+  const overflow: LivePairing = { qr: 'x'.repeat(20_000), token: FAKE_TOKEN, expiresAt: Date.now() + 60_000 }
+  const head = response()
+  await pairImageHandler(deps({ current: () => overflow }))(request('HEAD', { host: '127.0.0.1:19387' }), head.res)
+  assert.equal(head.reply().status, 200, 'HEAD 必须跳过渲染')
+  const get = response()
+  await pairImageHandler(deps({ current: () => overflow }))(request('GET', { host: '127.0.0.1:19387' }), get.res)
+  assert.equal(get.reply().status, 500, '前提：这张码 GET 一定编不出来')
+})
+
+test('图片路由只接受 GET/HEAD：POST 等写方法 → 405，且不去读当前码', async () => {
+  const d = deps()
+  const { res, reply } = response()
+  await pairImageHandler(d)(request('POST', { host: '127.0.0.1:19387' }), res)
+  assert.equal(reply().status, 405)
+  assert.deepEqual(JSON.parse(reply().body), { error: 'method not allowed' })
+  assert.equal(d.calls.current, 0, '被拒的请求不该已经去读当前码')
 })
 
 test('渲染抛错 → 500 且带截断后的原因，不抛到宿主', async () => {
@@ -480,4 +575,16 @@ test('反证：环回主机名这份表只有一份，写路由与只读那条�
   }
   // 而这一条钉住的是本轮真机那个结论：**谁把"Origin 必须存在"加回来，上面那条
   // "Origin 缺席 + 带自定义头 → 200" 就会立刻红**——不是判据松了，是那颗 pill 又点不动了。
+})
+
+test('反证：不再宣称"pill 拿 ETag 判断要不要重画"（`<img>` 拿不到响应头，而且响应是 no-store）', () => {
+  // ETag 本身留着（排错有用），错的是那句注释给后来的人指了一条不成立的路：
+  // 浏览器面判"换没换码"靠的是图片 URL 上那个 `?e=<epoch>`，不是响应头。
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  // 产物在 `dist/tests/`，所以源码要往上两层（`client-bundle.test.ts` 那条同款）。
+  const routes = readFileSync(path.join(here, '..', '..', 'src', 'pill', 'routes.ts'), 'utf8')
+  const client = readFileSync(path.join(here, '..', '..', 'client', 'src', 'pill.ts'), 'utf8')
+  assert.doesNotMatch(routes, /pill 拿它判断要不要重画/, '那句注释是误导：`<img>` 拿不到 ETag，响应还是 no-store')
+  assert.doesNotMatch(client, /headers\.get\(/, '浏览器面从来没读过响应头，别照那句注释去实现')
+  assert.match(routes, /ETag: `"\$\{pairingEpoch\(pairing\.qr\)\}"`/, 'ETag 留着（排错用），只是不再宣称有人读它')
 })
