@@ -29,7 +29,7 @@ import type {
   QuestionItem,
   SessionSummary,
 } from 'dsh-remote-wire'
-import { appendFileNote, saveFileAttachments } from '../shell/uploads.js'
+import { appendFileNote, MAX_ATTACH_TOTAL_BYTES, saveFileAttachments } from '../shell/uploads.js'
 import {
   keepAwakeState,
   messageDelta,
@@ -62,8 +62,6 @@ export interface RuntimeTransport {
   hasClient(conversationId: string): boolean
   /** 当前活跃的配对会话 id。 */
   conversationIds(): string[]
-  /** 把一条会话标为不可用（复核 R1：解不开/没人接时主动作废）。 */
-  voidConversation?(conversationId: string): void
 }
 
 export interface RuntimeOptions {
@@ -163,7 +161,10 @@ export class HostRuntime {
    * 用户实测到的串台（space-bunny-free 显示成 muse-spark）就是它。
    * 这里只缓存内核**为这条会话**报过的值，所以补发的是真的，且不会串台。
    *
-   * 内存天然有界：`pushSessions` 里按当前会话列表裁剪，LISTING_LIMIT 上限 100。
+   * 内存有界靠**容量上限**（`rememberModel` 的 MODEL_CACHE_MAX），
+   * **刻意不按会话列表裁剪**：列表是 LIMIT 截断的，一条跑过模型的会话掉出前 100
+   * 就被删的话，"打开一条旧会话模型是空的"会换个原因复发（理由见 `rememberModel`）。
+   * 代价是缓存里可能留着已不在列表里的会话，所以 `replayModels` 补发前自己求交。
    */
   private readonly modelBySession = new Map<string, { model: string; provider?: string }>()
   private started = false
@@ -187,18 +188,38 @@ export class HostRuntime {
   /** 挂接内核。任何一步失败都只降级，不抛（外层 apply() 的红线）。 */
   start(): void {
     if (this.started) return
-    this.started = true
+    /**
+     * **两步都成功之后才置 `started`**（2026-10-06）。
+     *
+     * 原来 `started = true` 在第一步之前，`attachInteractionSink` 又在这段 try 之外：
+     * 它一抛，这条 runtime 就"半启动且不可重试"——`start()` 下次直接 return，
+     * 表现是手机上永远没有审批/提问卡，而 status.json 里 carrier 一切正常。
+     * 订阅上了而 sink 抛出的那一档要把订阅退掉再返回，否则下一次 start() 会叠出两份订阅。
+     */
     try {
       this.unsubscribe = this.kernel.subscribe((event) => this.onKernelEvent(event))
     } catch (error) {
       this.log('kernel subscribe failed', { message: messageOf(error) })
+      return
     }
-    const detach = this.kernel.attachInteractionSink?.({
-      approval: (info) => this.onApprovalRequest(info),
-      question: (info) => this.onQuestionRequest(info),
-    })
-    if (detach) this.detachSink = detach
-    void this.pushSessions('start')
+    try {
+      const detach = this.kernel.attachInteractionSink?.({
+        approval: (info) => this.onApprovalRequest(info),
+        question: (info) => this.onQuestionRequest(info),
+      })
+      if (detach) this.detachSink = detach
+    } catch (error) {
+      this.log('kernel attach failed, will retry on the next start', { message: messageOf(error) })
+      try {
+        this.unsubscribe?.()
+      } catch {
+        /* 退订是尽力而为 */
+      }
+      this.unsubscribe = undefined
+      return
+    }
+    this.started = true
+    void this.pushSessions('start').catch(() => {})
     this.refreshTimer = this.clock.setTimeout(() => this.refreshLoop(), this.options.listingRefreshMs)
   }
 
@@ -217,7 +238,10 @@ export class HostRuntime {
       this.clock.clearTimeout(this.mergeTimer)
       this.mergeTimer = undefined
     }
-    for (const [id] of [...this.pending]) this.settle(id, undefined)
+    // 停机时**必须带 voidAs**：这一帧是手机上那张卡唯一的收场信号。停机顺序是
+    // `runtime.stop()` → `relay.stop()`（见 index.ts），此刻通道还活着，发得出去；
+    // 不带的话（原来就是这样）卡片一直亮到 TTL 走完，用户对着一个没人处理的审批干等。
+    for (const [id] of [...this.pending]) this.settle(id, undefined, 'withdrawn')
   }
 
   /** 手机发来的命令。`conversationId` 是配对通道 id，与载荷里的 sessionId 不是一回事（F3）。 */
@@ -266,6 +290,10 @@ export class HostRuntime {
               dir: this.options.uploadDir,
               sessionId: cmd.sessionId,
               maxBytesPerFile: this.options.maxFileBytes,
+              // 整批总量也要卡：单文件 512KB × 最多 4 个 = 2.7MB base64 进一帧，
+              // 中继 maxPayload 是 1MB，超了整帧被掐、socket 1009 断开（见 uploads.ts）。
+              // 这一条与 mp 侧 MAX_ATTACH_TOTAL_BYTES 同值同口径，手机放行的这里也放行。
+              maxTotalBytes: MAX_ATTACH_TOTAL_BYTES,
             })
             if (!savedFiles.ok) {
               reply(false, { message: savedFiles.message })
@@ -294,20 +322,20 @@ export class HostRuntime {
           }
           this.sleep.markActive()
           reply(true, { data: { sent: true } })
-          void this.pushSessions('prompt') // F8：状态变了就要额外推一次
+          void this.pushSessions('prompt').catch(() => {}) // F8：状态变了就要额外推一次
           return
         }
 
         case 'cmd.interrupt': {
           const done = await this.kernel.interrupt(cmd.sessionId)
           reply(done.ok, done.message ? { message: done.message } : {})
-          void this.pushSessions('interrupt')
+          void this.pushSessions('interrupt').catch(() => {})
           return
         }
         case 'cmd.resolve_permission': {
           const settled = this.settleApproval(cmd.requestId, cmd.decision)
           reply(settled, settled ? {} : { message: '这个审批请求已经不在挂起状态' })
-          void this.pushSessions('permission')
+          void this.pushSessions('permission').catch(() => {})
           return
         }
         case 'cmd.answer': {
@@ -338,7 +366,7 @@ export class HostRuntime {
           reply(true, { data: { sessionId: made.sessionId } })
           // 状态变了就要额外推一次列表（F8）：手机新建完回到列表时那条会话必须已经在，
           // 靠 15 秒的兜底刷新等它出现是不可接受的。
-          void this.pushSessions('new-session')
+          void this.pushSessions('new-session').catch(() => {})
           return
         }
         case 'cmd.session_history': {
@@ -479,7 +507,7 @@ export class HostRuntime {
         this.window.flushSession(event.sessionId)
         this.broadcast(runState(event))
         if (event.state === 'running') this.sleep.markActive()
-        void this.pushSessions('run-state')
+        void this.pushSessions('run-state').catch(() => {})
         return
       case 'model':
         // **按会话**广播模型（2026-10-05 用户实测：当前会话 space-bunny-free，
@@ -511,10 +539,10 @@ export class HostRuntime {
         this.broadcast(compactionNotice({ sessionId: event.sessionId, state: event.state, error: event.error }))
         return
       case 'title':
-        void this.pushSessions('title')
+        void this.pushSessions('title').catch(() => {})
         return
       case 'sessions-changed':
-        void this.pushSessions(event.reason ?? 'changed')
+        void this.pushSessions(event.reason ?? 'changed').catch(() => {})
         return
     }
   }
@@ -532,38 +560,50 @@ export class HostRuntime {
    */
   async pushSessions(reason: string): Promise<SessionSummary[]> {
     if (this.stopped) return this.sessions
+    /**
+     * **整段包 try**（2026-10-06）。原来只有 `kernel.listSessions` 那一句在 try 里，
+     * 后面的 `transport.broadcast`（加密 + 写 socket）与 `kernel.modelOptions()`
+     * （调内核服务）都在外面：任一处抛出就是一条未捕获的 Promise 拒绝，
+     * Node≥15 默认**直接终止进程** —— 而调用点全是 `void this.pushSessions(...)`，
+     * 等于用一次状态推送把用户的宿主带崩（违反 apply() 的头号红线）。
+     */
     try {
-      const listed = await this.kernel.listSessions(LISTING_LIMIT)
-      this.sessions = listed.map((item) => item.summary)
-    } catch (error) {
-      // 读失败时**保留上一次已知的快照**再照常广播：把列表清成空白比停在旧状态更糟
-      // （手机会以为会话全没了），而 keep_awake 那一侧的状态仍然必须送达（M25）。
-      this.log('list sessions failed', { message: messageOf(error), reason })
-    }
-    // 判窗口用的是"数据到手"的时刻，不是进入函数的时刻：内核读列表可能很慢，
-    // 用进入时刻会让一次 400ms 的读直接吃掉整个合并窗口。
-    const now = this.clock.now()
-    const sinceLast = now - this.lastPushAt
-    if (sinceLast < SESSION_MERGE_MS && reason !== 'start' && reason !== 'list') {
-      this.mergePendingReason = reason
-      if (this.mergeTimer === undefined) {
-        this.mergeTimer = this.clock.setTimeout(() => {
-          this.mergeTimer = undefined
-          void this.pushSessions(this.mergePendingReason)
-        }, SESSION_MERGE_MS - sinceLast)
+      try {
+        const listed = await this.kernel.listSessions(LISTING_LIMIT)
+        this.sessions = listed.map((item) => item.summary)
+      } catch (error) {
+        // 读失败时**保留上一次已知的快照**再照常广播：把列表清成空白比停在旧状态更糟
+        // （手机会以为会话全没了），而 keep_awake 那一侧的状态仍然必须送达（M25）。
+        this.log('list sessions failed', { message: messageOf(error), reason })
       }
+      // 判窗口用的是"数据到手"的时刻，不是进入函数的时刻：内核读列表可能很慢，
+      // 用进入时刻会让一次 400ms 的读直接吃掉整个合并窗口。
+      const now = this.clock.now()
+      const sinceLast = now - this.lastPushAt
+      if (sinceLast < SESSION_MERGE_MS && reason !== 'start' && reason !== 'list') {
+        this.mergePendingReason = reason
+        if (this.mergeTimer === undefined) {
+          this.mergeTimer = this.clock.setTimeout(() => {
+            this.mergeTimer = undefined
+            void this.pushSessions(this.mergePendingReason).catch(() => {})
+          }, SESSION_MERGE_MS - sinceLast)
+        }
+        return this.sessions
+      }
+      this.lastPushAt = now
+      if (this.mergeTimer !== undefined) {
+        // 这一条全量快照已经把待推的内容覆盖到了，尾随推送不必再发（否则会多发一条重复列表）。
+        this.clock.clearTimeout(this.mergeTimer)
+        this.mergeTimer = undefined
+      }
+      this.broadcast(sessionChanged(this.sessions, reason))
+      this.broadcast(keepAwakeState(this.sleep.snapshot()))
+      this.replayModels()
+      return this.sessions
+    } catch (error) {
+      this.log('push sessions crashed', { message: messageOf(error), reason })
       return this.sessions
     }
-    this.lastPushAt = now
-    if (this.mergeTimer !== undefined) {
-      // 这一条全量快照已经把待推的内容覆盖到了，尾随推送不必再发（否则会多发一条重复列表）。
-      this.clock.clearTimeout(this.mergeTimer)
-      this.mergeTimer = undefined
-    }
-    this.broadcast(sessionChanged(this.sessions, reason))
-    this.broadcast(keepAwakeState(this.sleep.snapshot()))
-    this.replayModels()
-    return this.sessions
   }
 
   /**
@@ -583,7 +623,17 @@ export class HostRuntime {
    * 显示的是猜的东西，比不显示更糟。
    */
   private replayModels(): void {
+    /**
+     * **只补发当前会话列表里那几条**（2026-10-06）。
+     *
+     * 缓存上限是 256 条，而 `pushSessions` 是"任何状态变化都推一次"的唯一入口：
+     * 全量重播意味着一次变化最坏发出数百帧 `ev.model`（含早就掉出列表、手机上根本
+     * 看不到的会话），而中继的单帧上限与手机的处理都按"一次状态变化一帧"设计。
+     * 求交不删缓存（理由见 `rememberModel`）：会话回到列表里时它的模型还在。
+     */
+    const listed = new Set(this.sessions.map((session) => session.id))
     for (const [sessionId, entry] of this.modelBySession) {
+      if (!listed.has(sessionId)) continue
       this.broadcastModel(sessionId, entry.model, entry.provider)
     }
   }
@@ -636,7 +686,7 @@ export class HostRuntime {
 
   private refreshLoop(): void {
     if (this.stopped) return
-    void this.pushSessions('refresh')
+    void this.pushSessions('refresh').catch(() => {})
     this.window.flushRound()
     this.refreshTimer = this.clock.setTimeout(() => this.refreshLoop(), this.options.listingRefreshMs)
   }
@@ -662,53 +712,75 @@ export class HostRuntime {
   }): Promise<ApprovalDecision> {
     const conversationId = this.pickConversation(info.sessionId)
     if (!conversationId || !this.transport.hasClient(conversationId)) return 'decline'
+    /**
+     * **进来就已经 abort 的信号：当场交还桌面，一张卡都不发**（2026-10-06）。
+     *
+     * `carrier-services.participate()` 在调用 sink **之前**就把平台撤下来的 signal
+     * 转成 `controller.abort('platform')`（`if (platform.aborted) controller.abort('platform')`），
+     * 而我们拿到的正是这条 controller 的 signal。对**已经 abort** 的 signal
+     * `addEventListener('abort', …)` **永远不会触发**：于是卡照发、挂锁照挂，
+     * 手机上是一张可点的死卡，宿主那条 waterfall 也被堵满整个超时窗口
+     * （审批 180s / 提问 300s），期间手机点"允许"还会被当成真答案。
+     * 这一判必须在 `sleep.hold()` 与首帧之前——那样连锁都不用挂。
+     */
+    if (info.signal?.aborted) {
+      this.log('approval already withdrawn by the platform, handing back to the desktop', {
+        sessionId: info.sessionId,
+        reason: String(info.signal.reason ?? ''),
+      })
+      return 'decline'
+    }
     const id = `ap_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     // 到期时刻只算一次：首帧与将来可能的重发（`replayPending`）用同一个，
     // 主机侧的超时表从第一次问出就开始走，重发时顺延等于骗手机的倒计时。
     const expiresAt = new Date(Date.now() + this.options.approvalTimeoutMs).toISOString()
-    const answered = await new Promise<ApprovalDecision>((resolve) => {
-      const timer = this.clock.setTimeout(() => {
-        this.settle(id, 'decline', 'timeout')
-      }, this.options.approvalTimeoutMs)
-      this.pending.set(id, {
-        conversationId,
-        sessionId: info.sessionId,
-        resolve: (value) => resolve(value === undefined ? 'decline' : (value as ApprovalDecision)),
-        timer,
-        kind: 'approval',
-        askedAt: this.clock.now(),
-        expiresAt,
-        action: info.action,
-        reason: info.reason,
-      })
-      // `reason` 是 `carrier-services.participate()` 打的标记：'desktop' = 桌面先答了，
-      // 其余（'platform'）是宿主自己把这次请求撤了。两种都要让手机把卡收掉，
-      // 但说出来的话不一样。
-      info.signal?.addEventListener(
-        'abort',
-        () => this.settle(id, 'cancelled', info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
-        { once: true },
-      )
-      this.replyTo(
-        conversationId,
-        permissionRequest({
-          requestId: id,
+    // `return await` + finally：executor 里抛出（或 resolve 路径的任何异常）都不会让
+    // releaseHold 被跳过 —— 旧写法里一次抛出就是一条永久泄漏的挂锁（机器再也不睡）。
+    try {
+      return await new Promise<ApprovalDecision>((resolve) => {
+        const timer = this.clock.setTimeout(() => {
+          this.settle(id, 'decline', 'timeout')
+        }, this.options.approvalTimeoutMs)
+        this.pending.set(id, {
+          conversationId,
           sessionId: info.sessionId,
-          action: info.action,
-          ...(info.reason === undefined ? {} : { reason: info.reason }),
-          options: APPROVAL_OPTIONS,
+          resolve: (value) => resolve(value === undefined ? 'decline' : (value as ApprovalDecision)),
+          timer,
+          kind: 'approval',
+          askedAt: this.clock.now(),
           expiresAt,
-        }),
-      )
-    })
-    this.sleep.releaseHold(id)
-    // 结算点（settleApproval）已经把手机的 'approve'/'reject' 翻成平台词汇了，
-    // 这里不再翻第二次——两处映射表迟早会分叉。
-    //
-    // 手机没被点过（超时、桌面先答、平台撤回）时那张卡的作废在 `settle()` 里就发了，
-    // 不用在这里补第二次：那一处同时管审批与提问两类卡。
-    return answered
+          action: info.action,
+          reason: info.reason,
+        })
+        // `reason` 是 `carrier-services.participate()` 打的标记：'desktop' = 桌面先答了，
+        // 其余（'platform'）是宿主自己把这次请求撤了。两种都要让手机把卡收掉，
+        // 但说出来的话不一样。
+        info.signal?.addEventListener(
+          'abort',
+          () => this.settle(id, 'cancelled', info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+          { once: true },
+        )
+        this.replyTo(
+          conversationId,
+          permissionRequest({
+            requestId: id,
+            sessionId: info.sessionId,
+            action: info.action,
+            ...(info.reason === undefined ? {} : { reason: info.reason }),
+            options: APPROVAL_OPTIONS,
+            expiresAt,
+          }),
+        )
+      })
+    } finally {
+      // 结算点（settleApproval）已经把手机的 'approve'/'reject' 翻成平台词汇了，
+      // 这里不再翻第二次——两处映射表迟早会分叉。
+      //
+      // 手机没被点过（超时、桌面先答、平台撤回）时那张卡的作废在 `settle()` 里就发了，
+      // 不用在这里补第二次：那一处同时管审批与提问两类卡。
+      this.sleep.releaseHold(id)
+    }
   }
 
   private async onQuestionRequest(info: {
@@ -718,58 +790,82 @@ export class HostRuntime {
   }): Promise<AskUserQuestionAnswerValue | null> {
     const conversationId = this.pickConversation(info.sessionId)
     if (!conversationId || !this.transport.hasClient(conversationId)) return null
+    // 与审批同一条：**已经 abort 的 signal 永远不会再触发监听器**，所以必须在
+    // hold 与首帧之前判掉，否则手机上是 300 秒的死卡、挂锁也一直挂着（见审批那里的取证）。
+    if (info.signal?.aborted) {
+      this.log('question already withdrawn by the platform, handing back to the desktop', {
+        sessionId: info.sessionId,
+        reason: String(info.signal.reason ?? ''),
+      })
+      return null
+    }
     const id = `q_${randomUUID().slice(0, 8)}`
     this.sleep.hold(id)
     // 到期时刻只算一次（理由见审批那条）：首帧与重发共用。
     const expiresAt = new Date(Date.now() + this.options.questionTimeoutMs).toISOString()
-    const answer = await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
-      const timer = this.clock.setTimeout(() => {
-        this.settle(id, null, 'timeout')
-      }, this.options.questionTimeoutMs)
-      this.pending.set(id, {
-        conversationId,
-        sessionId: info.sessionId,
-        resolve: (value) => resolve((value as AskUserQuestionAnswerValue | undefined) ?? null),
-        timer,
-        options: info.questions,
-        kind: 'question',
-        askedAt: this.clock.now(),
-        expiresAt,
-      })
-      // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
-      info.signal?.addEventListener(
-        'abort',
-        () => this.settle(id, null, info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
-        { once: true },
-      )
-      this.replyTo(
-        conversationId,
-        questionRequest({
-          requestId: id,
+    // `return await` + finally：releaseHold 与 hold 必须一一对应（同审批那条的理由）。
+    try {
+      return await new Promise<AskUserQuestionAnswerValue | null>((resolve) => {
+        const timer = this.clock.setTimeout(() => {
+          this.settle(id, null, 'timeout')
+        }, this.options.questionTimeoutMs)
+        this.pending.set(id, {
+          conversationId,
           sessionId: info.sessionId,
-          questions: info.questions,
-          // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
-          // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
+          resolve: (value) => resolve((value as AskUserQuestionAnswerValue | undefined) ?? null),
+          timer,
+          options: info.questions,
+          kind: 'question',
+          askedAt: this.clock.now(),
           expiresAt,
-        }),
-      )
-    })
-    this.sleep.releaseHold(id)
-    return answer
+        })
+        // 与审批那条同样：'desktop' 是桌面先答，其余是宿主自己撤了这次请求。
+        info.signal?.addEventListener(
+          'abort',
+          () => this.settle(id, null, info.signal?.reason === 'desktop' ? 'desktop' : 'withdrawn'),
+          { once: true },
+        )
+        this.replyTo(
+          conversationId,
+          questionRequest({
+            requestId: id,
+            sessionId: info.sessionId,
+            questions: info.questions,
+            // 提问这张卡以前**没有**到期时刻：主机 300 秒就判"没答上"，而手机上看不见任何倒计时，
+            // 用户不知道自己按的按钮什么时候作废（伞仓 docs/PRODUCT.md §3 第 3 条）。
+            expiresAt,
+          }),
+        )
+      })
+    } finally {
+      this.sleep.releaseHold(id)
+    }
   }
 
   private settleApproval(requestId: string, decision: string): boolean {
     const item = this.pending.get(requestId)
-    if (!item) return false
-    // F10：手机逐字回传我们下发的 options[].id；'reject' 之外的一律视为放行一次。
-    const outcome: ApprovalDecision = decision === 'reject' ? 'rejected' : 'allowed-once'
+    // **跨类结算必须拒掉**：审批与提问共用一张 pending 表与同一套 requestId 回传协议，
+    // 拿提问的 id 去 settleApproval（或反过来）原来会跨类结算并回 ok:true —— 手机上
+    // 那张提问卡被一个审批答案收掉，而平台拿到一个它没问过的决定。
+    if (!item || item.kind !== 'approval') return false
+    /**
+     * **白名单**（F10）：手机逐字回传我们下发的 `options[].id`，合法的只有两个
+     * `'approve'` / `'reject'`。原来写的是"不是 reject 就放行一次"——那是 fail-open：
+     * 未知词（`deny` / `decline` / `cancel`，或者旧版小程序回传的别的形状）会被当成
+     * **允许**，一次误判就是替用户放行了一条工具调用。认不出的一律按拒绝。
+     */
+    const outcome: ApprovalDecision = decision === 'approve' ? 'allowed-once' : 'rejected'
     this.settle(requestId, outcome)
     return true
   }
 
   private settleQuestion(requestId: string, answers: AnswerItem[]): boolean {
     const item = this.pending.get(requestId)
-    if (!item) return false
+    // 同 settleApproval：用错类的 requestId 不许跨类结算。
+    if (!item || item.kind !== 'question') return false
+    // 空答案不是答案：`answers: []` 交给平台会得到一条"问过了但什么都没选"的记录，
+    // 而手机上那张卡其实还亮着（用户会以为自己答了）。拒绝它，回执说清楚。
+    if (!Array.isArray(answers) || answers.length === 0) return false
     // 平台的答案里 selected 装的是**选项 label**（不是我们的 id），所以这里要翻回去。
     const byQuestion = new Map((item.options ?? []).map((question) => [question.id, question]))
     const value: AskUserQuestionAnswerValue = {

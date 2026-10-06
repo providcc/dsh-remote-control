@@ -210,3 +210,39 @@ test('按 3 秒节拍跑 5 分钟：只在半程处换码，不会每 tick 发�
   assert.ok(count > 0 && count <= 12, `300 秒里发了 ${count} 张：要么没刷新，要么每 tick 发一张（中继配额会被打爆）`)
   assert.equal(h.published.length, 0, '夹具自检：harness() 本身不该发码')
 })
+
+/* ── 2026-10-06 缺陷修复：自动补发与"刷新已挂出去那张"是两件事 ───────────── */
+
+test('pairOnStartSec=0（默认）时"中继重启换码"这条判据也必须生效：屏幕上的码在中继那边已经死了', () => {
+  const h = harness(0)
+  h.window.adopt({ token: 'SHOWN', createdAt: h.clock.now(), expiresAt: h.clock.now() + 120_000 })
+  assert.equal(h.window.tick(), false, '夹具自检：同一代次、没过半程时不该换码')
+
+  h.setGeneration(2) // 中继重启：它的 pending-pair 表是内存的，这张码已经没人认得
+  assert.equal(
+    h.window.tick(),
+    true,
+    '代次变了却不换码：用户点"刷新"拿到的还是同一张死码，只能干等 TTL（而 pairOnStartSec 默认 0）',
+  )
+  assert.deepEqual(h.published, [120_000], '这一档的 TTL 基线要用常规 pairTtlMs（默认 120000），不是 pairSec*1000=1s')
+  assert.equal((h.window.active as unknown as ActivePair).token, 'T1')
+})
+
+test('pairOnStartSec=0 时"过半程"同样要换：那张码按常规 TTL 老化，不会每 tick 换一张', async () => {
+  const h = harness(0)
+  h.window.adopt({ token: 'SHOWN', createdAt: h.clock.now(), expiresAt: h.clock.now() + 120_000 })
+  await h.clock.advance(59_000)
+  assert.equal(h.window.tick(), false, '还没过半程就换码：用户刚看到的码立刻作废')
+  await h.clock.advance(2_000)
+  assert.equal(h.window.tick(), true, '过半程之后不换：手机扫到一张刚刚过期的码')
+})
+
+test('staleNow() 与 tick() 同一套判据：刷新按钮据此拒发死码，且它自己不改状态', () => {
+  const h = harness(0)
+  assert.equal(h.window.staleNow(), 'no-active-pair', '没有活动码时 staleNow 必须说得出原因')
+  h.window.adopt({ token: 'SHOWN', createdAt: h.clock.now(), expiresAt: h.clock.now() + 120_000 })
+  assert.equal(h.window.staleNow(), null, '有效期内必须是 null（刷新按钮据此原样返回那张码）')
+  assert.equal(h.published.length, 0, 'staleNow 不许发布任何东西')
+  h.setGeneration(5)
+  assert.equal(h.window.staleNow(), 'relay-generation-changed', '代次变了必须能判出来（这就是那条死码）')
+})

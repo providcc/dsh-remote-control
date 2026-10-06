@@ -226,3 +226,29 @@ test('落盘文件不进版本库：它带 PSK，而测试用的工作目录可�
     '.gitignore 没有覆盖 conversations-*.json：这份文件含全部会话的 PSK，被提交出去等于把整台主机的历史密文密钥公开',
   )
 })
+
+/* ── 2026-10-06 缺陷修复：结构性 save 失败之后不许把脏标记复位 ───────────── */
+
+test('save 失败之后必须仍然算脏：新配对的 PSK 不许静默不落盘且永不重试', () => {
+  const { dir, cleanup } = tempDir()
+  try {
+    // 目录名先被一个普通文件占着：mkdirSync(dirname) 必失败（ENOTDIR）。
+    const blocker = path.join(dir, 'blocked')
+    writeFileSync(blocker, 'not a directory')
+    const file = path.join(blocker, 'conversations.json')
+    const store = new PairStore({ file, hostId: 'h_test' })
+    assert.equal(store.save([SAMPLE], 1), false, '夹具自检：写盘必须失败')
+    assert.equal(
+      store.hasPendingChanges,
+      true,
+      '失败之后 dirty 被复位成 false：status 的 3 秒 tick 看到"没脏"就再也不重试，新配对的 PSK 静默不落盘',
+    )
+
+    // 路径恢复可写之后，下一次 save 必须能成功、并把脏标记清掉。
+    rmSync(blocker)
+    assert.equal(store.save([SAMPLE], 2), true, '路径恢复之后仍然写不进去')
+    assert.equal(store.hasPendingChanges, false, '成功之后还不清脏：每个 tick 都会白写一次盘')
+  } finally {
+    cleanup()
+  }
+})

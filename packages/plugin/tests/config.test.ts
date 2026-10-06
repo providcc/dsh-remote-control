@@ -322,3 +322,61 @@ test('DRC_PILL 只认 1/0/true/false：拼错的值不许把配对入口悄悄�
     '无法识别的值必须退回上层值，而不是静默变成关（或开）',
   )
 })
+
+/* ── 2026-10-06 缺陷修复：有限性判据与"其余一律 warn + 夹回默认值" ───────── */
+
+test('pairTtlMs 的 Infinity 也要夹：只判"正数"会把"这张码永不过期"放过去', () => {
+  for (const bad of [Number.POSITIVE_INFINITY, Number.NaN]) {
+    const config = base({ pairTtlMs: bad })
+    const problems = validateConfig(config)
+    assert.equal(config.pairTtlMs, 120_000, `pairTtlMs=${String(bad)} 没被夹回 120000`)
+    assert.ok(
+      problems.some((problem) => problem.field === 'pairTtlMs' && problem.level === 'warn'),
+      `pairTtlMs=${String(bad)} 折回了却不留痕：用户以为自己配上了`,
+    )
+  }
+})
+
+test('approvalTimeoutSec / listingRefreshSec / maxFileBytes 非法值必须 warn + 夹回默认值', () => {
+  // 头注承诺的是"其余一律 warn + 夹回默认值"，而这三个字段此前**一个都不夹**：
+  //   - approvalTimeoutSec: NaN → setTimeout(NaN) 立刻触发 = 审批瞬间超时；
+  //   - listingRefreshSec: 0/负/NaN → 刷新节拍变成热循环；
+  //   - maxFileBytes: NaN → 每个文件都被判超限。
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+    const config = base({ approvalTimeoutSec: bad, listingRefreshSec: bad, maxFileBytes: bad })
+    const problems = validateConfig(config)
+    for (const field of ['approvalTimeoutSec', 'listingRefreshSec', 'maxFileBytes'] as const) {
+      assert.ok(
+        problems.some((problem) => problem.field === field && problem.level === 'warn'),
+        `${field}=${String(bad)} 没有 warn：NaN/0/负值都不是"用户想要的配置"`,
+      )
+    }
+    assert.equal(config.approvalTimeoutSec, 180, `approvalTimeoutSec=${String(bad)} 没夹回 180`)
+    assert.equal(config.listingRefreshSec, 15, `listingRefreshSec=${String(bad)} 没夹回 15`)
+    assert.equal(config.maxFileBytes, 512 * 1024, `maxFileBytes=${String(bad)} 没夹回 512KB`)
+  }
+
+  // 合法值一个都不许动（含"小于默认值但大于 0"的：那是用户有意调快的）。
+  const fine = base({ approvalTimeoutSec: 30, listingRefreshSec: 5, maxFileBytes: 4096 })
+  const problems = validateConfig(fine)
+  assert.equal(fine.approvalTimeoutSec, 30, '合法的 approvalTimeoutSec 被改写了')
+  assert.equal(fine.listingRefreshSec, 5, '合法的 listingRefreshSec 被改写了')
+  assert.equal(fine.maxFileBytes, 4096, '合法的 maxFileBytes 被改写了')
+  assert.equal(
+    problems.some((problem) => ['approvalTimeoutSec', 'listingRefreshSec', 'maxFileBytes'].includes(problem.field)),
+    false,
+    '合法值不该报任何问题',
+  )
+})
+
+test('carrierGraceMs 是死键：已从配置面上删掉（全 src 零读取）', () => {
+  assert.equal(
+    'carrierGraceMs' in DEFAULT_CONFIG,
+    false,
+    '这个键从来没有任何读取点：留着它等于让用户以为"载具宽限期"可调',
+  )
+  // 用户 patch 里可能还留着这一行：与其余删掉的键同一条约定——**不报错也不生效**
+  // （`readConfig` 的 `...injected` 只是原样带着走，没有任何一处读它）。
+  const config = readConfig({ carrierGraceMs: 50 } as unknown as Partial<PluginConfig>, {})
+  assert.equal(config.serverUrl, DEFAULT_CONFIG.serverUrl, '带着一个死键也要能正常合成配置')
+})

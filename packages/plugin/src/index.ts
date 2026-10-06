@@ -38,6 +38,7 @@ import {
   type PluginConfig,
 } from './shell/config.js'
 import { startPill, type PillHandle } from './pill/start.js'
+import { guardedSubscribe } from './platform/guard.js'
 import { type LivePairing, type PillStatus } from './pill/routes.js'
 import { PLUGIN_VERSION } from './version.js'
 import type { KernelPort, Clock } from './ports/index.js'
@@ -238,9 +239,6 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     conversationIds(): string[] {
       return relay?.conversationIds() ?? []
     },
-    voidConversation(conversationId: string): void {
-      relay?.voidConversation(conversationId)
-    },
   }
 
   const start = (port: KernelPort): void => {
@@ -298,11 +296,33 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         void runtime?.pushSessions('client-left')
       },
       onConversationGone: (conversationId) => log('conversation gone', { conversationId }),
-      onCommand: (conversationId, cmd: CmdPayload) => void runtime?.handleCommand(cmd, conversationId),
+      onCommand: (conversationId, cmd: CmdPayload) => void runtime?.handleCommand(cmd, conversationId).catch(() => {}),
       onState: (info) => {
         lastRelayState = info.relay
         lastRelayProblem = info.problem
         lastRelayGeneration = info.generation
+      },
+      /**
+       * 中继宣告"这张配对码没配上"（`expired` / `already_used` / `rate_limited` /
+       * `invalid_or_expired`）。
+       *
+       * 这个口原来是**声明了却没人接**（`relay.ts:461` 调、index.ts 从不传）：中继说码废了，
+       * 主机这边毫无反应，屏幕上那张死码继续挂着 —— 用户对着 `already_used` 反复扫，
+       * 只能等 TTL 走完（`pairOnStartSec` 默认 0，没有任何东西会去换它）。
+       *
+       * 处理：**清展示位 + 作废这张码 + 立刻补一张**（同一时刻屏幕上必须有一张能用的）。
+       * `rate_limited` 例外：中继明确在限速，立刻再申请只会继续被拒，把换码留给
+       * 用户点"刷新"或下一次窗口判断（那时中继的限速窗口多半已经过去）。
+       */
+      onPairFail: (reason) => {
+        const shown = active.pairing
+        if (shown) {
+          spendPairingToken(shown.token)
+          active.pairing = null
+          pairingWindow.forget(shown.token)
+        }
+        log('relay rejected the pairing code', { reason })
+        if (reason !== 'rate_limited') wrappedPublish()
       },
       // 配对通道长存（D3）之后必须自己剪枝：中继那边的空闲 TTL 是 7 天，
       // 不剪就是无界的 PSK 簿 + 每次广播对废弃通道逐个密封。
@@ -318,6 +338,10 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // 挂在这里等于每广播一次写一次盘。
       onStructuralChange: () => {
         if (!pairStoreFile || !relay) return
+        // **先标脏再写**：`save()` 失败（目录只读、磁盘满）时若不复位/不保持脏标记，
+        // 新配对的 PSK 就静默不落盘，而且 3 秒 tick 看到 hasPendingChanges=false
+        // 再也不会重试 —— 下一次重启用户面对的是"明明配过还要重新扫码"。
+        pairStore.markDirty()
         pairStore.save(relay.conversations.snapshot(), clock.now())
       },
       onBookActivity: () => {
@@ -564,7 +588,17 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * 手机扫到没被显示的那张就全线解不开。那正是当初"多码事故"的形状。
    */
   function ensureFreshPairing(): LivePairing | null {
-    const fresh = currentPairing() ?? createPairing()
+    /**
+     * **"屏幕上那张还能不能用"要问窗口，不能只问本地 TTL**（2026-10-06）。
+     *
+     * 中继重启后它内存里的 pending-pair 表已经空了：屏幕上那张码在中继那边**已经死了**，
+     * 而本地 `expiresAt` 还没到。旧实现把它直接当 fresh 返回 —— 用户点"刷新"拿到的
+     * 还是同一张死码，只能干等 TTL 走完（用户报的"要等下次刷新的二维码才能用"里，
+     * 最坏的一档就是这个）。`staleNow()` 复用窗口那套判据（代次变了 / 过期 / 过半程），
+     * 与自动换码同一口径，两处不会分叉。
+     */
+    const shown = currentPairing()
+    const fresh = shown && !pairingWindow.staleNow() ? shown : createPairing()
     if (!fresh) return null
     // 兜底一道：resolveFor 用 clock.now()，而路由算 expiresInMs 用 Date.now()，
     // 两个时钟之间有窗口；服务端 TTL 改写也让"还有效"这件事有两个口径。
@@ -655,6 +689,8 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       log,
     },
     config.pairOnStartSec,
+    // 未自动发码时那张"用户点出来的码"按配置的 pairTtlMs 老化（与发码时请求的 TTL 同源）。
+    config.pairTtlMs,
   )
 
   // ── 载体探测：services > (mock) ────────────────────────────────────
@@ -730,6 +766,56 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     }
   }
   /**
+   * 把某个上下文（根 ctx 或 `ctx.inject` 回调给的作用域上下文）的 `on`/`off` 绑到
+   * 服务对象上——carrier 的 `subscribe()` 与交互面登记都读 `services.on`。
+   *
+   * **为什么必须单独一条，而不是塞在 `accept()` 里**（2026-10-06 真机取证）：
+   * `tryStart()` 在 `ctx.get('sessions', true)` **同步可得**时会在任何 inject 回调
+   * **之前**就把内核启起来，而 `collected.on` 那时还只在 `accept('sessions', …)`
+   * 里绑——晚一步的后果是 `subscribe()` 读到 `services.on === undefined`，
+   * 记一句 `kernel has no on(); streaming disabled` 并永久返回空退订；
+   * `HostRuntime.start()` 有 started 闸门不会重试，于是**该进程内流式全黑**，
+   * 而 `describe()` 的 `hasOn` 每次现读（那时 on 早绑上了）会显示 true 掩盖真相。
+   * 现在：拿到任意服务、任意候选上下文时先绑一次，晚到的 inject 回调再补一次。
+   *
+   * 两处读取**各自包 try**：cordis 的 ctx 是 Proxy，读一个它这个作用域里没有的属性名
+   * 是**抛错**而不是返回 undefined（真机：`cannot get property "off" without inject`,
+   * 就是本文件 110-119 行那条结论）。`typeof`/`?.` 都挡不住 get trap，
+   * 所以只能用 try——而且 off 单独一段，它抛不能把 on 的绑定一起带走。
+   */
+  const bindScopedEvents = (source: unknown): void => {
+    if (!source || typeof source !== 'object') return
+    const asContext = source as LooseContext
+    /**
+     * 只认"看起来像上下文"的候选（有 `get`）。回调参数里除了作用域上下文还有别的东西
+     * （配置对象等），而某个**服务对象**自己也带一个同名 `on` 时，绑错了就是
+     * "订阅装到了没有事件派发能力的对象上"——比没绑更难查。
+     * 判别方式与 `pill/start.ts` 的 `pickFrom` 完全一致。
+     */
+    try {
+      if (typeof asContext.get !== 'function') return
+    } catch {
+      return
+    }
+    if (typeof collected.on !== 'function') {
+      try {
+        if (typeof asContext.on === 'function') collected.on = asContext.on.bind(asContext)
+      } catch {
+        /* 这个作用域读不到 on（或它抛了）：换下一个候选 */
+      }
+    }
+    if (typeof collected.off !== 'function') {
+      try {
+        if (typeof asContext.off === 'function') collected.off = asContext.off.bind(asContext)
+      } catch {
+        /* 同上：真机上 off 比 on 更常见地"没注入" */
+      }
+    }
+  }
+  // 根上下文先绑一次：`ctx.get` 那条同步路径拿到的服务也要能订阅（见上面那段取证）。
+  bindScopedEvents(ctx)
+
+  /**
    * 收下探到的服务并尝试启动；`via` 只用于把"从哪条路拿到的"记进 probe。
    * 晚到的服务热补丁进同一个对象：runtime 已经持有它的引用，不需要重启。
    */
@@ -741,11 +827,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       return false
     }
     collected[name] = value
-    const asContext = source as LooseContext | undefined
-    if (name === 'sessions' && typeof collected.on !== 'function' && typeof asContext?.on === 'function') {
-      collected.on = asContext.on.bind(asContext)
-      if (typeof asContext.off === 'function') collected.off = asContext.off.bind(asContext)
-    }
+    bindScopedEvents(source)
     probe[name] = `${via}(${keysOf(value)})`
     tryStart()
     return true
@@ -781,6 +863,10 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
           let value: unknown
           let from: unknown
           for (const candidate of [cbArgs[0], ...cbArgs, ctx]) {
+            // **先绑事件口再取服务**：`on` 只在这个作用域上下文上才读得到（根 ctx 上不一定有），
+            // 而 `accept()` 里的 `tryStart()` 可能就在这一句之后把 runtime 启起来 ——
+            // 绑晚了 subscribe() 拿到的就是 undefined（该进程内流式全黑，见 bindScopedEvents）。
+            bindScopedEvents(candidate)
             value = pickFrom(candidate, name)
             if (value) {
               from = candidate
@@ -801,11 +887,27 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   }
   probe.hasGet = String(hasGet)
   probe.hasInject = String(hasInject)
-  // 一次性取证：这一代宿主到底给了 ctx 什么。猜"名字对不对"之前先看形状。
-  probe.ctxKeys = Object.keys(ctx).slice(0, 40).join('|')
-  probe.ctxProtoKeys = Object.getOwnPropertyNames(Object.getPrototypeOf(ctx) ?? {})
-    .slice(0, 40)
-    .join('|')
+  /**
+   * 一次性取证：这一代宿主到底给了 ctx 什么。猜"名字对不对"之前先看形状。
+   *
+   * **逐句包 try**：`Object.keys(ctx)` / `getPrototypeOf(ctx)` / `ctx.effect` / `ctx.fiber`
+   * 在这台宿主上都是 Proxy 的 trap（ownKeys / getPrototypeOf / get），
+   * 读不到不是返回 undefined 而是**抛错**（本文件 110-119 行那条结论；
+   * `cannot get property "off" without inject` 就是同一个洞里出来的）。
+   * 取证段自己抛出去的代价是整段 applyInner 中断——那正是最贵的那种故障。
+   */
+  try {
+    probe.ctxKeys = Object.keys(ctx).slice(0, 40).join('|')
+  } catch (error) {
+    probe.ctxKeys = `threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
+  }
+  try {
+    probe.ctxProtoKeys = Object.getOwnPropertyNames(Object.getPrototypeOf(ctx) ?? {})
+      .slice(0, 40)
+      .join('|')
+  } catch (error) {
+    probe.ctxProtoKeys = `threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
+  }
   for (const candidate of ['sessions', 'agents']) {
     try {
       const strict = (ctx as { get?: (n: string) => unknown }).get?.(candidate)
@@ -817,10 +919,18 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   // 有些代际要靠 effect/fiber 才看得到服务；有就登记一条"等一会再看"的复查。
   // 注意 `injectFiredLive`（而不是任何在 apply 同步段里取的快照）才是"回调到底有没有
   // 触发"的证据：inject 回调最快也要一个微任务之后才跑，同步取的那一笔永远是 never。
-  probe.hasEffect = String(typeof (ctx as { effect?: unknown }).effect === 'function')
-  probe.hasFiber = String(
-    typeof (ctx as { fiber?: unknown }).fiber === 'function' || (ctx as { fiber?: unknown }).fiber !== undefined,
-  )
+  try {
+    probe.hasEffect = String(typeof (ctx as { effect?: unknown }).effect === 'function')
+  } catch (error) {
+    probe.hasEffect = `threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
+  }
+  try {
+    probe.hasFiber = String(
+      typeof (ctx as { fiber?: unknown }).fiber === 'function' || (ctx as { fiber?: unknown }).fiber !== undefined,
+    )
+  } catch (error) {
+    probe.hasFiber = `threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
+  }
 
   // ── 取证（只记录现场，不改变行为）────────────────────────────────
   // 每一次猜错都要付一次"重启 Harness"的代价，所以把定根因需要的东西一次拿全：
@@ -887,37 +997,50 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
   APPLY_COUNT.n += 1
   probe.applyCount = `${String(APPLY_COUNT.n)}@${clock.now()}`
   try {
-    ctx.on?.('internal/status', ((fiber: unknown, oldState: unknown) => {
-      if (asRecord(fiber) !== asRecord(ctx).fiber) return
-      const record = asRecord(fiber)
-      const state = Number(record.state ?? -1)
-      const entry = asRecord(record.entry)
-      const error = record._error
-      const tail = `${
-        error
-          ? ` err=${String((error as Error)?.name ?? '')}:${String((error as Error)?.message ?? error).slice(0, 200)} @${String(
-              (error as Error)?.stack ?? '',
-            )
-              .split('\n')
-              .slice(1, 4)
-              .map((line) => line.trim().replace(/^at\s+/, ''))
-              .join(' <- ')}`
-          : ''
-      }${
-        state >= 4
-          ? ` stack=${String(new Error('drc-dispose').stack ?? '')
-              .split('\n')
-              .slice(1, 7)
-              .map((line) => line.trim().replace(/^at\s+/, ''))
-              .join(' <- ')
-              .slice(0, 400)}`
-          : ''
-      }`
-      states.push(
-        `${clock.now()}:${String(oldState)}->${String(state)} entry=${String(entry.id ?? '?')}/disabled=${String(entry.disabled ?? '?')}${tail}`,
+    // **必须走 guard 的订阅口**（guard.ts 头注称自己是"事件订阅的唯一入口"）：
+    // 这里直接 `ctx.on(...)` 是绕过白名单的旁路 —— 今天这条是 emit-mode 所以没事，
+    // 但明天有人把名字改成一条 waterfall，就只有这行代码不在护栏里。
+    const on = (ctx as { on?: (name: string, listener: (...args: unknown[]) => void) => unknown }).on
+    if (typeof on === 'function') {
+      guardedSubscribe(
+        on.bind(ctx) as never,
+        'internal/status',
+        ((fiber: unknown, oldState: unknown) => {
+          if (asRecord(fiber) !== asRecord(ctx).fiber) return
+          const record = asRecord(fiber)
+          const state = Number(record.state ?? -1)
+          const entry = asRecord(record.entry)
+          const error = record._error
+          const tail = `${
+            error
+              ? ` err=${String((error as Error)?.name ?? '')}:${String((error as Error)?.message ?? error).slice(0, 200)} @${String(
+                  (error as Error)?.stack ?? '',
+                )
+                  .split('\n')
+                  .slice(1, 4)
+                  .map((line) => line.trim().replace(/^at\s+/, ''))
+                  .join(' <- ')}`
+              : ''
+          }${
+            state >= 4
+              ? ` stack=${String(new Error('drc-dispose').stack ?? '')
+                  .split('\n')
+                  .slice(1, 7)
+                  .map((line) => line.trim().replace(/^at\s+/, ''))
+                  .join(' <- ')
+                  .slice(0, 400)}`
+              : ''
+          }`
+          states.push(
+            `${clock.now()}:${String(oldState)}->${String(state)} entry=${String(entry.id ?? '?')}/disabled=${String(entry.disabled ?? '?')}${tail}`,
+          )
+          probe.fiberStates = states.join(' | ').slice(0, 1800)
+        }) as never,
+        (message, fields) => log(message, fields),
       )
-      probe.fiberStates = states.join(' | ').slice(0, 1800)
-    }) as never)
+    } else {
+      probe.statusWatch = 'no on() on the root ctx'
+    }
   } catch (error) {
     probe.statusWatch = `threw: ${String((error as Error)?.message ?? error).slice(0, 80)}`
   }

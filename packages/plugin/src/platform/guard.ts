@@ -32,17 +32,21 @@ export const SUBSCRIBABLE_EVENTS = [
   'agent/status',
   // agent 出错。取证：同上
   'agent/error',
+  // fiber 生命周期（index.ts 用它抓"是谁把我们拆了"的那条栈）。取证：@deepseek-ai/cordis
+  // lib/types/events.d.ts:219（`internal/status` 声明为 emit）。
+  // **它必须在白名单里**：这条例外是在**订阅口**上开放的，不是在调用点上——
+  // index.ts 原来直接 `ctx.on('internal/status', …)` 绕过了这份名单，
+  // 等于"唯一入口"这句话在代码里不成立（guard 头注与实现分叉）。
+  'internal/status',
 ] as const
 
 /**
- * 已知为 waterfall 的事件名。
+ * docs/legacy-spec/host-plugin-cordis.md §2.1 记录的**旧实现 13 项黑名单**
+ * （"来自代码常量，非推测"，且 13/13 都在宿主产物里被复核过是 waterfall 家族）。
  *
- * 这份清单**不参与放行判断**（放行只看白名单），它存在的意义只有一条：
- * 让测试能自校验"白名单里绝不出现这里任何一个名字"。
- * 取证位置见 docs/legacy-spec/host-plugin-cordis.md §2.1 的 13 项 + 由宿主
- * `remote-events.js` 与 `@mode waterfall` 声明补出来的 8 项。
+ * 它必须原样留着：这是纵深防御的第二层，也是"那次每个 turn 都崩"的直接证据。
  */
-export const WATERFALL_EVENTS: readonly string[] = [
+export const LEGACY_WATERFALL_EVENTS: readonly string[] = [
   'agent/pre-step',
   'agent/request',
   'agent/request-error',
@@ -52,12 +56,20 @@ export const WATERFALL_EVENTS: readonly string[] = [
   'fs/write-intent',
   'internal/get',
   'internal/set',
-  'internal/config',
-  'internal/update',
   'loader/patch-context',
   'session-telemetry/record',
   'user-questions/request',
   'workspace/session-activity',
+]
+
+/**
+ * 由宿主权威表 `remote-events.js`（`API_REMOTE_FORWARDED_EVENTS`，显式 mode 字段）
+ * 与 `@mode waterfall` 声明**补出来**的 9 项。旧黑名单里一项都没有它们——
+ * 旧插件没出事只是因为它恰好没订阅这些名字。
+ */
+export const EXTRA_WATERFALL_EVENTS: readonly string[] = [
+  'internal/config',
+  'internal/update',
   'approval/request',
   'llm/stream',
   'system-prompt/assemble',
@@ -66,6 +78,17 @@ export const WATERFALL_EVENTS: readonly string[] = [
   'tools/post-execute',
   'tools/code-dispatch-log',
 ]
+
+/**
+ * 已知为 waterfall 的事件名。
+ *
+ * 这份清单**不参与放行判断**（放行只看白名单），它存在的意义只有一条：
+ * 让测试能自校验"白名单里绝不出现这里任何一个名字"。
+ * 取证位置见 docs/legacy-spec/host-plugin-cordis.md §2.1 的 13 项 + 由宿主
+ * `remote-events.js` 与 `@mode waterfall` 声明补出来的 9 项（13+9=22，
+ * 由两条常量组合而成，注释里的数与数组本体不会再分叉）。
+ */
+export const WATERFALL_EVENTS: readonly string[] = [...LEGACY_WATERFALL_EVENTS, ...EXTRA_WATERFALL_EVENTS]
 
 /**
  * 允许**参与**的 waterfall（与"观测"是两件事）。

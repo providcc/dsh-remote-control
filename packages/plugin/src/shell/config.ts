@@ -33,8 +33,6 @@ export interface PluginConfig {
   pairOnStartSec: number
   /** 向中继申请 PSK 有效期；服务端权威值会覆盖它（见 transport/relay.ts）。 */
   pairTtlMs: number
-  /** 强 carrier 未到时，等多久才落到弱 carrier。 */
-  carrierGraceMs: number
   approvalTimeoutSec: number
   listingRefreshSec: number
   /**
@@ -115,7 +113,6 @@ export const DEFAULT_CONFIG: PluginConfig = {
   unarchiveOnPrompt: true,
   pairOnStartSec: 0,
   pairTtlMs: 120_000,
-  carrierGraceMs: 5000,
   approvalTimeoutSec: 180,
   listingRefreshSec: 15,
   conversationIdleTtlSec: 86_400,
@@ -266,8 +263,10 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
     })
     config.keepAwake.idleReleaseSec = 300
   }
-  if (config.pairTtlMs <= 0) {
-    problems.push({ level: 'warn', field: 'pairTtlMs', message: '必须为正数，已夹回 120000' })
+  // `.inf` / NaN 也要判：`Infinity <= 0` 是 false，只判正负号会把它放过去，
+  // 而 Infinity 的语义是"这张码永不过期"——与兄弟字段（pairOnStartSec 等）同一条规矩。
+  if (!secondsSchema.safeParse(config.pairTtlMs).success || config.pairTtlMs <= 0) {
+    problems.push({ level: 'warn', field: 'pairTtlMs', message: '必须是正的有限毫秒数，已夹回 120000' })
     config.pairTtlMs = 120_000
   }
   if (!secondsSchema.safeParse(config.pairOnStartSec).success || config.pairOnStartSec < 0) {
@@ -303,7 +302,42 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
   if (!config.statusFile) {
     problems.push({ level: 'warn', field: 'statusFile', message: '为空将关闭状态快照；GUI 宿主里这是唯一的排错入口' })
   }
+  /**
+   * 剩下这几个数字字段原来是**一个都不夹**的（头注却承诺"其余一律 warn + 夹回默认值"）：
+   * - `approvalTimeoutSec: NaN` → `setTimeout(NaN)` 立刻触发 = 审批**瞬间超时**，
+   *   而且没有任何一行日志会说这件事；
+   * - `listingRefreshSec: 0` / 负值 / NaN → 刷新节拍变成热循环（0ms 自续期）；
+   * - `maxFileBytes: NaN` → 每个文件都被判超限（NaN 比较恒 false，两个方向都失控）。
+   * 统一走这一条：非有限或越界就 warn + 夹回默认值（与 idleReleaseSec 同形）。
+   */
+  clampSeconds(config, problems, 'approvalTimeoutSec', 1, 180)
+  clampSeconds(config, problems, 'listingRefreshSec', 1, 15)
+  if (!secondsSchema.safeParse(config.maxFileBytes).success || config.maxFileBytes < 1) {
+    problems.push({
+      level: 'warn',
+      field: 'maxFileBytes',
+      message: '必须是正的有限字节数，已夹回 524288（512KB）',
+    })
+    config.maxFileBytes = 512 * 1024
+  }
   return problems
+}
+
+/** 秒数字段的统一夹取：非有限或小于 `min` 一律 warn + 夹回默认值（见 validateConfig 末尾）。 */
+function clampSeconds(
+  config: PluginConfig,
+  problems: ConfigProblem[],
+  field: 'approvalTimeoutSec' | 'listingRefreshSec',
+  min: number,
+  fallback: number,
+): void {
+  if (secondsSchema.safeParse(config[field]).success && config[field] >= min) return
+  problems.push({
+    level: 'warn',
+    field,
+    message: `必须是不小于 ${min} 的有限秒数，已夹回 ${fallback}`,
+  })
+  config[field] = fallback
 }
 
 /** 令牌脱敏：日志与 status.json 里都只允许出现这个形态。 */

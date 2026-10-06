@@ -284,7 +284,11 @@ export class PairingSlots {
   applyServerTtl(token: string, ttlMs: number): boolean {
     const slot = this.slots.get(token)
     if (!slot) return false
-    slot.expiresAt = this.now() + ttlMs
+    // **基线统一到 `createdAt`**（2026-10-06）：`PairingWindow.applyServerTtl` 用的是
+    // 发起时刻，这里原来用"pair-ready 到达时刻"（`now()`）。同一条 ttlMs 两条基线，
+    // 差的正好是一个 RTT —— 屏幕上那张码的过期时刻（窗口口径）与真正取 PSK 的口径
+    // （本方法）会差那么久，表现是"码显示还有效、点了却说无效"或反过来。
+    slot.expiresAt = slot.createdAt + ttlMs
     return true
   }
 
@@ -294,13 +298,6 @@ export class PairingSlots {
     const slot = this.slots.get(token)
     if (!slot || slot.expiresAt < this.now()) return null
     return slot
-  }
-
-  /** 最近一张仍有效的码（只用于 `/drc pair` 展示与状态快照，绝不用于取密钥）。 */
-  latest(): PairSlot | null {
-    const alive = [...this.slots.values()].filter((slot) => slot.expiresAt >= this.now())
-    if (alive.length === 0) return null
-    return alive.sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
   }
 
   prune(): number {

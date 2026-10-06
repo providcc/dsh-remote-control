@@ -22,8 +22,9 @@
  * （`/drc` 命令与终端文本码都删了，路由没挂上就没有任何配对入口，不留痕就是静默失败）；
  * 以及**不再注册任何命令**（`/drc` 整条已删，命令注册这条路不该再被碰）。
  *
- * 中继一律指 `ws://127.0.0.1:1`（必然拒绝），这样"连不上"是确定的而不是竞态；
- * `carrierGraceMs` 压到 50ms，否则载具要等默认 5s 宽限期才决定，测试会变成等时间。
+ * 中继一律指 `ws://127.0.0.1:1`（必然拒绝），这样"连不上"是确定的而不是竞态。
+ * 载具的等待由 `waitForCarrier()` 轮询（见下），不靠任何"宽限期配置"——
+ * `carrierGraceMs` 这个键 2026-10-06 已删（全 src 零读取，见 shell/config.ts）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -180,8 +181,6 @@ function boot(
     statusFile: path.join(statusDir, 'status.json'),
     mockBridge: true,
     pairOnStartSec: 0,
-    // 默认 5000ms：那是"等强 carrier"的宽限期，测试里等它就等于把单测变成计时器。
-    carrierGraceMs: 50,
     pill: { enabled: options.pillEnabled ?? true },
   })
 

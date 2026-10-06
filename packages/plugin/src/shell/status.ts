@@ -14,7 +14,7 @@
  * 3. **按定时器刷新，不按消费刷新**。这条不是偷懒：它决定了外部脚本只能接受
  *    "年龄 < 25s 且本轮未用过"的配对码（取证 HANDOFF.md §4.5 第 3 条）。
  */
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Clock, StatusSink } from '../ports/index.js'
 
@@ -33,6 +33,9 @@ export class StatusFile implements StatusSink {
       mkdirSync(path.dirname(this.file), { recursive: true })
       const tmp = `${this.file}.tmp-${process.pid}`
       // mode 在文件已存在时不生效，所以再 chmod 一次。
+      // 这一句不是可有可无：tmp 名里只有 pid，上一次同 pid 的进程留下的残留、
+      // 或 pid 被复用之后的旧文件，都可能带着更宽的权限 —— 而这个文件里可能有
+      // 仍然有效的配对码 + PSK（pairOnStartSec）与全部排错信息。
       writeFileSync(
         tmp,
         JSON.stringify({ ...snapshot, updatedAt: new Date().toISOString(), pid: process.pid }, null, 2) + '\n',
@@ -40,6 +43,7 @@ export class StatusFile implements StatusSink {
           mode: 0o600,
         },
       )
+      chmodSync(tmp, 0o600)
       renameSync(tmp, this.file)
     } catch {
       // 快照写失败绝不能影响主流程；排错入口没了是遗憾，插件崩了是事故。

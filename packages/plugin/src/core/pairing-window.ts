@@ -83,6 +83,8 @@ export class PairingWindow {
   constructor(
     private readonly deps: WindowDeps,
     private readonly pairSec: number,
+    /** 未自动发码（`pairOnStartSec <= 0`）时那张"用户点出来的码"按多长 TTL 老化。 */
+    private readonly defaultTtlMs = 120_000,
   ) {}
 
   /** 服务端权威 TTL（`pair-ready.ttlMs`）：落地后覆盖请求值，并修正已挂出的那张码。 */
@@ -104,6 +106,19 @@ export class PairingWindow {
   }
 
   /**
+   * 这张码在中继那边**已经废了**（`pair-fail`：expired / already_used / invalid_or_expired）。
+   *
+   * 与 `markConsumed` 的区别只在这条日志：那一条说"被用掉了"，而这一条是"中继不认它"
+   * ——排错时两者要分得开（一个是正常路径，一个是失败路径）。
+   */
+  forget(pairingToken: string): void {
+    if (this.active?.token === pairingToken) {
+      this.deps.log('pairing code rejected by the relay, dropping it', { token: pairingToken })
+      this.active = null
+    }
+  }
+
+  /**
    * 认领一张**别处**发出去的码（手工 `/drc pair`、或 status 之外的入口）。
    * 不认领的话窗口会认为"没有活动码"而再发一张，于是同一台主机挂两张有效码——
    * 手机扫的是屏幕上那张，取错密钥就是全线解不开（多码事故的原样）。
@@ -112,9 +127,34 @@ export class PairingWindow {
     this.active = { ...created, generation: this.deps.generation() }
   }
 
-  /** 一轮检查。返回"这一轮是否发布了新码"。 */
+  /**
+   * 此刻这张码还能不能递给用户；返回原因字符串表示"不能"，null 表示仍然可用。
+   *
+   * 与 `tick()` 的换码判据同一套（代次变了 / 已过期 / 过半程），只是**不发布**。
+   * 为什么要有这一口：`tick()` 挂在 3 秒的状态节拍上，而用户点的那条"刷新"是即时的
+   * —— 少了这一判，中继重启后屏幕上那张码在中继那边已经死了（它的 pending 表是内存的），
+   * 本地 TTL 却还没到，两次 tick 之间的那次刷新会把死码原样递回去，用户干等一整个 TTL。
+   */
+  staleNow(): string | null {
+    return staleReason({
+      active: this.active,
+      now: this.deps.clock.now(),
+      generation: this.deps.generation(),
+      ttlMs: this.ttlMs(),
+    })
+  }
+
+  /**
+   * 一轮检查。返回"这一轮是否发布了新码"。
+   *
+   * **"要不要自动补发"与"要不要刷新已经挂出去的那张"是两件事**（2026-10-06）：
+   * 原来第一行 `if (pairSec <= 0) return false` 把两件事一起掐了，于是
+   * `pairOnStartSec` 默认 0 的机器上 `generation-changed` 与 `past-half-life`
+   * 两条判据**永不生效** —— 中继重启后屏上那张码已经死了，而"刷新"因为本地
+   * 未过期会原样返回它，用户只能干等 TTL。现在只在"没有活动码且不自动发码"时早退。
+   */
   tick(): boolean {
-    if (this.pairSec <= 0) return false
+    if (this.pairSec <= 0 && this.active === null) return false
     // 发布闸门：**不在线就一张都不发**。`RelayClient.raw()` 对非 OPEN 的 socket 是静默丢弃，
     // 只记本地就会留下"status.json 显示有效、中继那边根本没收到"的死码（取证 §6.2）。
     if (!this.deps.relayOnline()) return false
@@ -144,8 +184,16 @@ export class PairingWindow {
     return published
   }
 
-  /** 请求值来自 `pairOnStartSec`，服务端一旦回过 `ttlMs` 就以它为准。 */
+  /**
+   * 请求值来自 `pairOnStartSec`；服务端一旦回过 `ttlMs` 就以它为准。
+   *
+   * `pairOnStartSec <= 0`（默认）时不能拿 `pairSec*1000` 当基线——那会得到 1 秒，
+   * 于是"已经挂出去的那张"每次 tick 都被判成过半程、3 秒换一张（永远没有能用的码）。
+   * 这一档用 `defaultTtlMs`（调用方传的是配置里的 `pairTtlMs`）：屏幕上那张码是
+   * 用户点出来的，它按常规 TTL 老化。
+   */
   private ttlMs(): number {
-    return this.requestedTtlMs ?? Math.max(1_000, this.pairSec * 1_000)
+    if (this.requestedTtlMs !== undefined) return this.requestedTtlMs
+    return this.pairSec > 0 ? Math.max(1_000, this.pairSec * 1_000) : this.defaultTtlMs
   }
 }

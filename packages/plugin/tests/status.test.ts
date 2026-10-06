@@ -256,3 +256,26 @@ function existsTmp(file: string): boolean {
     return false
   }
 }
+
+test('写盘前要再 chmod 一次：tmp 残留/pid 复用不许让新快照沿用旧权限', () => {
+  // 现场：tmp 名里只有 pid，上一次同 pid 的进程留下的残留（或 pid 被复用后的旧文件）
+  // 可能带着更宽的权限，而 writeFileSync 的 mode 只在**创建**时生效——直接改名就把宽权限
+  // 带给了正式文件，而 status.json 里可能有仍然有效的配对码 + PSK（pairOnStartSec）。
+  const dir = mkdtempSync(path.join(tmpdir(), 'drc-status-mode-'))
+  const file = path.join(dir, 'status.json')
+  const tmp = `${file}.tmp-${process.pid}`
+  writeFileSync(tmp, '{"stale":true}', { mode: 0o644 })
+  chmodSync(tmp, 0o644)
+  try {
+    const status = new StatusFile(file, DEFAULT_SYSTEM_CLOCK)
+    status.write({ carrier: 'services' })
+    assert.equal(
+      statSync(file).mode & 0o777,
+      0o600,
+      `status.json 的权限是 ${(statSync(file).mode & 0o777).toString(8)}：里面可能有 PSK`,
+    )
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).carrier, 'services', '夹具自检：内容确实被新快照覆盖了')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

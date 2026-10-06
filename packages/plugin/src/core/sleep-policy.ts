@@ -45,6 +45,10 @@ const DEFAULTS: KeepAwakeOptions = {
   tickMs: 10_000,
 }
 
+/** 拿锁失败后的重试退避：第一档 10 秒（= 一个 tick），之后翻倍，封顶 5 分钟。 */
+const RETRY_BASE_MS = 10_000
+const RETRY_MAX_MS = 300_000
+
 export class KeepAwake {
   private options: KeepAwakeOptions
   private enabled = false
@@ -55,6 +59,9 @@ export class KeepAwake {
   private timer: unknown
   private stopped = false
   private reason: string | undefined
+  /** 连续拿锁失败次数（退避用）与下一次允许重试的时刻。 */
+  private failures = 0
+  private nextRetryAt = 0
 
   constructor(
     private readonly port: SleepPort,
@@ -75,7 +82,13 @@ export class KeepAwake {
       this.options = { ...this.options, idleReleaseMs: idleReleaseSec * 1000 }
     }
     if (!enabled) this.stopLock()
-    else this.markActive()
+    else {
+      // 用户**显式**把开关打开：把失败退避清零，这一次要真去试（否则"刚打开就说没锁上、
+      // 还要等退避窗口"看起来就是坏的）。
+      this.failures = 0
+      this.nextRetryAt = 0
+      this.markActive()
+    }
     return this.snapshot()
   }
 
@@ -125,6 +138,7 @@ export class KeepAwake {
   }
 
   snapshot(): KeepAwakeSnapshot {
+    this.reconcile()
     return {
       enabled: this.enabled,
       active: this.held,
@@ -153,10 +167,47 @@ export class KeepAwake {
   }
 
   private acquire(): void {
+    const now = this.clock.now()
+    // 退避窗口内不再向后端发问：原来同步失败（没有受支持的平台、命令构造失败）会每
+    // 10 秒原样重试一次，日志刷屏、也无谓地反复 spawn。
+    if (now < this.nextRetryAt) return
     const started = this.port.start(this.options.ownerPid, this.options.keepDisplay)
     this.held = started.ok
     this.reason = started.message
-    this.lastRefreshAt = this.clock.now()
+    this.lastRefreshAt = now
+    if (started.ok) {
+      this.failures = 0
+      this.nextRetryAt = 0
+      return
+    }
+    this.failures += 1
+    // 指数退避，封顶 5 分钟：一次失败之后间隔翻倍，但不会退到"再也不试"。
+    this.nextRetryAt = now + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (this.failures - 1))
+  }
+
+  /**
+   * 用后端的真实状态校正 `held`。
+   *
+   * 为什么必须有这一条：`port.start()` 的同步 `ok` 只说明"命令发出去了"——
+   * macOS 上 spawn 失败是**异步** `'error'` 事件（见 `platform/sleep-posix.ts`），
+   * 那一刻 `held` 还是 true，于是 status.json 与手机上的 `active` 一直谎报
+   * "已开启防休眠"，而且因为 `held===true` 再也不会重试。`isActive()` 本来就是
+   * 为对账准备的（后端只有它知道子进程还在不在），生产里此前没有人调。
+   */
+  private reconcile(): void {
+    if (!this.held) return
+    let alive = true
+    try {
+      alive = this.port.isActive()
+    } catch {
+      // 读不出来就别乱改状态：宁可多报一次"持锁中"，也不能把真的锁报成没了。
+      return
+    }
+    if (alive) return
+    this.held = false
+    this.reason = '防休眠后端报告未持锁（spawn 失败或进程已退出）'
+    // 下一个 tick 的 evaluate() 会按退避重新 acquire；这里不立刻重试，避免抖动。
+    if (this.nextRetryAt === 0) this.nextRetryAt = this.clock.now() + RETRY_BASE_MS
   }
 
   private stopLock(): void {

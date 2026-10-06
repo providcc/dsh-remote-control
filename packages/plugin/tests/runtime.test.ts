@@ -2103,3 +2103,320 @@ test('send_prompt 只发图不发字：正文不许塞一个空文本块（模�
   assert.equal(sent.text, '', '只发图时正文保持空')
   assert.equal(sent.attachments?.length, 1, '只发图也要把图送进去')
 })
+
+/* ── 2026-10-06 缺陷修复：结算纪律 / 撤回 / 停机 / 补发口径 ──────────────── */
+
+test('平台已经撤销（signal 已 abort）的审批：当场交还桌面，不发卡、不挂锁、不占满超时窗口', async () => {
+  // 现场形状：`carrier-services.participate()` 在调用 sink **之前**就把平台撤下来的
+  // signal 转成 `controller.abort('platform')`，而 runtime 收到的正是这条 controller 的
+  // signal。对**已经 abort** 的 signal `addEventListener('abort', …)` 永远不会触发：
+  // 旧实现照样 hold 锁、照样发卡，手机上是一张可点的死卡，宿主那条 waterfall 被堵满
+  // 整个超时窗口（180s），期间手机点"允许"还会被当成真答案。
+  const { runtime, kernel, transport, sleep, events } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_ab0rt000001')
+  const controller = new AbortController()
+  controller.abort('platform')
+
+  let settled: ApprovalDecision | undefined
+  const kernelSide = kernel.sink?.approval({
+    sessionId: 'ses_live',
+    action: 'bash rm -rf',
+    signal: controller.signal,
+  })
+  void kernelSide?.then((value) => {
+    settled = value
+  })
+  await settle()
+
+  assert.equal(settled, 'decline', '已经撤销的审批必须**立刻**交还桌面，而不是挂到超时（旧实现这里一直是 undefined）')
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evPermissionRequest).length,
+    0,
+    '撤销的审批还发卡：手机上多一张点了也没用的死卡',
+  )
+  assert.deepEqual(sleep.holdIds, [], '撤销的审批不该 hold 锁：hold 了就要等超时才 release，期间机器不睡')
+  assert.equal(sleep.liveHolds.size, 0, '挂锁泄漏')
+  assert.equal(
+    events.some((item) => item.message === 'approval already withdrawn by the platform, handing back to the desktop'),
+    true,
+    '这条路径必须留痕：否则"手机上为什么没弹卡"没有任何答案',
+  )
+})
+
+test('平台已经撤销的提问：当场返回 null（交还桌面），不发卡、不挂锁', async () => {
+  const { runtime, kernel, transport, sleep } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_ab0rt000002')
+  const controller = new AbortController()
+  controller.abort('platform')
+
+  let settled: AskUserQuestionAnswerValue | null | undefined
+  const kernelSide = kernel.sink?.question({
+    sessionId: 'ses_live',
+    questions: [{ id: 'q1', question: '继续吗' }],
+    signal: controller.signal,
+  })
+  void kernelSide?.then((value) => {
+    settled = value
+  })
+  await settle()
+
+  assert.equal(settled, null, '已经撤销的提问必须立刻返回 null，而不是挂 300 秒')
+  assert.equal(
+    transport.replies.filter((item) => item.payload.t === PAYLOAD_TYPES.evQuestionRequest).length,
+    0,
+    '撤销的提问还发卡：手机上一张 300 秒的死卡',
+  )
+  assert.deepEqual(sleep.holdIds, [], '撤销的提问不该 hold 锁')
+})
+
+test('审批的落点只认 approve：deny/decline/cancel 一律 rejected（fail-open 会替用户放行）', async () => {
+  for (const decision of ['deny', 'decline', 'cancel', 'Allow', '']) {
+    const { runtime, kernel, transport } = fixture()
+    runtime.start()
+    await settle()
+    transport.pair('c_decision001')
+    const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+    await settle()
+    const card = transport.replies
+      .map((item) => item.payload)
+      .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+      EvPayload,
+      { t: 'ev.permission_request' }
+    >
+    await runtime.handleCommand(
+      cmd(PAYLOAD_TYPES.cmdResolvePermission, {
+        sessionId: 'ses_live',
+        requestId: card.requestId,
+        decision,
+      }),
+      'c_decision001',
+    )
+    assert.equal(
+      await kernelSide,
+      'rejected',
+      `decision=${JSON.stringify(decision)} 被当成了放行：未知词一律按拒绝（白名单只有 approve/reject）`,
+    )
+  }
+})
+
+test('跨类结算必须拒掉：拿审批的 requestId 去答提问（或反过来）回 ok:false 且两边都还挂着', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_cross000001')
+
+  const approvalSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  const questionSide = kernel.sink?.question({ sessionId: 'ses_live', questions: [{ id: 'q1', question: '继续吗' }] })
+  await settle()
+  const approvalCard = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evPermissionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.permission_request' }
+  >
+  const questionCard = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  assert.ok(approvalCard && questionCard, '夹具自检：两类卡都要发出去')
+
+  // 用**提问的** requestId 去答审批。
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, {
+      sessionId: 'ses_live',
+      requestId: questionCard.requestId,
+      decision: 'approve',
+    }),
+    'c_cross000001',
+  )
+  await settle()
+  assert.equal(
+    transport.resultReplies().at(-1)?.ok,
+    false,
+    '跨类结算回了 ok:true：手机上那张提问卡会被一个审批答案收掉，而平台拿到一个它没问过的决定',
+  )
+
+  // 反向：用**审批的** requestId 去答提问。
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdAnswer, {
+      sessionId: 'ses_live',
+      requestId: approvalCard.requestId,
+      answers: [{ questionId: 'q1', selected: ['o1'] }],
+    }),
+    'c_cross000001',
+  )
+  await settle()
+  assert.equal(transport.resultReplies().at(-1)?.ok, false, '拿审批的 id 答提问同样必须拒')
+  assert.equal(runtime.waiting.count, 2, `跨类结算把挂起项吃掉了：waiting=${runtime.waiting.count}（应当仍是 2）`)
+
+  // 两边仍能被自己的那一类正常结算（证明前面拒掉的是"跨类"，不是"全都答不了"）。
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdResolvePermission, {
+      sessionId: 'ses_live',
+      requestId: approvalCard.requestId,
+      decision: 'approve',
+    }),
+    'c_cross000001',
+  )
+  assert.equal(await approvalSide, 'allowed-once')
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdAnswer, {
+      sessionId: 'ses_live',
+      requestId: questionCard.requestId,
+      answers: [{ questionId: 'q1', selected: ['o1'] }],
+    }),
+    'c_cross000001',
+  )
+  assert.notEqual(await questionSide, null, '正类结算也必须还能用')
+})
+
+test('空 answers 不是答案：cmd.answer 回 ok:false，提问仍挂着（回一条"答过了"是假事实）', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_emptyans0001')
+  const kernelSide = kernel.sink?.question({ sessionId: 'ses_live', questions: [{ id: 'q1', question: '继续吗' }] })
+  await settle()
+  const card = transport.replies
+    .map((item) => item.payload)
+    .find((payload) => payload.t === PAYLOAD_TYPES.evQuestionRequest) as Extract<
+    EvPayload,
+    { t: 'ev.question_request' }
+  >
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdAnswer, { sessionId: 'ses_live', requestId: card.requestId, answers: [] }),
+    'c_emptyans0001',
+  )
+  await settle()
+  assert.equal(transport.resultReplies().at(-1)?.ok, false, 'answers: [] 被当成有效答案回了 ok:true')
+  assert.equal(runtime.waiting.count, 1, '空答案把挂起项结算掉了：手机上那张卡还亮着，平台却收到"答过了"')
+
+  // 真答案仍然有效。
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdAnswer, {
+      sessionId: 'ses_live',
+      requestId: card.requestId,
+      answers: [{ questionId: 'q1', selected: ['o1'] }],
+    }),
+    'c_emptyans0001',
+  )
+  assert.notEqual(await kernelSide, null, '补一条真答案必须还能答上')
+})
+
+test('stop() 结算挂起项要发"作废帧"：停机时通道还活着，手机上那张卡必须当场收掉', async () => {
+  const { runtime, kernel, transport, sleep, events } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_stopvoid0001')
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+
+  runtime.stop()
+  await settle()
+
+  assert.equal(await kernelSide, 'decline', '停机仍要立刻结算挂起的审批')
+  assert.equal(sleep.liveHolds.size, 0, '停机后仍挂着锁')
+  const resolved = transport.ofType(PAYLOAD_TYPES.evPermissionResolved)
+  assert.ok(
+    resolved.length >= 1 || lastRunState(transport) !== undefined,
+    '停机没发作废帧：手机上那张卡会一直亮到 TTL 走完（停机顺序里 relay 还没停，发得出去）',
+  )
+  assert.equal(voidReason(events), 'withdrawn', '停机收场该说"被撤回"而不是"桌面答了"（by 字段决定手机上那句话）')
+})
+
+test('审批/提问的 executor 抛出（reply 抛）也必须 releaseHold：挂锁不能因为一次异常永久泄漏', async () => {
+  const { runtime, kernel, transport, sleep } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_throwhold0001')
+  // 发卡那一步抛（socket 刚断、加密失败……任何一处）。旧写法里 releaseHold 排在 await 之后，
+  // executor 抛出 → promise reject → releaseHold 永不执行 → 这台机器再也不睡。
+  transport.reply = (): boolean => {
+    throw new Error('socket 已经没了')
+  }
+  const kernelSide = kernel.sink?.approval({ sessionId: 'ses_live', action: 'bash' })
+  await assert.rejects(() => kernelSide as Promise<unknown>, '异常必须原样传出去（不许吞成一次静默的 decline）')
+  assert.equal(
+    sleep.liveHolds.size,
+    0,
+    `executor 抛出后仍挂着锁：${JSON.stringify([...sleep.liveHolds])} → caffeinate 永久泄漏`,
+  )
+})
+
+test('attachInteractionSink 抛出时不许"半启动且不可重试"：下一次 start() 必须还能挂上', async () => {
+  const { runtime, kernel, transport } = fixture()
+  const original = kernel.attachInteractionSink!.bind(kernel)
+  let fail = true
+  kernel.attachInteractionSink = (sink) => {
+    if (fail) throw new Error('这一代宿主 register 抛了')
+    return original(sink)
+  }
+
+  runtime.start()
+  await settle()
+  assert.equal(kernel.sink === undefined, true, '夹具自检：第一轮确实没挂上')
+
+  fail = false
+  runtime.start() // 旧实现：started 已经是 true → 直接 return，这条 runtime 永远没有交互面
+  await settle()
+  assert.ok(kernel.sink !== undefined, 'sink 抛出之后 start() 不可重试：手机上永远不会有审批/提问卡')
+
+  transport.pair('c_attach000001')
+  const kernelSide = kernel.sink!.approval({ sessionId: 'ses_live', action: 'bash' })
+  await settle()
+  assert.notEqual(kernelSide, undefined, '重试之后审批面必须真的能用')
+})
+
+test('pushSessions 的广播段抛出不许变成未捕获拒绝：调用点全是 void，一旦漏出去就是进程被终止', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_pushcrash001')
+  transport.broadcast = (): number => {
+    throw new Error('加密或写 socket 炸了')
+  }
+  await assert.doesNotReject(() => runtime.pushSessions('list'), 'pushSessions 抛出=未捕获拒绝=Node 默认终止宿主进程')
+
+  // 调用点（内核事件）那一侧同样：feed 是同步的，拒绝只能靠 .catch 兜。
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown): void => {
+    rejections.push(reason)
+  }
+  process.on('unhandledRejection', onRejection)
+  try {
+    kernel.feed({ kind: 'title', sessionId: 'ses_live', title: 'x' })
+    await settle()
+    await new Promise((resolve) => setImmediate(resolve))
+  } finally {
+    process.off('unhandledRejection', onRejection)
+  }
+  assert.deepEqual(rejections, [], `内核事件触发的推送出现了未捕获拒绝：${String(rejections[0])}`)
+})
+
+test('模型补发只带**当前列表里**的会话：缓存里的旧会话不许每次都往手机上灌', async () => {
+  const { runtime, kernel, transport } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_modelcap0001')
+  // 三条会话各报过一次模型，但列表里只留一条（另两条已经掉出 LIMIT 截断）。
+  kernel.feed({ kind: 'model', sessionId: 'ses_keep', model: 'keep-model' })
+  kernel.feed({ kind: 'model', sessionId: 'ses_gone1', model: 'gone-1' })
+  kernel.feed({ kind: 'model', sessionId: 'ses_gone2', model: 'gone-2' })
+  await settle()
+  kernel.listing = [{ id: 'ses_keep', state: 'idle', running: false, title: '留着' }]
+  transport.broadcasts.length = 0
+
+  await runtime.pushSessions('list')
+  await settle()
+
+  const models = transport.ofType(PAYLOAD_TYPES.evModel) as Array<{ sessionId?: string; model?: string }>
+  assert.equal(models.length, 1, `补发了 ${models.length} 条模型帧：缓存里的旧会话每次状态变化都要占一帧`)
+  assert.equal(models[0]?.sessionId, 'ses_keep', '补发的必须是列表里那条')
+  assert.equal(models[0]?.model, 'keep-model', '补发的模型值不许串台')
+})

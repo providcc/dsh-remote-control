@@ -73,8 +73,12 @@ export interface RelayClientOptions {
   onPairReady: (pairingToken: string, ttlMs: number) => void
   /**
    * 中继宣告"这张配对码没配上"（`expired` / `already_used` / `rate_limited` /
-   * `invalid_or_expired`）。主机侧唯一的用处是**退避自动补发**：
-   * 被限速时还按原节拍发码，只会让自己继续被拒。
+   * `invalid_or_expired`）。
+   *
+   * 这个回调**必须被接上**（index.ts 的 `onPairFail`）：中继说码废了，而主机这边
+   * 一张都不换的话，屏幕上那张死码会一直挂着，用户对着 `already_used` 反复扫，
+   * 只能等 TTL 走完（`pairOnStartSec` 默认 0，没有任何东西会自动补发）。
+   * 接线方要做的是"清展示位 + 作废这张 + 按需补一张"；被限速时不建议立刻再申请。
    */
   onPairFail?: (reason: string) => void
   /** 连接状态变化，直接进 status.json。 */
@@ -249,7 +253,12 @@ export class RelayClient {
 
   stop(): void {
     this.stopped = true
-    if (this.reconnectTimer !== undefined) this.options.clock.clearTimeout(this.reconnectTimer)
+    if (this.reconnectTimer !== undefined) {
+      this.options.clock.clearTimeout(this.reconnectTimer)
+      // 句柄要一起清掉：`scheduleReconnect` 靠它判"已经排着一次重连"，
+      // 留着它会让人以为还有一次重连在路上。
+      this.reconnectTimer = undefined
+    }
     this.closeSocket()
     this.emitState('offline', 'stopped')
   }
@@ -541,11 +550,26 @@ export class RelayClient {
 
   private scheduleReconnect(problem: string): void {
     if (this.stopped) return
+    /**
+     * **已经排着一次重连就不再排**（2026-10-06）。
+     *
+     * 握手超时那条路会**同时**踩到两个调用点：超时回调里 `terminate()` + 直接
+     * `scheduleReconnect('握手超时')`，而 `terminate()` 又会逼出 `close` 事件、
+     * 那条路径再 `scheduleReconnect('closed …')` 一次。两个 timer 各自延时执行，
+     * 不但退避按 2 的幂翻倍（4 倍增长），后一个还会把前一个刚建立的连接掐掉
+     * —— 表现是"刚连上又断"的抖动。
+     */
+    if (this.reconnectTimer !== undefined) return
     this.emitState('offline', problem)
     const base = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** this.attempts)
     this.attempts += 1
     const delay = base + Math.floor((randomBytes(2).readUInt16BE(0) / 65536) * 500)
-    this.reconnectTimer = this.options.clock.setTimeout(() => this.connect(), delay)
+    this.reconnectTimer = this.options.clock.setTimeout(() => {
+      // 定时器已经用掉了：不清的话下面每一次 scheduleReconnect 都会被上面那道闸门挡回去，
+      // 重连就此永久停摆（比双 timer 更糟）。
+      this.reconnectTimer = undefined
+      this.connect()
+    }, delay)
   }
 
   private closeSocket(): void {

@@ -164,20 +164,6 @@ export interface KernelHistoryPage {
   nextBeforeSeq?: number
 }
 
-/** 一次待决审批。`id` 是插件自己生成的关联键（手机回传时逐字带回）。 */
-export interface PendingApproval {
-  id: string
-  sessionId: string
-  /** 平台侧的审计 id（`approval/asked` 里那个），有就带着，便于取证。 */
-  platformId?: string
-  action: string
-  reason?: string
-  /** 挂起的 abort 信号：手机一直不回答案时由平台侧撤销。 */
-  signal?: AbortSignal
-  /** 认领这次决定：返回平台词汇的 outcome。 */
-  settle(outcome: ApprovalOutcomeValue): void
-}
-
 /** 平台词汇（`@deepseek-ai/dsh-user-approval` 的 `ApprovalOutcome`）。 */
 export type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 

@@ -26,6 +26,11 @@ class FakeBackend implements SleepPort {
   readonly starts: StartCall[] = []
   stops = 0
   startResult: { ok: boolean; message?: string } = { ok: true }
+  /**
+   * 非 undefined 时直接回答 `isActive()`：用来演"spawn 异步失败、子进程已经没了"
+   * 这一档（真后端就是靠子进程句柄回答的，见 `platform/sleep-posix.ts`）。
+   */
+  activeOverride: boolean | undefined
 
   constructor(
     private readonly backendName = 'fake-caffeinate',
@@ -50,7 +55,7 @@ class FakeBackend implements SleepPort {
   }
 
   isActive(): boolean {
-    return this.starts.length > this.stops
+    return this.activeOverride ?? this.starts.length > this.stops
   }
 }
 
@@ -364,4 +369,44 @@ test('stop() 之后再 advance 也不许有任何事件被处理（闸门在 eva
   await clock.advance(1_000_000)
   assert.equal(backend.starts.length + backend.stops, before, '停机后节拍仍在驱动拿锁/放锁')
   assert.equal(clock.pending, 0, '停机后仍有定时器存活')
+})
+
+/* ── 2026-10-06 缺陷修复：与后端对账 + 失败退避 ─────────────────────────── */
+
+test('后端异步失败（spawn error 之后子进程没了）时 snapshot 必须校正 held，不许一直谎报"已开启防休眠"', () => {
+  const { clock, backend, sleep } = fixture()
+  sleep.setEnabled(true, 300)
+  assert.equal(sleep.snapshot().active, true, '夹具自检：同步 ok 时先按持锁报')
+
+  // 现场：`port.start()` 的同步 ok 只说明命令发出去了，macOS 上 spawn 失败是**异步**
+  // 'error' 事件（见 platform/sleep-posix.ts）——那一刻后端已经没有子进程了。
+  // 旧实现不看 `isActive()`（生产无人调），held 永远是 true：status.json 与手机上
+  // 一直说"已开启防休眠"，而且因为 held===true 再也不会重试。
+  backend.activeOverride = false
+  const snapshot = sleep.snapshot()
+  assert.equal(snapshot.active, false, '后端都没锁了还报 active:true：手机上显示"已开启防休眠"，机器照睡')
+  assert.match(String(snapshot.reason ?? ''), /未持锁|后端/, '要对账就要说得出原因，否则用户只看到一个突然变灰的开关')
+  assert.ok(clock.pending >= 1, '校正之后节拍还在：下一个 tick 要能按退避重试')
+})
+
+test('后端同步失败之后按指数退避重试：不许每 10 秒原样刷一次，也不许试两下就停用', async () => {
+  const { clock, backend, sleep } = fixture()
+  backend.startResult = { ok: false, message: 'caffeinate 不在 PATH 里' }
+  // 0 = 不自动放锁：这条测的是退避，不想让"空闲释放"混进来。
+  sleep.setEnabled(true, 0)
+  const first = backend.starts.length
+  assert.ok(first >= 1, '夹具自检：第一轮应当真的试过一次')
+
+  // 退避序列是 0s / 10s / 30s / 70s…：头一分钟最多 3 次。
+  // 旧实现每个 tick（10 秒）原样重试一次 = 6 次。
+  await clock.advance(60_000)
+  const inMinute = backend.starts.length - first
+  assert.ok(inMinute <= 3, `头一分钟试了 ${inMinute} 次：没有退避，每 10 秒原样重试会一直刷日志`)
+
+  // 但退避不许退化成"停用"：封顶之后后端恢复了必须还能拿回锁。
+  await clock.advance(600_000)
+  assert.ok(backend.starts.length > first + inMinute, '退避封顶之后再也不试：后端恢复了也拿不回锁')
+  backend.startResult = { ok: true }
+  await clock.advance(600_000)
+  assert.equal(sleep.snapshot().active, true, '后端恢复之后必须能真的持锁')
 })

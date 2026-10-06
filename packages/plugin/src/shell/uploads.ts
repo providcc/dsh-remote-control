@@ -43,6 +43,18 @@ export interface SaveFilesFail {
 export type SaveFilesResult = SaveFilesOk | SaveFilesFail
 
 /**
+ * 一批文件附件的**总字节预算**，与 mp 侧 `chat.js` 的 `MAX_ATTACH_TOTAL_BYTES` 同值同口径
+ * （按 base64 解出来的原始字节算）。
+ *
+ * 为什么主机侧也必须有这一道：单文件 512KB 挡不住"4 × 512KB"——schema 允许 `files.max(4)`，
+ * 最坏一批是 2MB 原文 ≈ 2.7MB base64 进一帧，而中继的 `maxPayload` 是 1MB：
+ * 整帧被掐、socket 1009 断开，用户看到的是"发个附件就掉线"。mp 侧有这道闸，
+ * 但它是**客户端**；一条旧版/被改过的小程序照样能把超限批次送上来，所以主机侧按
+ * 同一把尺子再量一遍（口径差一点都会出现"手机说发出去了、主机回失败"的分叉）。
+ */
+export const MAX_ATTACH_TOTAL_BYTES = 512 * 1024
+
+/**
  * 文件名/目录名收敛：只留 [A-Za-z0-9._-]，其余折成 _；空串与超长都有兜底。
  * **点号开头的名字直接丢掉点**——.ssh 这种隐藏路径不该由一条手机消息造出来。
  */
@@ -95,9 +107,12 @@ export function saveFileAttachments(options: {
   sessionId: string
   maxCount?: number
   maxBytesPerFile?: number
+  /** 整批的原始字节上限；默认与 mp 侧同值（见 {@link MAX_ATTACH_TOTAL_BYTES}）。 */
+  maxTotalBytes?: number
 }): SaveFilesResult {
   const maxCount = options.maxCount ?? 4
   const maxBytes = options.maxBytesPerFile ?? 512 * 1024
+  const maxTotalBytes = options.maxTotalBytes ?? MAX_ATTACH_TOTAL_BYTES
   const files = options.files || []
   if (files.length === 0) return { ok: true, saved: [], dir: options.dir }
   if (files.length > maxCount) {
@@ -105,6 +120,7 @@ export function saveFileAttachments(options: {
   }
 
   const decoded: Array<{ file: (typeof files)[number]; buf: Buffer }> = []
+  let totalBytes = 0
   for (const [i, one] of files.entries()) {
     const buf = decodeBase64(one.data)
     if (!buf) return { ok: false, message: `第 ${i + 1} 个文件的解码失败（不是合法 base64）` }
@@ -112,6 +128,15 @@ export function saveFileAttachments(options: {
       return {
         ok: false,
         message: `第 ${i + 1} 个文件有 ${Math.round(buf.length / 1024)}KB，超过单个上限 ${Math.round(maxBytes / 1024)}KB`,
+      }
+    }
+    totalBytes += buf.length
+    if (totalBytes > maxTotalBytes) {
+      return {
+        ok: false,
+        message: `这一批附件合计 ${Math.round(totalBytes / 1024)}KB，超过整批上限 ${Math.round(
+          maxTotalBytes / 1024,
+        )}KB（第 ${i + 1} 个文件让它超了，请少带几个）`,
       }
     }
     decoded.push({ file: one, buf })

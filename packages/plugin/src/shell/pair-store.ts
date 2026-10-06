@@ -166,6 +166,15 @@ export class PairStore {
       this.dirty = false
       return true
     } catch (error) {
+      /**
+       * **失败之后必须保持脏**（2026-10-06）。
+       *
+       * 结构性变化（新配对建立的 PSK、会话作废）走的是"立刻 save"这条路；写盘失败时
+       * 若把 dirty 复位成 false，`status` 的 3 秒 tick 看到 `hasPendingChanges=false`
+       * 就**再也不会重试** —— 新配对的 PSK 静默不落盘，用户下一次重启面对的是
+       * "明明配过还要重新扫码"。保持脏，下一个 tick 会再试一次。
+       */
+      this.dirty = true
       log?.('pair-store save failed (pairing will need a rescan after the next restart)', {
         message: String((error as Error)?.message ?? error).slice(0, 120),
       })

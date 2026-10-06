@@ -301,15 +301,6 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   let approvalAsked = 0
   let approvalDecided = 'not-seen'
 
-  /**
-   * 模型面的登记结果，进 status.json。
-   *
-   * 为什么要单独记一份而不在读的时候现探：手机上「模型下拉是空的」有两种完全不同的原因
-   * —— 宿主根本不能换（那下拉就该置灰并说明），或者能换但我们没读到清单。
-   * 不把`agentDefaultModel` 的实际成员报出来，这两者就只能靠猜。
-   */
-  const modelMethods: string[] = []
-
   /** 软探测一个成员是不是函数。返回类型用 unknown 参数表，调用点各自窄化。 */
   const fn = (owner: unknown, name: string): ((...args: any[]) => unknown) | undefined => {
     if (!owner) return undefined
@@ -622,8 +613,6 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     for (const name of MODEL_FACE_METHODS) {
       if (fn(owner, name)) hits.push(name)
     }
-    modelMethods.length = 0
-    modelMethods.push(...hits)
     return {
       hits,
       canList: hits.some((n) => MODEL_LIST_METHODS.has(n)),
@@ -791,7 +780,17 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       Promise.resolve(read.call(services.sessionQuery, sessionId)),
       options.historyTimeoutMs ?? HISTORY_TIMEOUT_DEFAULT,
     )) as { events?: Array<{ type?: unknown; seq?: unknown; data?: unknown }> } | undefined
-    const events = Array.isArray(loaded?.events) ? loaded!.events : []
+    /**
+     * **`events` 不是数组时必须抛，不许静默回一张空页**（2026-10-06）。
+     *
+     * 空页在手机上是"这个会话没内容"——一个会让人查错方向的假事实，与本文件
+     * 上面"能力缺失就抛"那条纪律同源。`readSession` 的形状变了（返回 undefined、
+     * 或返回 `{items: …}`）时旧写法会把它当成"零条历史"，现场看起来完全正常。
+     */
+    if (!Array.isArray(loaded?.events)) {
+      throw new Error(`会话历史读不出来：sessionQuery.readSession 没回 events 数组（shape=${shapeOf(loaded)}）`)
+    }
+    const events = loaded.events
     return historyPageFromLog({
       sessionId,
       events,
@@ -800,13 +799,54 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     })
   }
 
+  /**
+   * `on` 到晚时的补登记表（订阅与交互面登记各推一条 binder；binder 返回 false = 还没成）。
+   *
+   * 重试窗口刻意很短（0/50/250/1000ms 四档）：要覆盖的是"`ctx.inject` 回调在一个微任务
+   * 之后才把 `on` 绑上来"这个尺度，不是网络。四档都没等到就如实记日志放弃——
+   * 不会留下吊住宿主的定时器（这也是 e2e"跑完还要等一分钟"那类事故的形状）。
+   */
+  const lateBinders: Array<() => boolean> = []
+  const LATE_BIND_DELAYS_MS = [0, 50, 250, 1_000] as const
+  let lateTimer: unknown
+  let lateAttempt = 0
+
+  const scheduleLateBind = (): void => {
+    if (lateTimer !== undefined || lateAttempt >= LATE_BIND_DELAYS_MS.length) return
+    const delay = LATE_BIND_DELAYS_MS[lateAttempt] ?? 1_000
+    lateAttempt += 1
+    const handle = options.clock.setTimeout(() => {
+      lateTimer = undefined
+      if (typeof services.on !== 'function') {
+        scheduleLateBind()
+        return
+      }
+      let pending = false
+      for (const binder of [...lateBinders]) {
+        try {
+          if (!binder()) pending = true
+        } catch (error) {
+          log('late event bind failed', { message: messageOf(error) })
+        }
+      }
+      if (pending) scheduleLateBind()
+    }, delay)
+    // 尽力 unref：这条重试链最坏横跨 1.3 秒，插件自己的纪律是"绝不吊住宿主的事件循环"
+    // （见 core/clock.ts 的 createOneShotTimers）。假时钟给的是数字句柄，可选调用天然空转。
+    ;(handle as { unref?: () => void } | undefined)?.unref?.()
+    lateTimer = handle
+  }
+
+  const addLateBinder = (binder: () => boolean): void => {
+    lateBinders.push(binder)
+    // 新的等待方进来了：把重试窗口重新打开（上一个等待方可能已经用光了那四档）。
+    if (lateTimer === undefined) lateAttempt = 0
+    scheduleLateBind()
+  }
+
   function subscribe(onEvent: (event: KernelEvent) => void): () => void {
-    const on = services.on
-    if (typeof on !== 'function') {
-      log('kernel has no on(); streaming disabled', { keys: shapeOf(services) })
-      return () => {}
-    }
     const disposers: Array<() => void> = []
+    let disposed = false
     /**
      * 注册一个**永远不会往外抛**的监听器。
      *
@@ -827,17 +867,43 @@ export function createServicesKernel(services: ServicesBundle, options: Services
         }
       }
       disposers.push(
-        guardedSubscribe(on as never, name, guardedHandler as never, (message, fields) => log(message, fields)),
+        guardedSubscribe(services.on as never, name, guardedHandler as never, (message, fields) =>
+          log(message, fields),
+        ),
       )
     }
-    bind('session/event', (...args) => translateSessionEvent(onEvent, args))
-    bind('session/created', () => onEvent({ kind: 'sessions-changed', reason: 'session/created' }))
-    bind('agent/status', (...args) => translateAgentStatus(onEvent, args))
-    bind('agent/error', (...args) => {
-      const sessionId = sessionIdOf(args)
-      if (sessionId) onEvent({ kind: 'run-state', sessionId, state: 'idle', detail: 'agent-error' })
-    })
+    /**
+     * **订阅可以在 `on` 从无到有时补上**（2026-10-06 真机取证）。
+     *
+     * `services` 是热补丁对象：`tryStart()` 在 `ctx.get('sessions', true)` 同步可得时
+     * 会在任何 `ctx.inject` 回调**之前**把内核启起来，那一刻 `services.on` 还是
+     * undefined（on 要等作用域上下文那条回调才绑上来）。旧实现这时记一句
+     * `kernel has no on(); streaming disabled` 并**永久**返回空退订，
+     * 而 `HostRuntime.start()` 有 started 闸门不会重试 → 该进程内流式全黑，
+     * 只有重启宿主才能恢复；`describe().hasOn` 每次现读、那时早已是 true，会掩盖真相。
+     *
+     * 所以：第一次拿不到就登记一条补绑，短窗口重试（覆盖"一个微任务之后"这个尺度）。
+     */
+    const bindAll = (): boolean => {
+      if (disposed) return true
+      if (disposers.length > 0) return true
+      const on = services.on
+      if (typeof on !== 'function') return false
+      bind('session/event', (...args) => translateSessionEvent(onEvent, args))
+      bind('session/created', () => onEvent({ kind: 'sessions-changed', reason: 'session/created' }))
+      bind('agent/status', (...args) => translateAgentStatus(onEvent, args))
+      bind('agent/error', (...args) => {
+        const sessionId = sessionIdOf(args)
+        if (sessionId) onEvent({ kind: 'run-state', sessionId, state: 'idle', detail: 'agent-error' })
+      })
+      return true
+    }
+    if (!bindAll()) {
+      log('kernel has no on() yet; streaming will start as soon as it appears', { keys: shapeOf(services) })
+      addLateBinder(bindAll)
+    }
     return () => {
+      disposed = true
       for (const dispose of disposers) {
         try {
           dispose()
@@ -845,6 +911,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
           /* 退订失败无所谓 */
         }
       }
+      disposers.length = 0
     }
   }
 
@@ -906,44 +973,55 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   function attachInteractionSink(next: InteractionSink): () => void {
     sink = next
     const disposers: Array<() => void> = []
-    const on = services.on
-    if (typeof on !== 'function') {
-      for (const name of PARTICIPATED_EVENTS) faces[name].registered = 'no on()'
-      return () => {
-        sink = undefined
+    let detached = false
+    /**
+     * 与 `subscribe()` 同一条理由：`on` 可能晚一步才挂上来（热补丁对象），
+     * 而交互面登记晚一步就等于**手机上永远不弹审批/提问卡**、平台的 waterfall
+     * 一直等到超时。第一次拿不到就登记一条补绑。
+     */
+    const attachAll = (): boolean => {
+      if (detached) return true
+      const on = services.on
+      if (typeof on !== 'function') {
+        for (const name of PARTICIPATED_EVENTS) faces[name].registered = 'no on()'
+        return false
       }
+      if (disposers.length > 0) return true
+      for (const name of PARTICIPATED_EVENTS) {
+        const face = faces[name]
+        if (!canParticipate(name)) {
+          // 名单是 guard 里那份极窄的显式清单。走到这里说明有人改了名单却没同步这里——
+          // 宁可这条面不接，也不要悄悄订阅一条 waterfall。
+          face.registered = 'refused by guard'
+          continue
+        }
+        // **参与**这条 waterfall：必须返回真答案或调用 `next()`；返回 undefined 会冲掉整条链
+        // （那是"每个 turn 都崩"的形状，见 guard.ts）。
+        const listener = (...args: unknown[]): Promise<unknown> => participate(name, args)
+        try {
+          const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
+            services,
+            name,
+            listener,
+            PARTICIPATE_OPTIONS,
+          )
+          // 这条登记要进 status.json：真机上"卡为什么没弹"分三种原因（宿主没问 / 没登记上 /
+          // 登记了但没有配对的手机），没有这个字段就只能猜。
+          face.registered = 'registered'
+          disposers.push(() => {
+            if (typeof disposer === 'function') (disposer as () => void)()
+            else if (typeof services.off === 'function') services.off(name, listener)
+          })
+        } catch (error) {
+          face.registered = `failed: ${messageOf(error)}`.slice(0, 80)
+          log(`${name} participation failed`, { message: messageOf(error) })
+        }
+      }
+      return true
     }
-    for (const name of PARTICIPATED_EVENTS) {
-      const face = faces[name]
-      if (!canParticipate(name)) {
-        // 名单是 guard 里那份极窄的显式清单。走到这里说明有人改了名单却没同步这里——
-        // 宁可这条面不接，也不要悄悄订阅一条 waterfall。
-        face.registered = 'refused by guard'
-        continue
-      }
-      // **参与**这条 waterfall：必须返回真答案或调用 `next()`；返回 undefined 会冲掉整条链
-      // （那是"每个 turn 都崩"的形状，见 guard.ts）。
-      const listener = (...args: unknown[]): Promise<unknown> => participate(name, args)
-      try {
-        const disposer = (on as (n: string, fn: unknown, o?: unknown) => unknown).call(
-          services,
-          name,
-          listener,
-          PARTICIPATE_OPTIONS,
-        )
-        // 这条登记要进 status.json：真机上"卡为什么没弹"分三种原因（宿主没问 / 没登记上 /
-        // 登记了但没有配对的手机），没有这个字段就只能猜。
-        face.registered = 'registered'
-        disposers.push(() => {
-          if (typeof disposer === 'function') (disposer as () => void)()
-          else if (typeof services.off === 'function') services.off(name, listener)
-        })
-      } catch (error) {
-        face.registered = `failed: ${messageOf(error)}`.slice(0, 80)
-        log(`${name} participation failed`, { message: messageOf(error) })
-      }
-    }
+    if (!attachAll()) addLateBinder(attachAll)
     return () => {
+      detached = true
       sink = undefined
       for (const dispose of disposers) {
         try {
@@ -952,6 +1030,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
           /* 尽力退订 */
         }
       }
+      disposers.length = 0
     }
   }
 
@@ -1006,8 +1085,11 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       | undefined
     const next = args.find((arg) => typeof arg === 'function') as (() => Promise<unknown>) | undefined
     const sessionId = String(request?.agent?.session?.id ?? '')
-    if (!sink || !sessionId || !servicesPeers()) {
-      // 压根没有能收消息的手机 → 一行都不弹，完整交还桌面。这一步是"插件不抢答"的关键。
+    // `!sink` 就是"没有能收消息的手机"：交互面登记过才有 sink，而真正的
+    // "此刻有没有在线对端"由 runtime 判（它才认识 transport）。原来这里还串了一个
+    // `servicesPeers()`，它的实现恒等于 `sink !== undefined` —— 与 `!sink` 完全重复。
+    if (!sink || !sessionId) {
+      // 一行都不弹，完整交还桌面。这一步是"插件不抢答"的关键。
       // 这里**不 catch**：提问那条没人答时宿主本来就是抛 `NO_PROVIDER`，
       // 把它吞成值会改变宿主的错误形状（未配对的手机上"提问"就变成了一次空答案）。
       face.last = 'handed-back(no phone target)'
@@ -1129,11 +1211,6 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     return Array.isArray(answers) ? `${answers.length} 项` : typeof value
   }
 
-  /** 有没有能收消息的对端由 runtime 判断；这里只做一个粗筛（有 sink 即可能有对端）。 */
-  function servicesPeers(): boolean {
-    return sink !== undefined
-  }
-
   /**
    * 从一个对象里取第一个**非空**的字符串字段。
    *
@@ -1167,7 +1244,10 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       label: firstText(option as LooseObject, OPTION_TEXT_KEYS) || '选项 ' + String(optionIndex + 1),
     }))
     return {
-      id: String(item.id ?? 'q' + String(index + 1)),
+      // id 是协议里的 **nonEmpty**：宿主给空串（或只有空白）时必须补一个稳定值，
+      // 否则**整帧** question_request 会被 zod 拒掉并静默丢弃 —— 手机上永远不弹这张卡，
+      // 而主机这边记着 questionsCalls=1 / no-answer，两头对不上账（题面那两处同理，见 firstText）。
+      id: firstText(item, ['id']) || 'q' + String(index + 1),
       question: text,
       ...(item.multiSelect === true ? { multi: true } : {}),
       // 没有可选项就不带这个键:手机把空数组渲染成一张只有输入框的卡,

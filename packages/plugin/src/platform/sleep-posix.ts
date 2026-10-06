@@ -59,7 +59,10 @@ export class SystemSleepBackend implements SleepPort {
       const child = spawn(command.command, command.args, { stdio: 'ignore' })
       child.on('error', (error) => {
         this.lastError = String(error?.message ?? error)
-        this.child = undefined
+        // 与 exit 同一个守卫：spawn 失败是**异步**报的，旧 child 的错误若把**新** child
+        // 的句柄清成 undefined，`stop()` 就再也杀不掉那个仍在跑的 caffeinate——
+        // 断言的寿命绑在宿主 pid 上（`-w <pid>`）也救不了这一次，因为句柄已经丢了。
+        if (this.child === child) this.child = undefined
       })
       child.on('exit', (code) => {
         if (code !== 0 && code !== null) this.lastError = `${command.command} 退出码 ${code}`

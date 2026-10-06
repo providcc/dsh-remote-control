@@ -206,8 +206,11 @@ test('applyServerTtl 用服务端权威 TTL 改写本地过期；未知 token �
   assert.equal(slots.applyServerTtl(slot.token, 120_000), true, '服务端 TTL 没能落到这张码上')
   assert.equal(
     slots.resolveFor(slot.token)?.expiresAt,
-    clock.now() + 120_000,
-    '过期时间没按服务端值改写（基线是 pair-ready 到达时刻）',
+    slot.createdAt + 120_000,
+    // 基线统一到**发起时刻**（与 PairingWindow.applyServerTtl 同一口径）：
+    // 两处各用一条基线（这里曾是"pair-ready 到达时刻"）会差一个 RTT，
+    // 屏幕上那张码的过期时刻与真正取 PSK 的口径就对不上了。
+    '过期时间没按服务端值改写，或基线不是 createdAt',
   )
   assert.equal(
     slots.applyServerTtl('999999', 120_000),
@@ -235,24 +238,27 @@ test('prune 只清过期项并如实报数：清多了会误杀正在配对的�
   assert.equal(slots.prune(), 0, '第二次 prune 不该再报东西')
 })
 
-test('latest() 只用于展示，取密钥必须走 resolveFor：用 A 码建的会话拿 B 码的 PSK 一定解不开', () => {
+test('取密钥必须走 resolveFor，不许"拿最新那张"：用 A 码建的会话拿 B 码的 PSK 一定解不开', () => {
   const clock = ticking()
   const slots = new PairingSlots(clock.now)
   const usedByPhone = slots.create(120_000) // 屏幕上那张、手机真正扫的
   clock.advance(1_000)
   const newer = slots.create(120_000) // 自动补发的另一张
 
-  const shown = slots.latest()
-  assert.equal(shown?.token, newer.token, '夹具自检：latest() 给出的是最新那张')
-  assert.equal(shown?.token !== usedByPhone.token, true, '夹具自检：两张不同')
+  // 夹具自检：两张不同，且"最新那张"就是 newer（展示位/取最新这条错路当年走的就是它）。
+  assert.equal(newer.token !== usedByPhone.token, true, '夹具自检：两张不同')
+  assert.equal(
+    newer.createdAt > usedByPhone.createdAt,
+    true,
+    '夹具自检：newer 确实是更晚创建的那张（原来的 latest() 会给它）',
+  )
 
-  // 事故形状：会话是用 A 建的，却按 latest()（B）的 PSK 派生密钥。
+  // 事故形状：会话是用 A 建的，却按"最新那张"（B）的 PSK 派生密钥。
   const book = new ConversationBook()
   const picked = slots.resolveFor(usedByPhone.token)
   assert.ok(picked !== null, '按手机实际用的那张码必须取到 PSK')
   const correct = book.open({ id: 'c_pair', psk: picked.psk, now: clock.now() })
-  assert.ok(shown !== null, '夹具自检：展示位上有码')
-  const mistaken = book.open({ id: 'c_wrong', psk: shown.psk, now: clock.now() })
+  const mistaken = book.open({ id: 'c_wrong', psk: newer.psk, now: clock.now() })
 
   const record = seal(correct.kH2C, { t: 'ev.session_changed', sessions: [] })
   assert.equal(
@@ -330,7 +336,7 @@ test('ConversationBook 的初始簿记形状：seqHost 从 0 起、clientIds 空
   )
 })
 
-test('过期判据的边界：expiresAt 恰好等于此刻时仍算有效（与 resolveFor 的严格小于一致）', () => {
+test('过期判据的边界：expiresAt 恰好等于此刻时仍算有效（resolveFor 与 prune 都是严格小于）', () => {
   const clock = ticking()
   const slots = new PairingSlots(clock.now)
   const slot = slots.create(10_000)
@@ -339,16 +345,12 @@ test('过期判据的边界：expiresAt 恰好等于此刻时仍算有效（与 
   assert.equal(
     slots.resolveFor(slot.token) !== null,
     true,
-    '边界判据必须与 latest()/prune() 一致：一处用 <= 一处用 < 会让"能显示但取不到密钥"——又是静默丢 peer',
+    '边界判据必须与 prune() 一致：一处用 <= 一处用 < 会让"能显示但取不到密钥"——又是静默丢 peer',
   )
-  assert.equal(
-    slots.latest() !== null,
-    true,
-    'latest() 与 resolveFor 在这一刻说法不一致：状态里还展示一张码，配对却取不到 PSK',
-  )
+  assert.equal(slots.prune(), 0, 'prune() 与 resolveFor 在这一刻说法不一致：取密钥还说有效，剪枝却已经把这张码清了')
   clock.advance(1)
   assert.equal(slots.resolveFor(slot.token), null, '超过一刻就必须判过期')
-  assert.equal(slots.latest(), null, '超过一刻展示位也要清空：status.json 里的码年龄判据靠它')
+  assert.equal(slots.prune(), 1, '超过一刻就必须剪掉：status.json 里的码年龄判据靠这条一致')
 })
 
 // ── 跨进程续用（2026-10-04）────────────────────────────────────────────

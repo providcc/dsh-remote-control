@@ -218,7 +218,11 @@ test('多码并存时按手机实际使用的那张码取 PSK：用 A 码建的�
   await clock.advance(10)
   const newer = slots.create(120_000) // 用户又手工 /drc pair 了一张
   assert.equal(older.token !== newer.token, true, '夹具自检：两张码必须不同')
-  assert.equal(slots.latest()?.token, newer.token, '夹具自检：latest() 会给出更新的那一张（旧实现就是取了它）')
+  assert.equal(
+    newer.createdAt > older.createdAt,
+    true,
+    '夹具自检：newer 是更晚创建的那张（旧实现"取最新那张"取的就是它）',
+  )
 
   feed({ t: 'peer-joined', sessionId: 'c_ccc111222333', clientId: 'k_mp', pairingToken: older.token })
   assert.equal(joined.length, 1, '用较早那张码配对被拒了：手机扫的是它屏幕上那张，不是最新那张')
@@ -979,4 +983,35 @@ test('probe: stop or socket swap collects the chain, never kills the new connect
   const last = h.states[h.states.length - 1]
   assert.ok(last, 'a state must have been emitted')
   assert.equal(last.relay, 'offline', 'stop lands the state on offline')
+})
+
+/* ── 2026-10-06 缺陷修复：重连定时器只许有一只 ──────────────────────────── */
+
+test('握手超时那条路只许排出一次重连：双 timer 会把退避翻成 4 倍，还会掐掉刚建立的连接', async () => {
+  // 现场：握手超时回调里 `terminate()` + `scheduleReconnect('握手超时')`，
+  // 而 terminate() 会逼出 close 事件、那条路径再 `scheduleReconnect('closed …')` 一次。
+  const h = harness()
+  const priv = h.client as unknown as { scheduleReconnect(problem: string): void; connect(): void }
+  let connects = 0
+  priv.connect = () => {
+    connects += 1
+  }
+
+  priv.scheduleReconnect('握手超时')
+  priv.scheduleReconnect('closed 1006')
+  assert.equal(
+    h.clock.pending,
+    1,
+    `排了 ${h.clock.pending} 个重连定时器：两个 timer 各自到点各连一次，后一个还会掐掉前一个刚建立的连接`,
+  )
+
+  await h.clock.advance(2_000) // 退避第一档 1000ms + 抖动 ≤ 500ms
+  assert.equal(connects, 1, '退避到点必须重连**一次**（双 timer 会连两次）')
+  assert.equal(h.clock.pending, 0, '到点之后句柄没清：下一次重连会被"已经排着一次"那道闸挡回去')
+
+  priv.scheduleReconnect('again')
+  assert.equal(h.clock.pending, 1, '一次重连之后就再也不排了：重连永久停摆（比双 timer 更糟）')
+
+  h.client.stop()
+  assert.equal(h.clock.pending, 0, 'stop() 之后不许留下重连定时器：插件走了还去建 socket')
 })

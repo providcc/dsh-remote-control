@@ -85,3 +85,21 @@ test('appendFileNote：正文在后补路径与类型；空正文时（只发文
     '[文件附件 1 个，已存到本机]\n1. /tmp/u/a',
   )
 })
+
+test('整批附件总量也要卡：单文件 512KB × 4 会撞穿中继的 1MB 单帧上限', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-total-'))
+  const chunk = Buffer.alloc(200 * 1024, 7) // 200KB
+  const one = { name: 'a.bin', data: chunk.toString('base64') }
+  const r = saveFileAttachments({ files: [one, one, one], dir, sessionId: 'ses/1' })
+  assert.equal(r.ok, false, '3×200KB = 600KB 原文（≈800KB base64）没有被整批闸挡住：这一帧会撞穿中继上限')
+  assert.match(r.ok === false ? r.message : '', /整批上限/, '拒绝理由要能读懂（回给手机的就是这句话）')
+  assert.equal(
+    fs.existsSync(path.join(dir, 'ses')) && fs.readdirSync(path.join(dir, 'ses')).length > 0,
+    false,
+    '整批先验后写：被拒的批次一个字节都不许留在磁盘上',
+  )
+
+  // 与 mp 同口径：单文件 200KB、总量 400KB 的一批必须放行（mp 侧就是按原始字节算的）。
+  const ok = saveFileAttachments({ files: [one, one], dir, sessionId: 'ses/2' })
+  assert.equal(ok.ok, true, `2×200KB 被误拒：与 mp 的 MAX_ATTACH_TOTAL_BYTES 口径不一致（${JSON.stringify(ok)}）`)
+})

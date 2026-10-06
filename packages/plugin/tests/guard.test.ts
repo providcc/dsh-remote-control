@@ -15,6 +15,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  EXTRA_WATERFALL_EVENTS,
+  LEGACY_WATERFALL_EVENTS,
   SUBSCRIBABLE_EVENTS,
   WATERFALL_EVENTS,
   WATERFALL_PARTICIPANTS,
@@ -258,5 +260,42 @@ test('拒订的告警要如实标出"这是 waterfall"：让排错的人一眼�
     other.warns[0]?.fields?.waterfall,
     false,
     '不在 waterfall 清单里的名字要如实报 false：否则会误以为已知风险',
+  )
+})
+
+/* ── 2026-10-06 缺陷修复：白名单覆盖 index.ts 的那条订阅；13+9 的组合不再分叉 ── */
+
+test('internal/status 必须在白名单里：index.ts 的 fiber 取证走的就是这个订阅口（guard 是唯一入口）', () => {
+  assert.equal(
+    canSubscribe('internal/status'),
+    true,
+    'index.ts 原来直接 ctx.on(...) 绕过白名单；把它收进白名单之后，这条订阅才真的在护栏里',
+  )
+  assert.equal(
+    WATERFALL_EVENTS.includes('internal/status'),
+    false,
+    'internal/status 是 emit-mode（cordis events.d.ts:219）：它不该出现在 waterfall 清单里',
+  )
+  const bus = makeBus()
+  guardedSubscribe((n, l) => bus.on(n, l), 'internal/status', (() => {}) as Listener, warnOf(bus))
+  assert.deepEqual(bus.registered, ['internal/status'], '白名单内的这条订阅必须真的透下去')
+  assert.equal(bus.warns.length, 0, '放行不该留告警')
+})
+
+test('waterfall 清单是 13 + 9 的组合：注释里的数与数组本体不许再分叉', () => {
+  assert.equal(
+    LEGACY_WATERFALL_EVENTS.length,
+    13,
+    '旧黑名单是 13 项（docs/legacy-spec/host-plugin-cordis.md §2.1 的"真实事件名清单（13 项）"）',
+  )
+  assert.equal(
+    EXTRA_WATERFALL_EVENTS.length,
+    9,
+    '宿主权威表 + @mode waterfall 补出来的那部分是 9 项（approval/request 等旧黑名单一项都没有的）',
+  )
+  assert.equal(
+    WATERFALL_EVENTS.length,
+    LEGACY_WATERFALL_EVENTS.length + EXTRA_WATERFALL_EVENTS.length,
+    '清单本体必须是两份常量的拼接：之前注释写"13 项 + 8 项"而数组是 22 项，两处说的不是一回事',
   )
 })

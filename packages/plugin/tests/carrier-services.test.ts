@@ -1566,3 +1566,132 @@ test('inbox 已接线：必须回到映射表，不再记成 unmapped', () => {
   )
   assert.ok(MAPPED_SESSION_EVENTS.has('agent/inbox/spliced'), '接线完成就必须回到映射表里')
 })
+
+/* ── 2026-10-06 缺陷修复：on 晚到 / 历史形状 / 提问 id 兜底 ─────────────── */
+
+test('on 晚一步才挂上来时订阅要能补上：否则该进程内流式全黑，只有重启宿主才能恢复', () => {
+  // 现场形状：`tryStart()` 在 `ctx.get('sessions', true)` 同步可得时会在任何
+  // `ctx.inject` 回调之前把内核启起来，那一刻 `services.on` 还是 undefined
+  // （on 要等作用域上下文那条注入回调才绑上来）。旧实现这时永久返回空退订。
+  const f = fixture()
+  const clock = new FakeClock()
+  const services = f.bundle()
+  const kernel = createServicesKernel(services, { clock, log: () => {} })
+  const seen: string[] = []
+  kernel.subscribe((event) => seen.push(event.kind))
+  assert.ok(typeof services.on !== 'function', '夹具自检：第一次订阅时 on 还不在服务对象上（这就是真机上那个时序）')
+
+  // 注入回调到了：on 挂上来（index.ts 的 bindScopedEvents 做的就是这一句）。
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  clock.advance(10) // 补绑窗口（0/50/250/1000ms 的第一档）
+
+  assert.ok(
+    typeof listeners['session/event'] === 'function',
+    'on 从无到有之后没有补订阅：该进程内事件流全黑，而 status.json 里 hasOn 早已是 true',
+  )
+  listeners['session/created']?.()
+  assert.deepEqual(seen, ['sessions-changed'], '补上的订阅必须是真的接上了（回调要能到 core）')
+})
+
+test('on 晚到时的补绑窗口不会留下吊住宿主的定时器：四档用光就收手', async () => {
+  const f = fixture()
+  const clock = new FakeClock()
+  const services = f.bundle() // 这份 bundle 里永远没有 on
+  const kernel = createServicesKernel(services, { clock, log: () => {} })
+  const unsubscribe = kernel.subscribe(() => {})
+  assert.ok(clock.pending > 0, '夹具自检：补绑窗口应当装着一次重试')
+  await clock.advance(10_000)
+  assert.equal(clock.pending, 0, `四档之后仍有 ${clock.pending} 个定时器：插件会吊住宿主的进程退出`)
+  unsubscribe()
+})
+
+test('交互面也对 on 晚到做补绑：审批/提问卡不许因为一次时序就永远不弹', () => {
+  const f = fixture()
+  const clock = new FakeClock()
+  const services = f.bundle()
+  const kernel = createServicesKernel(services, { clock, log: () => {} })
+  kernel.attachInteractionSink!({ approval: async () => 'decline', question: async () => null })
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalFace,
+    'no on()',
+    '夹具自检：第一轮确实登记不上（这个字面量本身也是给现场看的那条读数）',
+  )
+
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  clock.advance(10)
+  assert.equal(
+    typeof listeners['approval/request'],
+    'function',
+    'on 晚到之后审批 waterfall 没有补登记：手机上永远不会有审批卡',
+  )
+  assert.equal(typeof listeners['user-questions/request'], 'function', '提问那条同样要补上')
+  assert.equal(
+    (kernel.describe() as Record<string, unknown>).approvalFace,
+    'registered',
+    '补登记之后 status.json 的那条读数也要跟着变成 registered，否则排错时看不出已经好了',
+  )
+})
+
+test('readSession 没回 events 数组时必须抛，不许静默回一张空页（空页是假事实）', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    // 形状变了：不是 {events: [...]}。旧实现把它当成"零条历史"，手机上是"这个会话没内容"。
+    readSession: () => Promise.resolve({ session: { id: 'ses_1' }, items: [] }),
+  }
+  const kernel = f.kernel(services)
+  await assert.rejects(
+    () => kernel.readHistory!('ses_1', { limit: 10 }),
+    /没回 events 数组/,
+    'events 非数组却回了一张空页：用户以为这个会话没内容，而真相是我们读不懂宿主的返回',
+  )
+})
+
+test('提问 id 为空串时补一个稳定值：协议是 nonEmpty，空 id 会让**整帧**被静默丢弃', async () => {
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  const kernel = f.kernel(services)
+  let received: { questions: Array<Record<string, unknown>> } | undefined
+  kernel.attachInteractionSink!({
+    approval: async () => 'decline',
+    question: async (info) => {
+      received = info as { questions: Array<Record<string, unknown>> }
+      return { answers: [] }
+    },
+  })
+  await listeners['user-questions/request']!(
+    {
+      agent: { session: { id: 'ses_live' } },
+      questions: [
+        { id: '', question: '第一条' },
+        { id: '   ', question: '第二条' },
+      ],
+    },
+    async () => {
+      throw new Error('桌面没答')
+    },
+  )
+  assert.ok(received, '提问没有派发到 sink')
+  const ids = received.questions.map((item) => item.id)
+  assert.deepEqual(ids, ['q1', 'q2'], `空 id 没有兜底：${JSON.stringify(ids)} → 整帧 question_request 会被 zod 拒掉`)
+  assert.notEqual(
+    parseEvPayload(
+      questionRequest({ requestId: 'q_1', sessionId: 'ses_live', questions: received.questions as never }),
+    ),
+    null,
+    '产出的整帧过不了协议解析：手机上永远不弹这张卡',
+  )
+})
