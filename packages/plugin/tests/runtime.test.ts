@@ -293,8 +293,27 @@ async function settle(times = 12): Promise<void> {
   for (let i = 0; i < times; i++) await Promise.resolve()
 }
 
+/**
+ * 造一条命令。
+ *
+ * ## `cmdId` 必须**逐条不同**（2026-10-07 补）
+ *
+ * 原来这里写死 `cmd_${t}`，于是"同一个 runtime 里发两次同类型命令"会拿到**同一个
+ * cmdId** —— 而真实客户端每条命令都调 `newCmdId()` 拿一个全新的 id
+ * （`dsh-remote-mp/miniprogram/core/client.js` 的 `_cmdSeq` 自增）。
+ *
+ * 夹具这么写一直没事，是因为主机**零去重**（GAP-4）；接上去 `IdempotencyLedger`
+ * 之后它立刻变成一个陷阱：同一条命令的第二次发送被当成"重发"吞掉，于是
+ * 「一次审批的 requestId 是一次性的」这类用例全红 —— 而红的**不是产品，是夹具**。
+ *
+ * 这条与「判据依赖的全局状态必须归一」是同一族：一个不真实的夹具会**制造**出
+ * 一整片假红，而真红（重复发送被执行两遍）反而被它盖住。
+ */
+let cmdSeq = 0
 function cmd(t: string, extra: Record<string, unknown>): CmdPayload {
-  return { t, cmdId: `cmd_${t}`, ...extra } as unknown as CmdPayload
+  cmdSeq += 1
+  // `extra` 在后 ⇒ 显式传的 cmdId 仍优先（去重那几条用例要的就是"同一个 id 发两次"）
+  return { t, cmdId: `cmd_${t}_${cmdSeq}`, ...extra } as unknown as CmdPayload
 }
 
 /** 最后一条广播出去的 `ev.run_state`（手机上"挂着的卡片作废"那一帧）。 */
@@ -324,7 +343,9 @@ test('cmd.list_sessions 必须额外推一条 ev.session_changed：ev.result.dat
   transport.pair('c_000000000001')
   transport.broadcasts.length = 0
 
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdListSessions, {}), 'c_000000000001')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdListSessions, {})
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_000000000001')
   await settle()
 
   const changed = transport.ofType(PAYLOAD_TYPES.evSessionChanged)
@@ -337,7 +358,7 @@ test('cmd.list_sessions 必须额外推一条 ev.session_changed：ev.result.dat
   assert.ok(results.length >= 1, 'cmd 必须回执，否则手机等到自己超时')
   assert.equal(
     results[0]?.cmdId,
-    `cmd_${PAYLOAD_TYPES.cmdListSessions}`,
+    sentCmdId,
     'cmdId 不回原值 → 手机认不出这是哪条命令的回执',
   )
   assert.equal(results[0]?.ok, true)
@@ -378,7 +399,9 @@ test('ev.session_changed 与 ev.keep_awake_state 的产物里不许存在 sessio
   runtime.start()
   await settle()
   transport.pair('c_000000000001')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdKeepAwake, { enabled: true }), 'c_000000000001')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdKeepAwake, { enabled: true })
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_000000000001')
   await settle()
 
   const pairs: Array<[EvPayload, string]> = [
@@ -1169,7 +1192,9 @@ test('cmd.keep_awake 关掉时不带 idleReleaseSec：带了就会覆盖用户�
   transport.pair('c_ffffffff04')
 
   await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdKeepAwake, { enabled: true, idleReleaseSec: 0 }), 'c_ffffffff04')
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdKeepAwake, { enabled: false }), 'c_ffffffff04')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdKeepAwake, { enabled: false })
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_ffffffff04')
   await settle()
 
   assert.deepEqual(
@@ -1190,7 +1215,7 @@ test('cmd.keep_awake 关掉时不带 idleReleaseSec：带了就会覆盖用户�
 
   const results = transport.resultReplies()
   assert.ok(results.length >= 2, '两条 keep_awake 命令都要回执')
-  assert.equal(results[results.length - 1]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdKeepAwake}`, 'cmdId 必须原样回传')
+  assert.equal(results[results.length - 1]?.cmdId, sentCmdId, 'cmdId 必须原样回传')
 })
 
 /**
@@ -1207,12 +1232,14 @@ test('内核抛异常：send_prompt 当场回 ok:false 并带原因（不假装�
   transport.pair('c_ffffffff05')
   kernel.throwOnSend = true
 
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' }), 'c_ffffffff05')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '你好' })
+  await runtime.handleCommand(sentCmd, 'c_ffffffff05')
   await settle()
 
   const results = transport.resultReplies()
   assert.ok(results.length >= 1, '一条回执都没有 → 手机输入框永久禁用，等到自己超时')
-  assert.equal(results[0]?.cmdId, `cmd_` + PAYLOAD_TYPES.cmdSendPrompt, '回执的 cmdId 必须回原值')
+  // 对照**发出去的那一条**，不复算字符串（`cmd()` 现在逐条给新 id，见它的注释）
+  assert.equal(results[0]?.cmdId, sentCmd.cmdId, '回执的 cmdId 必须回原值')
   assert.equal(results[0]?.ok, false, '内核抛了异常却回 ok:true：手机上看起来像发出去了，其实根本没到')
   assert.ok(
     String(results[0]?.message ?? '').length > 0,
@@ -1771,7 +1798,11 @@ test('恢复失败时把底层原因回给手机，且不再发指令：手机 t
   await settle()
   transport.pair('c_ffffffff10')
   kernel.ensureRunnableImpl = async () => ({ ok: false, message: '底层：归档盘不可读' })
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: '继续' }), 'c_ffffffff10')
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: '继续' }),
+    'c_ffffffff10',
+  )
+  await settle()
 
   const result = transport.resultReplies().at(-1)
   assert.equal(result?.ok, false, '恢复失败必须 ok:false，不能假装发出去了')
@@ -1841,10 +1872,9 @@ test('cmd.session_history：条目走与实时流同一批出站构造器，游�
   transport.broadcasts.length = 0
   transport.replies.length = 0
 
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSessionHistory, { sessionId: 'ses_live', beforeSeq: 42, limit: 3 }),
-    'c_000000000001',
-  )
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdSessionHistory, { sessionId: 'ses_live', beforeSeq: 42, limit: 3 })
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_000000000001')
   await settle()
 
   // 历史是**回执**不是广播：广播会把整份历史发给每一条配对通道
@@ -1854,7 +1884,7 @@ test('cmd.session_history：条目走与实时流同一批出站构造器，游�
   assert.equal(pages.length, 1, `历史页必须只回给发起者（实得 ${pages.length} 条）`)
   const page = pages[0] as Extract<EvPayload, { t: 'ev.session_history' }>
   assert.equal(page.sessionId, 'ses_live', 'F3：载荷里的 sessionId 是 DSH 会话 id，必须逐字回原值')
-  assert.equal(page.cmdId, `cmd_${PAYLOAD_TYPES.cmdSessionHistory}`, 'cmdId 不回原值 → 手机认不出这是哪次请求的页')
+  assert.equal(page.cmdId, sentCmdId, 'cmdId 不回原值 → 手机认不出这是哪次请求的页')
   assert.deepEqual(asked, [{ sessionId: 'ses_live', beforeSeq: 42, limit: 3 }], '游标与条数必须逐字传给内核端口')
   assert.deepEqual(
     page.items.map((item) => item.t),
@@ -1931,13 +1961,15 @@ test('cmd.session_history：读历史时炸了也必须回执失败（手机不�
   transport.pair('c_000000000001')
   transport.replies.length = 0
 
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSessionHistory, { sessionId: 'ses_live' }), 'c_000000000001')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdSessionHistory, { sessionId: 'ses_live' })
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_000000000001')
   await settle()
 
   const results = transport.resultReplies()
   assert.equal(results.length, 1)
   assert.equal(results[0]?.ok, false)
-  assert.equal(results[0]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdSessionHistory}`)
+  assert.equal(results[0]?.cmdId, sentCmdId)
   assert.match(String(results[0]?.message ?? ''), /不能读会话历史/)
 })
 
@@ -1979,13 +2011,16 @@ test('cmd.new_session：回执带上主机分配的 id，并额外推一次列�
   transport.broadcasts.length = 0
   transport.replies.length = 0
 
-  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdNewSession, {}), 'c_000000000001')
+  const sentCmd = cmd(PAYLOAD_TYPES.cmdNewSession, {})
+  const sentCmdId = sentCmd.cmdId
+  await runtime.handleCommand(sentCmd, 'c_000000000001')
+  await settle()
   await settle()
 
   const results = transport.resultReplies()
   assert.equal(results.length, 1, '新建必须回执一次且只一次')
   assert.equal(results[0]?.ok, true)
-  assert.equal(results[0]?.cmdId, `cmd_${PAYLOAD_TYPES.cmdNewSession}`, 'cmdId 不回原值 → 手机认不出这是哪次新建的结果')
+  assert.equal(results[0]?.cmdId, sentCmdId, 'cmdId 不回原值 → 手机认不出这是哪次新建的结果')
   assert.equal(
     (results[0]?.data as { sessionId?: string } | undefined)?.sessionId,
     'ses_made',
@@ -2575,4 +2610,137 @@ test('cmd.new_session：老手机不带 workspace 时端口收到 undefined（�
   await settle()
 
   assert.equal(seen[0], undefined, '没带就等于没带：载体会退回它那三级推断，行为与接线之前完全一致')
+})
+
+/* ── `cmdId` 去重（规范 §10.2 / GAP-4）────────────────────────────────────
+ *
+ * 故障是既有的、且**随机**：手机 12 秒收不到回执就报超时并允许重发，断线重连后
+ * 也会补发，而主机此前零去重 ⇒ `cmd.send_prompt` 可能执行两次（用户说一遍、
+ * 模型回两遍）。快网络下几乎不复现，慢网络或切后台时必现，于是排错时永远
+ * 找不到"那次重复发送"是谁发起的。
+ *
+ * 四条断言各自钉一个方向，且**两条是反向的**——那两条最要紧：
+ * 「重发必须重放上一次的回执」与「窗口外/不同 cmdId 仍要照常执行」。
+ * 没有它们，一个"一律拒绝重复命令"的实现也能让前两条变绿，而那个实现会把
+ * 用户真的重发（例如换了个内容但忘了换 cmdId）一起拦掉。
+ * ─────────────────────────────────────────────────────────────────────── */
+
+test('同一条 cmd.send_prompt 重发只执行一次（超时的补发不许变成第二次发言）', async () => {
+  const { runtime, transport, kernel } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+
+  const payload = cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+    sessionId: 'ses_live',
+    text: '只说 ok',
+    // 显式给一个稳定的 cmdId：手机重发时用的是**同一个** cmdId（它重发的是那条请求）
+    cmdId: 'cmd_dup_1',
+  } as never)
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+  assert.equal(kernel.calls.sendPrompt.length, 1, '前置条件：第一条应当执行一次')
+  const firstReply = transport.resultReplies().at(-1)
+
+  // 模拟"手机没收到回执，12 秒后补发同一条"
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+
+  assert.equal(
+    kernel.calls.sendPrompt.length,
+    1,
+    `重发之后 kernel.sendPrompt 被调了 ${kernel.calls.sendPrompt.length} 次 —— 用户说了一遍、模型回两遍，` +
+      '而这正是这条去重要防的那件事。',
+  )
+  assert.equal(
+    transport.resultReplies().length,
+    2,
+    '重发也必须回执：不回执的话手机上那个 Promise 会一直转到自己超时，' +
+      '用户看到的是"点了没反应"。',
+  )
+  assert.deepEqual(
+    transport.resultReplies().at(-1),
+    firstReply,
+    '重发必须**重放上一次的回执**，不是回一句新的 ok:true —— ' +
+      '新回执会让超时的那个 Promise 正常 resolve，而那条命令可能根本没执行成功。',
+  )
+})
+
+test('不同 cmdId 照常执行（去重不能变成"拒绝一切重复命令"）', async () => {
+  const { runtime, transport, kernel } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '第一条', cmdId: 'cmd_a' } as never),
+    'c_000000000001',
+  )
+  await settle()
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_live', text: '第二条', cmdId: 'cmd_b' } as never),
+    'c_000000000001',
+  )
+  await settle()
+
+  assert.equal(kernel.calls.sendPrompt.length, 2, '两个不同 cmdId 是两条命令，都必须执行')
+  assert.deepEqual(
+    kernel.calls.sendPrompt.map((c) => c.text),
+    ['第一条', '第二条'],
+  )
+})
+
+test('出了去重窗口的同一条命令重新算新命令（窗口是幂等有效期，不是安全边界）', async () => {
+  const { runtime, transport, kernel, clock } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+
+  const payload = cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+    sessionId: 'ses_live',
+    text: '很久以后又发一次',
+    cmdId: 'cmd_window',
+  } as never)
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+
+  // 走过整个去重窗口（默认 5 分钟，见协议层 IDEMPOTENCY_WINDOW_MS）。
+  // ⚠️ `advance` 是 **async** 的：不 await 的话时间根本没动，台账还在窗口内 ——
+  // 那时这条判据红的是"忘了 await"，而不是"实现把窗口当成了永久"，两者不能混。
+  await clock.advance(10 * 60_000)
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+
+  assert.equal(
+    kernel.calls.sendPrompt.length,
+    2,
+    '过了窗口的同一条命令没有重新执行 —— 那意味着**永久**去重：' +
+      'cmdId 重复（手机重发）会被拦，可一条真实的重复命令也会被拦。',
+  )
+})
+
+test('停机不重置台账（重发跨越一次 stop/start 仍不该执行第二遍）', async () => {
+  // 这条钉的是"台账的生命周期与 runtime 一致"：如果 stop() 里顺手清空台账，
+  // 那么"主机刚好在命令执行后、回执发出前重启"这一档就会执行两次 ——
+  // 而那恰恰是最容易发生重启的时刻（用户刚发出指令就合上电脑）。
+  const { runtime, transport, kernel } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+
+  const payload = cmd(PAYLOAD_TYPES.cmdSendPrompt, {
+    sessionId: 'ses_live',
+    text: '发完就合盖',
+    cmdId: 'cmd_sleep',
+  } as never)
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+  await runtime.stop()
+
+  // 重连（同一条命令被补发）
+  transport.pair('c_000000000001')
+  await runtime.handleCommand(payload, 'c_000000000001')
+  await settle()
+
+  assert.equal(kernel.calls.sendPrompt.length, 1, '跨 stop/start 的重发又执行了一遍')
 })

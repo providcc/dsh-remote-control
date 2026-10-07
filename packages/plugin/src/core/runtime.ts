@@ -30,6 +30,7 @@ import type {
   SessionSummary,
 } from 'dsh-remote-wire'
 import { appendFileNote, MAX_ATTACH_TOTAL_BYTES, saveFileAttachments } from '../shell/uploads.js'
+import { IdempotencyLedger } from 'dsh-remote-wire/idempotency'
 import {
   keepAwakeState,
   messageDelta,
@@ -184,6 +185,47 @@ export class HostRuntime {
    * 代价是缓存里可能留着已不在列表里的会话，所以 `replayModels` 补发前自己求交。
    */
   private readonly modelBySession = new Map<string, { model: string; provider?: string }>()
+  /**
+   * `cmdId` 去重台账（规范 §10.2 / GAP-4，2026-10-07 接线）。
+   *
+   * ## 它解决的是一个已经存在的故障
+   *
+   * 手机 12 秒收不到回执就报超时并允许重发（`COMMAND_TIMEOUT_MS`），断线重连后
+   * 也会补发。而主机此前**零去重**，于是同一条命令可能执行两次：
+   * `cmd.send_prompt` 两次 → 用户说一遍、模型回两遍；`cmd.resolve_permission` 两次 →
+   * 第二次落在一个已关闭的请求上，表现为"点了没反应"，且与真正的失败无法区分。
+   *
+   * 它**随机**：快网络下几乎不复现，慢网络或切后台时必现 —— 于是排错时永远
+   * 找不到"那次重复发送"是谁发起的。
+   *
+   * ## 为什么用协议层那个纯函数而不是自己写一个
+   *
+   * 判定必须与协议层一致（那是载荷契约），而它把时钟从外面注入 ⇒ 判据能用
+   * 假时钟把窗口边界一格格走一遍，不必真等五分钟（凡是"要靠真实等待才能测"的
+   * 东西实际上都不会被测）。时钟就用本类已有的 `this.clock`。
+   *
+   * ## 它不是安全边界
+   *
+   * 去重是**幂等性**，不是防重放：真正的防重放依赖密封记录的 Poly1305 与通道成员
+   * 校验。台账在内存里，主机重启即清空 —— 而主机重启本来就会作废全部会话
+   * （`resync{[]}`），所以这条边界恰好与安全边界重合。
+   */
+  private readonly ledger = new IdempotencyLedger()
+  /**
+   * 已执行过的命令的**回执**，供重发时原样重放（规范 §10.2 要求 "MUST 重发上一次
+   * 那个 `ev.result`"）。
+   *
+   * ⚠️ 为什么单独一张表而不是让台账存：协议的 `IdempotencyLedger` 只存时刻
+   * （`admit()` 返回 `firstSeenAt`），它**刻意**不存载荷 —— 那是载荷层不该管的事。
+   * 而没有这张表，重发只能"跳过执行并回一句新的"，那与规范要求的"重发上一次那个
+   * 回执"不同：手机上 `ev.result` 是按 `cmdId` 结算的（`client.js` 的 `_cmdWaiters`），
+   * 回一句新的 `ok:true` 会让**超时重发的那个 Promise 正常 resolve** —— 而实际上
+   * 那条命令可能根本没执行成功。这条差异对用户不可见，对判据可见。
+   *
+   * 容量与台账同源（同一个 `IDEMPOTENCY_CAPACITY`）：两张表同生共死，不给
+   * "台账清了这张还在"留机会。
+   */
+  private readonly settledReplies = new Map<string, EvPayload>()
   private started = false
   private stopped = false
   private lastPushAt = 0
@@ -261,10 +303,54 @@ export class HostRuntime {
     for (const [id] of [...this.pending]) this.settle(id, undefined, 'withdrawn')
   }
 
+  /**
+   * 让 `settledReplies` 与台账**同生共死**。
+   *
+   * 为什么需要它：台账自己按窗口 + 容量淘汰，而这张表没有 —— 不管的话它会无界增长，
+   * 而"每条命令留一个回执"在长会话里就是每条消息一份（`send_prompt` 的回执还带
+   * `data`）。**这正是协议层那张表刻意不存载荷的原因**：载荷级的记忆必须由使用方
+   * 自己按同样的边界管。
+   *
+   * 做法：登记时顺手看一眼台账还在不在（`has()` 只问不记），不在就删掉这条回执。
+   * 淘汰因此**跟着台账走**，而台账的窗口与容量都由协议层定义（单一来源）。
+   */
+  private forgetWhenOutOfWindow(cmdId: string, now: number): void {
+    if (!this.ledger.has(cmdId, now)) this.settledReplies.delete(cmdId)
+  }
+
   /** 手机发来的命令。`conversationId` 是配对通道 id，与载荷里的 sessionId 不是一回事（F3）。 */
   async handleCommand(cmd: CmdPayload, conversationId: string): Promise<void> {
+    // ── `cmdId` 去重（规范 §10.2）─────────────────────────────────────
+    //
+    // 放在 `handleCommand` 的**最前面**，因为这是命令的唯一入口（放里面某几个
+    // case 就会漏，而漏掉的那几条正是最不能重复执行的：`send_prompt`）。
+    //
+    // 三条纪律（每条都对应一种"看起来能跑、实际不行"）：
+    // ① `admit()` 是**问 + 记账**合一（协议层刻意不拆成 has/add：拆开的话进程
+    //    在两者之间退出就会执行两次 —— 而那正是本模块要防的事）；
+    // ② 重发时**重放上一次的回执**，不是回一句新的（见 `settledReplies` 的注释）；
+    // ③ 只有"确实回过执"的命令才进 `settledReplies` —— 异常路径（`catch` 里的
+    //    `internal`）也回执，所以同样要记，否则重发会既不执行也不回执，
+    //    手机那头 12 秒超时后又变成"什么都没有"。
+    const now = this.clock.now()
+    const decision = this.ledger.admit(cmd.cmdId, now)
+    if (decision.action === 'replay') {
+      const previous = this.settledReplies.get(cmd.cmdId)
+      // 有上一份回执就原样重放；没有（进程中途重启、或那一帧还没来得及记）就
+      // **明确回一句"已执行过、但回执丢了"** —— 绝不能静默：手机在等一个
+      // `cmdId` 对应的回执，不回它就一直转到超时。
+      this.replyTo(
+        conversationId,
+        previous ??
+          resultOf(cmd.cmdId, true, { message: '这条指令上一轮已执行过，但回执已不在（主机重启过）' }),
+      )
+      return
+    }
     const reply = (ok: boolean, extras: { message?: string; data?: Record<string, unknown> } = {}): void => {
-      this.replyTo(conversationId, resultOf(cmd.cmdId, ok, extras))
+      const frame = resultOf(cmd.cmdId, ok, extras)
+      this.settledReplies.set(cmd.cmdId, frame)
+      this.forgetWhenOutOfWindow(cmd.cmdId, now)
+      this.replyTo(conversationId, frame)
     }
     try {
       switch (cmd.t) {
