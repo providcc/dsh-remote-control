@@ -1113,6 +1113,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       events,
       ...(page.beforeSeq === undefined ? {} : { beforeSeq: page.beforeSeq }),
       limit: page.limit,
+      // 读历史的同时问一次"此刻在不在跑"：只有正在跑才允许把历史快照说成此刻的清单。
+      running: agentStatus(sessionId) === 'running',
     })
   }
 
@@ -2077,6 +2079,13 @@ export function historyPageFromLog(input: {
   beforeSeq?: number
   limit: number
   charBudget?: number
+  /**
+   * 这条会话**此刻是否正在跑**。
+   *
+   * 只决定"要不要把历史里那份待办快照当成此刻的清单补给手机"（见下面那段）。
+   * 默认 false = 不补：**宁可手机空着，也不要让它说一句主机此刻没说的话。**
+   */
+  running?: boolean
 }): KernelHistoryPage {
   const { sessionId } = input
   const groups: Array<{ seq: number; events: KernelEvent[] }> = []
@@ -2087,7 +2096,16 @@ export function historyPageFromLog(input: {
     const seq = typeof raw?.seq === 'number' && Number.isFinite(raw.seq) ? raw.seq : 0
     const data = (raw?.data ?? {}) as LooseObject
     const mapped = sessionEventKernelEvents({ sessionId, type, seq, data })
-    const kept = mapped.filter(isHistoryWorthy)
+    const kept = mapped
+      .filter(isHistoryWorthy)
+      // 会话**不在跑**时，历史里的待办快照整条丢掉（2026-10-07 用户实测双端不一致）。
+      //
+      // 为什么不能只是"不补"：待办事件本来就在日志里，只要落在第一页窗口内就会
+      // 原样送到手机，而 mp 的 `_replayTodos` 把它当**此刻的清单**显示。
+      // 宿主那一侧是按轮清的——这一轮没写待办，它就是空的；于是用户看到一件
+      // **没在发生的事**。所以要丢的是"作为呈现的待办"，不是"作为历史事实的待办"
+      // （历史里那次待办确实发生过，只是不该被当成现在）。
+      .filter((event) => input.running === true || event.kind !== 'todo')
     if (kept.length > 0) groups.push({ seq, events: kept })
   }
 
@@ -2125,13 +2143,24 @@ export function historyPageFromLog(input: {
   const flat: KernelEvent[] = []
   for (const group of page) flat.push(...group.events)
 
-  // 第一页（最新一页）恒带最新的一份待办快照。待办是"此刻的清单"，
-  // 不是"当时发生了什么"——40 条窗口装满工具事件时，快照会被裁在外面，
-  // 手机重进一条跑了很久的会话，顶部条子直接消失（2026-10-06 用户实测），
-  // 而且之后没有 todo 变更就没有实时帧来补，它会一直缺着。
+  // **只在会话正在跑的时候**把历史里那份待办快照补给手机。
+  //
+  // 起因（2026-10-06 用户实测）：40 条窗口装满工具事件时快照会被裁在外面，
+  // 手机**重进一条正在跑的**长会话，顶部条子直接消失，而且之后没有 todo 变更
+  // 就没有实时帧来补，它会一直缺着。
+  //
+  // 为什么后来收窄到"正在跑"（2026-10-07 用户实测双端不一致）：待办的语义是
+  // **"此刻这一轮的清单"**，而宿主那一侧正是这么做的——上一轮写过、这一轮没写，
+  // 宿主的清单就是空的。以前这里**无条件**补，于是手机把上一轮的清单当作
+  // "此刻在做什么"显示，而宿主此刻什么都没有：用户看到的是一件**没在发生的事**。
+  // 这属于本仓库反复出现的那一类（静默黑洞 / 假事实），而"条子消失"那种症状
+  // 只在**正在跑**时才成立——所以收窄之后既一致又不回归。
+  //
   // 只补第一页：更早页的快照是过期的，手机只应用第一页那一份（mp 侧守卫）。
   // 快照很小（十几条短文本），不计入分页预算——预算管的是"别顶满中继帧"，
   // 一份清单顶不满（wire 1.5.0 同一口径）。
+  // 不用再判 `running`：**上一段的过滤器已经保证 `flat` 里一条 todo 都没有**
+  // （不在跑时整条被丢掉）。再判一遍是同一件事说两遍，而两遍里总有一遍会先被放宽。
   if (input.beforeSeq === undefined && !flat.some((event) => event.kind === 'todo')) {
     for (let i = ranged.length - 1; i >= 0; i--) {
       const snap = ranged[i]!.events.find((event) => event.kind === 'todo')

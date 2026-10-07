@@ -2445,3 +2445,80 @@ test('模型补发只带**当前列表里**的会话：缓存里的旧会话不�
   assert.equal(models[0]?.sessionId, 'ses_keep', '补发的必须是列表里那条')
   assert.equal(models[0]?.model, 'keep-model', '补发的模型值不许串台')
 })
+
+test('待办双端一致：新一轮开始时，手机上**上一轮**的待办必须被收掉', async () => {
+  // 2026-10-07 用户实测：这一轮没写待办，手机上还挂着上一轮的清单，宿主此刻是空的。
+  //
+  // 内核**不会**为"这一轮没有待办"专门发一帧 `todo/write`，所以指望不到它来清。
+  // 宿主那一侧是按轮清的（这一轮没写就是空），手机要一致就得由宿主在
+  // **轮次开始**时补一帧空快照——这也是 host 侧唯一知道"轮次换了"的位置。
+  //
+  // 与历史快照那条（carrier-services 的 historyPageFromLog）是同一个病的两条通路：
+  // 那条治"重进会话时"，这条治"不重进、同一页里跑下一轮"。
+  const { runtime, transport, kernel, clock } = fixture()
+  runtime.start()
+  await settle()
+  transport.pair('c_0000000000ff')
+  await settle()
+
+  const todos = (): Array<Extract<EvPayload, { t: 'ev.todo' }>> =>
+    transport.ofType(PAYLOAD_TYPES.evTodo) as Array<Extract<EvPayload, { t: 'ev.todo' }>>
+
+  // ── 第一轮：内核写了待办 ────────────────────────────────────────
+  await clock.advance(1_000)
+  kernel.feed({ kind: 'todo', sessionId: 'ses_live', todos: [{ content: '上一轮要做的事', status: 'in_progress' }] })
+  await settle()
+  assert.deepEqual(
+    todos().at(-1)?.todos,
+    [{ content: '上一轮要做的事', status: 'in_progress' }],
+    '夹具自检：第一轮待办到了手机',
+  )
+
+  // ── 第二轮开始：这一轮不写待办 ──────────────────────────────────
+  await clock.advance(1_000)
+  transport.broadcasts.length = 0
+  kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  await settle()
+  assert.deepEqual(
+    todos().at(-1)?.todos,
+    [],
+    '新一轮开始却没把上一轮的待办收掉：手机显示一件没在发生的事，宿主此刻是空的（双端不一致）',
+  )
+
+  // ── 这一轮真的写了待办：照常显示 ────────────────────────────────
+  await clock.advance(1_000)
+  kernel.feed({ kind: 'todo', sessionId: 'ses_live', todos: [{ content: '这一轮要做的事', status: 'pending' }] })
+  await settle()
+  assert.deepEqual(
+    todos().at(-1)?.todos,
+    [{ content: '这一轮要做的事', status: 'pending' }],
+    '这一轮的待办要能正常上来',
+  )
+
+  // ── 内核把清单清空（发一帧空）之后：下一轮开始**不该**再补一帧空 ──
+  // 这是"只在真有清单时才补"那半句的判据。少了它，实现把空清单也记进
+  // todoShown 之后，从第二轮起每轮都会白发一帧——单看"清空"那几条是绿的。
+  await clock.advance(1_000)
+  kernel.feed({ kind: 'todo', sessionId: 'ses_live', todos: [] })
+  await settle()
+  await clock.advance(1_000)
+  transport.broadcasts.length = 0
+  kernel.feed({ kind: 'run-state', sessionId: 'ses_live', state: 'running' })
+  await settle()
+  assert.equal(
+    transport.ofType(PAYLOAD_TYPES.evTodo).length,
+    0,
+    '清单已经是空的了，下一轮开始还补一帧空：每轮白发一帧只是白花渲染',
+  )
+
+  // ── 从没用过待办的会话：同样不许收到空清单 ──────────────────────
+  await clock.advance(1_000)
+  transport.broadcasts.length = 0
+  kernel.feed({ kind: 'run-state', sessionId: 'ses_other', state: 'running' })
+  await settle()
+  assert.equal(
+    transport.ofType(PAYLOAD_TYPES.evTodo).length,
+    0,
+    '这个会话压根没用过待办，却收到了一帧空清单：每轮白发一帧只是白花渲染',
+  )
+})

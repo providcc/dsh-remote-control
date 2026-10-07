@@ -998,10 +998,14 @@ test('历史：预算再小也要给出一整组，不能产出空页（空页 +
   assert.ok(page.events.length >= 1, '给了空页但游标还在动，手机端的「加载更早」会一直转')
 })
 
-test('历史：第一页恒带最新待办快照（长回合里窗口裁掉也不许丢）', () => {
+test('历史：**正在跑**时第一页补最新待办快照（长回合里窗口裁掉也不许丢）', () => {
   // 2026-10-06 用户实测：重进一条跑了很久的会话，顶部待办条直接消失。
   // 待办是"此刻的清单"：todo/write 在回合开头，后面跟了几十条工具事件，
   // 40 条窗口把它裁在外面，而之后没有 todo 变更就没有实时帧来补——一直缺着。
+  //
+  // ⚠️ 2026-10-07 起这条**只在会话正在跑的时候成立**（`running: true`）：
+  // 宿主那一侧的待办是按轮清的，会话没在跑时那份快照是**上一轮**的，
+  // 补给手机等于让它说一句宿主此刻没说的话（用户实测双端不一致）。
   const log = [
     { type: 'todo/write', seq: 1, data: { todos: [{ content: '做一件事', status: 'in_progress' }] } },
     ...Array.from({ length: 10 }, (_, i) => ({
@@ -1010,7 +1014,7 @@ test('历史：第一页恒带最新待办快照（长回合里窗口裁掉也�
       data: { turn: 1, step: 1 + i, callId: `call_${i}`, name: 'bash', arguments: '{"command":"x"}' },
     })),
   ]
-  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 3 })
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 3, running: true })
   const todos = page.events.filter((event) => event.kind === 'todo')
   assert.equal(todos.length, 1, '第一页没有待办：手机重进长会话，顶部条子直接消失')
   assert.equal(
@@ -1025,7 +1029,10 @@ test('历史：第一页本来就有待办时不许补第二份（去重，不�
     { type: 'todo/write', seq: 1, data: { todos: [{ content: '旧的', status: 'pending' }] } },
     { type: 'todo/write', seq: 2, data: { todos: [{ content: '新的', status: 'in_progress' }] } },
   ]
-  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100 })
+  // ⚠️ `running: true` 不是可有可无的：2026-10-07 起，会话**不在跑**时历史里的
+  // 待办整条被丢掉（宿主按轮清，手机不该拿上一轮的当"此刻的清单"——用户实测双端不一致）。
+  // 下面这几条验的是"待办在历史里怎么被承载"，那个问题只在正在跑时存在。
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100, running: true })
   const todos = page.events.filter((event) => event.kind === 'todo')
   assert.equal(todos.length, 1, '塌缩后最新一份只留一条，兜底不能再加一条')
 })
@@ -1838,12 +1845,18 @@ function logWithTodos(): Array<{ type: string; seq: number; data: Record<string,
 const todosIn = (page: { events: KernelEvent[] }): KernelEvent[] => page.events.filter((e) => e.kind === 'todo')
 
 test('历史：todo/write 要活过 historyPageFromLog（以前被 isHistoryWorthy 挡掉了）', () => {
-  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  // ⚠️ `running: true` 不是可有可无的：2026-10-07 起，会话**不在跑**时历史里的
+  // 待办整条被丢掉（宿主按轮清，手机不该拿上一轮的当"此刻的清单"——用户实测双端不一致）。
+  // 下面这几条验的是"待办在历史里怎么被承载"，那个问题只在正在跑时存在。
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100, running: true })
   assert.ok(todosIn(page).length > 0, '一条待办都没活下来 —— mp 于是永远等不到历史快照')
 })
 
 test('历史：一页只留**最后一份**待办快照（全量语义，冗余的会把正文挤出 charBudget）', () => {
-  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  // ⚠️ `running: true` 不是可有可无的：2026-10-07 起，会话**不在跑**时历史里的
+  // 待办整条被丢掉（宿主按轮清，手机不该拿上一轮的当"此刻的清单"——用户实测双端不一致）。
+  // 下面这几条验的是"待办在历史里怎么被承载"，那个问题只在正在跑时存在。
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100, running: true })
   const todos = todosIn(page) as Array<{ todos: Array<{ content: string }> }>
   assert.equal(todos.length, 1, '三条全量快照应当塌缩成一条')
   assert.equal(todos[0]!.todos[0]!.content, '实现落盘', '留的是最后那一份')
@@ -1851,7 +1864,7 @@ test('历史：一页只留**最后一份**待办快照（全量语义，冗余�
 
 test('历史：待办不占正文的位置（正文字数一条都不能少）', () => {
   const bare = historyPageFromLog({ sessionId: 'ses_1', events: realLog('ses_1'), limit: 100 })
-  const withTodo = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100 })
+  const withTodo = historyPageFromLog({ sessionId: 'ses_1', events: logWithTodos(), limit: 100, running: true })
   const deltas = (page: typeof bare) => page.events.filter((e) => e.kind === 'delta').length
   assert.equal(deltas(withTodo), deltas(bare), '待办把正文挤出去了')
 })
@@ -1861,7 +1874,10 @@ test('历史：空清单也是一份快照，照样保留（用户拍板取最�
   const last = log[log.length - 1]!.seq
   log.push({ type: 'todo/write', seq: last + 1, data: { todos: [{ content: 'x', status: 'pending' }] } })
   log.push({ type: 'todo/write', seq: last + 2, data: { todos: [] } })
-  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100 })
+  // ⚠️ `running: true` 不是可有可无的：2026-10-07 起，会话**不在跑**时历史里的
+  // 待办整条被丢掉（宿主按轮清，手机不该拿上一轮的当"此刻的清单"——用户实测双端不一致）。
+  // 下面这几条验的是"待办在历史里怎么被承载"，那个问题只在正在跑时存在。
+  const page = historyPageFromLog({ sessionId: 'ses_1', events: log, limit: 100, running: true })
   const todos = todosIn(page) as Array<{ todos: unknown[] }>
   assert.equal(todos.length, 1)
   assert.equal(todos[0]!.todos.length, 0, '最后一份是空的（内核清空了清单），这就是用户拍板的语义')
@@ -2156,5 +2172,76 @@ test('会话摘要的 updatedAt 是**最后活动时刻**，不是创建时刻�
     old?.summary.updatedAt,
     undefined,
     '从没见过活动的会话不该凭空多一个 updatedAt：那是它**创建**的时刻，不是我们知道的事实',
+  )
+})
+
+test('待办双端一致：会话没在跑时，历史里那份旧快照**不许**被当成此刻的清单补给手机', async () => {
+  // 2026-10-07 用户实测：这一轮没写待办，手机上却还挂着上一轮的清单，
+  // 而宿主此刻是空的——用户看到一件没在发生的事。
+  //
+  // 根因在 `historyPageFromLog`：它**无条件**往第一页塞一份历史里的待办快照
+  // （那是 2026-10-06 为了治"重进正在跑的长会话时条子消失"加的）。
+  // 而"条子消失"那种症状只在**正在跑**时才成立，所以收窄到 running 之后
+  // 既一致、又不回归那条修复。
+  const CREATED = 1_700_000_000_000
+  const f = fixture()
+  const services = f.bundle()
+  services.sessionQuery = {
+    readSession: () =>
+      Promise.resolve({
+        events: [
+          { type: 'turn/start', seq: 1, data: {} },
+          {
+            type: 'todo/write',
+            seq: 2,
+            data: { todos: [{ content: '上一轮的第一件事', status: 'completed' }] },
+          },
+          { type: 'turn/end', seq: 3, data: {} },
+          {
+            type: 'user/message',
+            seq: 4,
+            data: { id: 'm-1', message: { role: 'user', content: [{ type: 'text', text: '这一轮' }] } },
+          },
+        ],
+      }),
+    listSessions: () => Promise.resolve([{ header: { id: 'ses_x', createdAt: CREATED, cwd: '/w' } }]),
+  }
+  const kernel = createServicesKernel(services, { clock: new FakeClock(), log: () => {} })
+
+  // 会话**不在跑**（没有 running 的 agent）：手机不该拿到任何待办。
+  // 这条日志里 todo/write 就落在第一页窗口内——所以要验的是"整条丢掉"，
+  // 而不是"只是别补快照"（补快照那条路只管被窗口裁掉的情况）。
+  const idle = await kernel.readHistory!('ses_x', { limit: 50 })
+  assert.equal(
+    idle.events.some((e) => e.kind === 'todo'),
+    false,
+    '会话不在跑却把上一轮的待办当此刻的清单补给手机了：双端不一致，用户看到一件没在发生的事',
+  )
+  assert.ok(idle.events.length >= 1, '夹具自检：别的内容还在——别把整页丢空')
+
+  // 正在跑的时候**仍然要补**——那是 2026-10-06 那条修复的正当场景，
+  // 收窄不能把它一起收掉（"重进一条正在跑的长会话，顶部条子直接消失"）。
+  const running = historyPageFromLog({
+    sessionId: 'ses_x',
+    events: [
+      {
+        type: 'todo/write',
+        seq: 2,
+        data: { todos: [{ content: '正在做的事', status: 'in_progress' }] },
+      },
+      { type: 'turn/end', seq: 3, data: {} },
+      {
+        type: 'user/message',
+        seq: 4,
+        data: { id: 'm-1', message: { role: 'user', content: [{ type: 'text', text: 'x' }] } },
+      },
+    ],
+    limit: 50,
+    running: true,
+  })
+  assert.equal(
+    running.events.some((e) => e.kind === 'todo'),
+    true,
+    '会话正在跑却没有把待办快照补给手机：收窄过头了，2026-10-06 那条症状会回来',
   )
 })

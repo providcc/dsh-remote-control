@@ -151,6 +151,14 @@ export class HostRuntime {
   private readonly window: DeltaWindow
 
   private readonly pending = new Map<string, PendingInteraction>()
+  /**
+   * 手机上**此刻有清单**的会话（`todo/write` 发过非空清单、且还没被下一轮清掉）。
+   *
+   * 用来在下一轮开始时补一帧空快照。刻意用有界 Set 记、不留内容：它只回答
+   * "要不要清"，不回答"清成什么"（清成空是唯一答案）。
+   * 按会话隔离：同一时刻可能有几条会话各自带着清单。
+   */
+  private readonly todoShown = new Set<string>()
   private unsubscribe: (() => void) | undefined
   private detachSink: (() => void) | undefined
   private refreshTimer: unknown
@@ -553,7 +561,23 @@ export class HostRuntime {
       case 'run-state':
         this.window.flushSession(event.sessionId)
         this.broadcast(runState(event))
-        if (event.state === 'running') this.sleep.markActive()
+        if (event.state === 'running') {
+          this.sleep.markActive()
+          /**
+           * 新一轮开始：**把上一轮的待办从手机上收掉**（2026-10-07 用户实测双端不一致）。
+           *
+           * 宿主那一侧的待办是按轮清的：上一轮写过、这一轮没写，它就是空的。
+           * 而内核**不会**为"这一轮没有待办"专门发一帧 `todo/write`，于是手机上
+           * 留着上一轮的清单、宿主此刻却是空的——用户看到一件**没在发生的事**
+           * （与历史快照那条同一个病的两条通路，见 carrier-services 的 historyPageFromLog）。
+           *
+           * 只在**上一轮确实有过清单**时才补这一帧空快照：没用过待办的轮次
+           * 每轮白发一帧空清单只是白花一次渲染。
+           */
+          if (this.todoShown.delete(event.sessionId)) {
+            this.broadcast(todoList({ todos: [], sessionId: event.sessionId }))
+          }
+        }
         void this.pushSessions('run-state').catch(() => {})
         return
       case 'model':
@@ -572,6 +596,10 @@ export class HostRuntime {
         // "最后那份清单"晚到，而顶部那颗条子要的就是此刻。
         this.window.flushSession(event.sessionId)
         this.broadcast(todoList({ todos: event.todos, sessionId: event.sessionId }))
+        // 记一笔"这个会话的手机上此刻有清单"：下一轮开始时要据此补一帧空快照
+        //（见 case 'run-state'）。空清单不记账——那本来就没有要清的。
+        if (event.todos.length > 0) this.todoShown.add(event.sessionId)
+        else this.todoShown.delete(event.sessionId)
         this.sleep.markActive()
         return
       case 'retry':
