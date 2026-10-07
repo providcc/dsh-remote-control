@@ -354,8 +354,7 @@ export class HostRuntime {
       // `cmdId` 对应的回执，不回它就一直转到超时。
       this.replyTo(
         conversationId,
-        previous ??
-          resultOf(cmd.cmdId, true, { message: '这条指令上一轮已执行过，但回执已不在（主机重启过）' }),
+        previous ?? resultOf(cmd.cmdId, true, { message: '这条指令上一轮已执行过，但回执已不在（主机重启过）' }),
       )
       return
     }

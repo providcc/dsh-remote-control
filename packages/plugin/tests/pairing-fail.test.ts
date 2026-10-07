@@ -28,8 +28,7 @@ test('情形 ②：失败的是**另一张** → 只作废那一张，展示位*
   assert.equal(
     d.clearShown,
     false,
-    '展示位必须**不动**：清掉它等于用户手上那张有效的码被自己的机器撤回，' +
-      '而屏幕上会换成一张他没扫过的新码',
+    '展示位必须**不动**：清掉它等于用户手上那张有效的码被自己的机器撤回，' + '而屏幕上会换成一张他没扫过的新码',
   )
 })
 
@@ -65,9 +64,5 @@ test('判据不许把"中继没告诉我们"与"中继说就是这张"混成一�
   const sameToken = decidePairFail('x', 'x')
   assert.equal(withoutToken.victim, sameToken.victim, '两者在这一格上结果相同')
   // 真正必须分开的是情形 ②：那里 clearShown 要不同。
-  assert.notEqual(
-    decidePairFail('x', 'y').clearShown,
-    sameToken.clearShown,
-    '别人的失败不许牵连自己的展示位',
-  )
+  assert.notEqual(decidePairFail('x', 'y').clearShown, sameToken.clearShown, '别人的失败不许牵连自己的展示位')
 })

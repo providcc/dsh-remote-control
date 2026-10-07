@@ -323,10 +323,7 @@ test('MAC 校验通过但载荷不是任何一条已定义命令：不进 runtim
     [{ conversationId: 'c_dtd111222333', cmdId: 'x_1', payloadType: 'cmd.drop_everything' }],
     '形状不对的载荷没有被交出去：手机那一头只剩 12 秒超时，根因只活在主机日志里',
   )
-  assert.ok(
-    invalid[0]?.cmdId,
-    'cmdId 必须随载荷一起交出去 —— 没有它主机回不了执（回执是按 cmdId 结算的）',
-  )
+  assert.ok(invalid[0]?.cmdId, 'cmdId 必须随载荷一起交出去 —— 没有它主机回不了执（回执是按 cmdId 结算的）')
 
   /**
    * 解得开就算这条会话**有活动**，与过不过 schema 无关（同一次修）。
@@ -348,10 +345,7 @@ test('MAC 校验通过但载荷不是任何一条已定义命令：不进 runtim
     ciphertext: seal(phone.kC2H, { t: 'cmd.drop_everything', cmdId: 'x_2' } as never).ciphertext,
   })
   const after = client.conversations.get('c_dtd111222333')?.lastActivityAt ?? 0
-  assert.ok(
-    after > stale,
-    `形状不对的帧没被算成活动（停在 ${stale}），通道会被剪枝当闲置剪掉`,
-  )
+  assert.ok(after > stale, `形状不对的帧没被算成活动（停在 ${stale}），通道会被剪枝当闲置剪掉`)
 
   // 同一条通道上的合法命令仍然进得来（这次拒收没有把通道打死）。
   feed({
@@ -1160,11 +1154,7 @@ test('pair-fail 的 pairingToken 原样交给接线方', () => {
   h.feed({ t: 'pair-fail', reason: 'invalid_or_expired', pairingToken: '999999' })
   assert.equal(h.pairFails.length, 1, '必须回调（不回调 = 屏幕上那张死码一直挂着）')
   assert.equal(h.pairFails[0]?.reason, 'invalid_or_expired')
-  assert.equal(
-    h.pairFails[0]?.pairingToken,
-    '999999',
-    '必须点名是哪一张：接线方靠它避免把"当前展示的那张"误当成废码',
-  )
+  assert.equal(h.pairFails[0]?.pairingToken, '999999', '必须点名是哪一张：接线方靠它避免把"当前展示的那张"误当成废码')
 })
 
 test('反向判据：中继没带 token 时给 undefined（而不是空串或猜一个）', () => {

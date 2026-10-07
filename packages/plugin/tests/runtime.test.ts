@@ -375,11 +375,7 @@ test('cmd.list_sessions 必须额外推一条 ev.session_changed：ev.result.dat
 
   const results = transport.resultReplies()
   assert.ok(results.length >= 1, 'cmd 必须回执，否则手机等到自己超时')
-  assert.equal(
-    results[0]?.cmdId,
-    sentCmdId,
-    'cmdId 不回原值 → 手机认不出这是哪条命令的回执',
-  )
+  assert.equal(results[0]?.cmdId, sentCmdId, 'cmdId 不回原值 → 手机认不出这是哪条命令的回执')
   assert.equal(results[0]?.ok, true)
   assert.deepEqual(results[0]?.data, { sessions: SESSIONS }, '回执里仍要带 data.sessions（e2e 读它，且旧实现如此）')
   assert.ok(kernel.calls.listSessions.length >= 1, '列表必须真的去内核取过，不是拿缓存糊弄')
@@ -1817,10 +1813,7 @@ test('恢复失败时把底层原因回给手机，且不再发指令：手机 t
   await settle()
   transport.pair('c_ffffffff10')
   kernel.ensureRunnableImpl = async () => ({ ok: false, message: '底层：归档盘不可读' })
-  await runtime.handleCommand(
-    cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: '继续' }),
-    'c_ffffffff10',
-  )
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdSendPrompt, { sessionId: 'ses_arch', text: '继续' }), 'c_ffffffff10')
   await settle()
 
   const result = transport.resultReplies().at(-1)
@@ -2674,8 +2667,7 @@ test('同一条 cmd.send_prompt 重发只执行一次（超时的补发不许变
   assert.equal(
     transport.resultReplies().length,
     2,
-    '重发也必须回执：不回执的话手机上那个 Promise 会一直转到自己超时，' +
-      '用户看到的是"点了没反应"。',
+    '重发也必须回执：不回执的话手机上那个 Promise 会一直转到自己超时，' + '用户看到的是"点了没反应"。',
   )
   assert.deepEqual(
     transport.resultReplies().at(-1),

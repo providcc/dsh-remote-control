@@ -619,8 +619,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
         enabled: pairStoreFile !== '',
         file: pairStoreFile || undefined,
         restored: restoredAtBoot.length,
-        lastSavedAt:
-          pairStoreFile && pairStore.lastSavedAt > 0 ? isoOrUndefined(pairStore.lastSavedAt) : undefined,
+        lastSavedAt: pairStoreFile && pairStore.lastSavedAt > 0 ? isoOrUndefined(pairStore.lastSavedAt) : undefined,
       },
       pairing: describeActivePairing(),
       keepAwake: snapshot,
