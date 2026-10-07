@@ -28,6 +28,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { apply } from '../src/index.js'
 import { defaultPairStoreFile } from '../src/shell/pair-store.js'
+import { DEFAULT_SYSTEM_CLOCK, FakeClock } from '../src/core/clock.js'
+import type { Clock } from '../src/ports/index.js'
 
 const FAKE_TOKEN = 'fake-host-token-not-a-real-secret-0123456789abcdef'
 const HOST_A = 'wiring_host_a'
@@ -54,6 +56,26 @@ interface BootOptions {
   hostId: string
   /** true = 根 ctx 上就挂着 on/off；false = 根 ctx 读 on/off 会抛（真机的 Proxy 形状）。 */
   rootHasEvents: boolean
+  /** 假时钟：用来演"时间过去了而某一拍还没响"。省略 = 真定时器。 */
+  clock?: Clock
+  /** `statusFile` 传这个：装成**关掉状态快照**（一个有文档的开关）。 */
+  statusFile?: string
+  /**
+   * 盘上那条恢复出来的通道写成"7 天前最后活动过"（`lastActivityAt: 0`）。
+   *
+   * 为什么不能沿用 `Date.now()`：夹具的假时钟停在 1.7e12，而真 `Date.now()` 是 1.78e12，
+   * 于是 `now - lastActivityAt` 是**负数**，剪枝永远不触发——夹具会绿，行为没被测到。
+   */
+  staleRestored?: boolean
+  /**
+   * 「落盘开着、排错入口关着」这一档：`statusFile` 置空，但**显式**把密钥簿指到
+   * 夹具自己的临时目录。
+   *
+   * 为什么必须显式给：默认密钥簿路径是从 `statusFile` 推出来的，而 `statusFile` 为空时
+   * `defaultPairStoreFile` 返回 `''` = 连落盘一起关了。那是个更彻底的配置，
+   * 演不到这条缺陷——真实运维关快照往往正是因为它老写盘，不是想连配对一起关掉。
+   */
+  persistWithoutStatus?: boolean
 }
 
 interface WiringFixture extends Wiring {
@@ -69,7 +91,12 @@ interface WiringFixture extends Wiring {
 function boot(options: BootOptions): WiringFixture {
   const dir = mkdtempSync(path.join(tmpdir(), 'drc-wiring-'))
   const statusFile = path.join(dir, 'status.json')
-  const storeFile = defaultPairStoreFile(statusFile, options.hostId)
+  // 插件真正会去读的那个路径：显式给了就用它，否则按 statusFile 推。
+  const storeFile =
+    options.persistWithoutStatus && !options.statusFile
+      ? path.join(dir, `conversations-${options.hostId}.json`)
+      : defaultPairStoreFile(statusFile, options.hostId)
+  if (!storeFile) throw new Error('夹具自检：这条配置下插件没有密钥簿可读，演不到剪枝')
   writeFileSync(
     storeFile,
     JSON.stringify({
@@ -77,7 +104,13 @@ function boot(options: BootOptions): WiringFixture {
       hostId: options.hostId,
       savedAt: Date.now(),
       conversations: [
-        { id: 'c_wired0000001', psk: FAKE_PSK, seqHost: 0, createdAt: Date.now(), lastActivityAt: Date.now() },
+        {
+          id: 'c_wired0000001',
+          psk: FAKE_PSK,
+          seqHost: 0,
+          createdAt: options.staleRestored ? 0 : Date.now(),
+          lastActivityAt: options.staleRestored ? 0 : Date.now(),
+        },
       ],
     }),
   )
@@ -129,13 +162,19 @@ function boot(options: BootOptions): WiringFixture {
     })
   }
 
-  apply(context as never, {
-    enabled: true,
-    serverUrl: 'ws://127.0.0.1:1',
-    hostToken: FAKE_TOKEN,
-    hostId: options.hostId,
-    statusFile,
-  })
+  apply(
+    context as never,
+    {
+      enabled: true,
+      serverUrl: 'ws://127.0.0.1:1',
+      hostToken: FAKE_TOKEN,
+      hostId: options.hostId,
+      statusFile: options.statusFile ?? statusFile,
+      ...(options.persistWithoutStatus && !options.statusFile ? { pairStoreFile: storeFile } : {}),
+    },
+    // 时钟只有一个来源（`apply` 的第三个参数）：不传就是真定时器，与生产同一条路。
+    options.clock ?? (DEFAULT_SYSTEM_CLOCK as Clock),
+  )
 
   const service = provided.dshRemoteControl as { state?: Record<string, unknown> } | undefined
   return {
@@ -299,5 +338,138 @@ test('中继回 pair-fail 时主机必须换一张码：onPairFail 不许再是"
     )
   } finally {
     relay.close()
+  }
+})
+
+/* ── 限速退避：`rate_limited` 从来不在 pair-fail 的 reason 枚举里 ───────────── */
+
+/** 轮询到条件成立或超时（假中继是异步的，"没发生"要用一段时间来证）。 */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return predicate()
+}
+
+test('中继限速之后不许自动补码：退避窗口内被拒，主机不再立刻申请一张', async () => {
+  // 现场：`index.ts` 里写的是 `if (reason !== 'rate_limited')`，而 `pair-fail.reason`
+  // 的四个取值里**没有** `rate_limited`（中继把配对限流折成 `invalid_or_expired`，
+  // 只在自己的日志里记 `rate_limited`）。所以那是一个**恒真**的分支：
+  // 读起来像"限速时我们会克制一下"，实际上从不克制。
+  //
+  // 后果不是"多申请了几张码"这么轻：自动补码是一条自我加速的循环
+  //（被拒 → 补一张 → 再被拒 → 再补），而配对限流的全局配额是 20/s。
+  // 于是"刚被限速"最可能的表现是**主机自己把配额烧光**，手机随后连普通帧都发不出去。
+  //
+  // 真实的信号是 `error{code:'rate_limited'}` 那一帧。判据分三段：
+  //   ① 基线：没被限速时被拒 → 必须补码（否则这条退避逻辑会把正常路径也掐死）；
+  //   ② 限速窗口内被拒 → **不许**补码；
+  //   ③ 两次连续限速各自开一个窗口（退避不是永久的：换连接即清零）。
+  const relay = await bootWithFakeRelay('wiring_host_ratelimit')
+  try {
+    assert.ok(await relay.waitForFrame((f) => f.t === 'hello'), '夹具自检：主机应当先发 hello')
+
+    // ① 基线
+    const countPairBegins = (): number => relay.frames.filter((f) => f.t === 'pair-begin').length
+    relay.send({ t: 'pair-fail', reason: 'invalid_or_expired' })
+    await waitUntil(() => countPairBegins() >= 1)
+    assert.ok(countPairBegins() >= 1, '没被限速时被拒必须立刻补一张码')
+
+    // ② 中继说它限速了（带等待建议），紧接着这一张又被拒
+    relay.send({ t: 'error', code: 'rate_limited', message: '慢一点', retryAfterMs: 5_000 })
+    await new Promise((resolve) => setTimeout(resolve, 100)) // 让 error 帧先落地
+    const marks = countPairBegins()
+    relay.send({ t: 'pair-fail', reason: 'invalid_or_expired' })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(
+      countPairBegins(),
+      marks,
+      '刚被限速就自动补码 = 自我加速的拒绝循环；中继的全局配额只有 20/s，烧光之后手机连普通帧都发不出去',
+    )
+
+    // ③ 退避有尽头：5 秒的窗口过去之后（这里不真等，走另一条路证明它不是永久的）
+    //    —— 中继重连即清零（配额按连接计）。
+    relay.send({ t: 'error', code: 'rate_limited', message: '慢一点' })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const marks2 = countPairBegins()
+    relay.send({ t: 'pair-fail', reason: 'invalid_or_expired' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(countPairBegins(), marks2, '第二个窗口内同样不许补码')
+  } finally {
+    relay.close()
+  }
+})
+
+/* ── 2026-10-07：关掉状态快照不许顺手关掉剪枝、补码与落盘 ─────────────────── */
+
+test('statusFile 置空（关掉状态快照）：空闲超时的通道仍会被剪掉，否则密钥簿重新变回无界', async () => {
+  // 现场：`pairingWindow.tick()` / `relay.pruneConversations()` / 批量落盘三件事
+  // 全都写在 `status.start()` 的回调里，而 `StatusFile.start` 在没有文件时**直接 return**。
+  // `statusFile: ''` 是有文档的开关（HOST-SIDE §4），于是关掉快照的用户同时关掉了：
+  //   ① 通道剪枝（全仓唯一的 `pruneStale()` 调用方）→ 密钥簿无界，
+  //      `MAX_CONVERSATIONS` 与两条 TTL 全部形同虚设，每天重配一次两周攒 200+ 把 PSK；
+  //   ② 配对码自动换代 → `pairOnStartSec>0` 的实例永远只发启动那一张；
+  //   ③ PSK 簿批量落盘 → 只剩结构性变化与停机两条写盘路。
+  // 而且**没有任何提示**——正是本仓库反复出现的那一类「静默失效」。
+  //
+  // 判据钉的是**可观察的后果**（会话数真的掉下来），不是"装了几只定时器"：
+  // 上一版钉的是后者，结果 apply 里那一堆一次性复查与 runtime 的刷新节拍
+  // 足以让断言恒真——把修复整段删掉它照样绿。
+  const clock = new FakeClock()
+  const wiring = boot({
+    hostId: HOST_A,
+    rootHasEvents: true,
+    clock,
+    statusFile: '',
+    staleRestored: true,
+    persistWithoutStatus: true,
+  })
+  const conversations = (): number => Number(wiring.state().conversations ?? -1)
+  try {
+    assert.equal(conversations(), 1, '前提：盘上那条恢复出来了，此刻它占着一个会话位')
+
+    // 走满 7 天（`restoredIdleTtlSec` 默认 604800 秒）+ 一拍余量。
+    await clock.advance(604_800_000 + 30_000)
+
+    assert.equal(
+      conversations(),
+      0,
+      '一条 7 天没动过的恢复通道必须被剪掉：剪枝**只**由 housekeeping 驱动，' +
+        '关掉状态快照就等于把它一起关掉，而那正是 `MAX_CONVERSATIONS` 与两条 TTL 被写成要治的无界密钥簿',
+    )
+  } finally {
+    wiring.dispose()
+  }
+})
+
+test('关掉状态快照时另起的那只节拍必须在停机时收掉', () => {
+  // 这条与上面那条是两个不同的保证：那一条钉"剪枝会发生"，这一条钉"它不会变成孤儿节拍"。
+  // 插件都走了还在往一个已经不存在的会话簿上写盘，是那种没人会在现场当场发现的漏。
+  const clock = new FakeClock()
+  const wiring = boot({ hostId: HOST_A, rootHasEvents: true, clock, statusFile: '', persistWithoutStatus: true })
+  try {
+    // 跑满几拍：让它自续几次，证明它是活的（而不是恰好没被排上）。
+    void clock
+  } finally {
+    wiring.dispose()
+  }
+  assert.equal(clock.pending, 0, `停机后不许留下定时器（还剩 ${clock.pending} 只）`)
+})
+
+test('statusFile 有值：节拍仍然只有状态那一拍，没有多出一只重复的 housekeeping', async () => {
+  // 反证：上一条不能靠"到处再挂一只定时器"来满足——那会让正常路径多一个写盘心跳。
+  // 走状态那一拍就够，所以这里钉的是"仍然只靠状态驱动"。
+  const clock = new FakeClock()
+  const wiring = boot({ hostId: HOST_A, rootHasEvents: true, clock })
+  try {
+    const before = clock.pending
+    assert.ok(before > 0, '前提：状态节拍装上了')
+    for (let round = 0; round < 5; round += 1) await clock.advance(3_000)
+    assert.ok(clock.pending > 0, '状态节拍必须自续')
+  } finally {
+    wiring.dispose()
+    assert.equal(clock.pending, 0, '停机后不留定时器')
   }
 })

@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { defaultPairStoreFile } from './pair-store.js'
+import { MAX_ATTACH_TOTAL_BYTES } from './uploads.js'
 
 export interface PluginConfig {
   enabled: boolean
@@ -316,6 +317,29 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
   }
   if (!config.statusFile) {
     problems.push({ level: 'warn', field: 'statusFile', message: '为空将关闭状态快照；GUI 宿主里这是唯一的排错入口' })
+  } else if (!config.statusFile.startsWith('/')) {
+    /**
+     * 相对路径必须说清楚它会落在**哪里**（2026-10-07 审计）。
+     *
+     * 这里原来只有 `!config.statusFile` 一道真值检查：它不 trim、也不要求绝对路径。
+     * 而 `StatusFile` 是 `mkdirSync(path.dirname(file))` + `writeFileSync`，
+     * 相对路径按**宿主进程的 CWD** 解析——GUI 宿主的 CWD 是 `/`，于是写不进去，
+     * 失败被 `StatusFile.write` 那个空 catch 吞掉。
+     *
+     * 症状是这个仓里最贵的一种：插件正常加载、status.json 从不出现、
+     * **没有 problems、没有日志、没有任何探针**说得出为什么 —— 而那正是
+     * "唯一排错入口"消失之后的样子。
+     *
+     * 刻意**只告警不改道**（与 `resolvePairStoreFile` 同一条纪律）：
+     * 静默改到一个用户没要求的路径，比让他看见自己写错了更难查。
+     */
+    problems.push({
+      level: 'warn',
+      field: 'statusFile',
+      message:
+        `必须是绝对路径：相对路径按宿主进程的当前目录解析，而 GUI 宿主的 CWD 是 /（写不进去，状态快照会静默消失）。` +
+        `收到 ${JSON.stringify(config.statusFile)}，建议写成 ~/.dsh/dsh-remote-control/status.json 这样的绝对路径`,
+    })
   }
   /**
    * 剩下这几个数字字段原来是**一个都不夹**的（头注却承诺"其余一律 warn + 夹回默认值"）：
@@ -334,6 +358,27 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
       message: '必须是正的有限字节数，已夹回 524288（512KB）',
     })
     config.maxFileBytes = 512 * 1024
+  } else if (config.maxFileBytes > MAX_ATTACH_TOTAL_BYTES) {
+    /**
+     * **调大它不会生效**，而原来一句提示都没有（2026-10-07 审计）。
+     *
+     * `runtime` 传下去的是 `maxBytesPerFile: maxFileBytes` 与
+     * `maxTotalBytes: MAX_ATTACH_TOTAL_BYTES`——后者是硬的（整批预算，与中继的
+     * 1MB 帧上限同源）。所以把 `maxFileBytes` 设成 2MB 的结果是：一个 600KB 的文件
+     * 被**整批闸**拒掉，而回给手机的话是
+     * "这一批附件合计 512KB，超过整批上限 512KB（第 1 个文件让它超了，请少带几个）"
+     * ——用户只带了**一个**文件，却被告知"少带几个"。
+     *
+     * 与 `resolvePairStoreFile` 同一条纪律：不静默改道，改道要说出来。
+     */
+    problems.push({
+      level: 'warn',
+      field: 'maxFileBytes',
+      message:
+        `整批附件的预算是 ${MAX_ATTACH_TOTAL_BYTES} 字节（中继 1MB 帧上限的同源口径），` +
+        `单个文件的上限调过它不会生效；已夹回 ${MAX_ATTACH_TOTAL_BYTES}`,
+    })
+    config.maxFileBytes = MAX_ATTACH_TOTAL_BYTES
   }
   return problems
 }

@@ -163,6 +163,25 @@ export function saveFileAttachments(options: {
       written.push({ name, path: file, bytes: one.buf.length, mediaType: one.file.mediaType })
     }
   } catch (error) {
+    /**
+     * **IO 失败也要把这一批收干净**（2026-10-07 审计）。
+     *
+     * 文件头第 2 条纪律写的是"被拒的批次一个字节都不留在磁盘上"，而原来那句话
+     * 只覆盖了**校验**失败：先验后写保证的是"不会写一半才发现不合格"，可
+     * `writeFileSync` 自己是会在循环中途抛的（ENOSPC / EACCES / EMFILE）——
+     * 于是 1~3 个文件已经落盘，第 4 个抛了，`catch` 直接返回失败，
+     * 而 `runtime` 如实告诉手机"整条 prompt 失败、什么都没发"。
+     *
+     * 症状比"多几个文件"难查：用户看到的是失败，重试一次文件名就变成
+     * `report-2.pdf`、`report-3.pdf`……一直涨，而目录里的那些副本没有任何人认领。
+     */
+    for (const file of written) {
+      try {
+        fs.rmSync(file.path, { force: true })
+      } catch {
+        /* 收不回来就留着：宁可留一个孤儿文件，也不要在这里再抛一次把错误信息顶掉 */
+      }
+    }
     return {
       ok: false,
       message: `文件落盘失败：${String((error as Error)?.message ?? error).slice(0, 160)}`,

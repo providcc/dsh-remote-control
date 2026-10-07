@@ -26,6 +26,8 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext, runInContext } from 'node:vm'
+/** 真 Date：夹具的假墙钟要从它身上取静态成员（`parse`/`UTC` 等）与构造语义。 */
+const RealDate = Date
 import {
   PAIR_IMAGE_ROUTE,
   PAIR_MARKER_HEADER,
@@ -73,6 +75,11 @@ interface LoadOptions {
   newThrows?: boolean
   /** `POST /unpair` 的回答。 */
   unpairAnswer?: Record<string, unknown>
+  /**
+   * `POST /unpair` 回非 200。**要能造这一档**，因为 403 不会让 fetch 抛错：
+   * 退出配对这条路原来把回答整个丢掉，于是"守卫拒了"这件事在现场一句都留不下。
+   */
+  unpairHttp?: number
   /** `POST /unpair` 直接抛。 */
   unpairThrows?: boolean
   /** 预置一份**上一版**的样式表：模拟"宿主热更了这一半、文档没重载"。 */
@@ -105,6 +112,14 @@ interface Harness {
   unmountPill(): void
   /** 假 document：点外面与 Escape 这两条要往它身上发事件。 */
   fakeDocument(): FakeDocument
+  /**
+   * 把假墙钟往前拨若干毫秒，**不打任何节拍**。
+   *
+   * 用来演后台计时器被节流/冻结的那一段时间：真实浏览器里页面隐藏时 `setInterval`
+   * 可能一分钟才醒一次，合上盖子直接停摆，而用户切回来是**立刻**看屏的。
+   * 夹具里节拍是手工打的，所以"时间过去了但节拍没响"只能这么造。
+   */
+  advanceClock(ms: number): void
 }
 
 // ── 够用的假 DOM ────────────────────────────────────────────────────
@@ -293,6 +308,12 @@ function load(options: LoadOptions = {}): Harness {
    * 还活着的用 `liveTimerCount()`。
    */
   const timers: Array<{ id: number; callback: () => void; cleared: boolean }> = []
+  /**
+   * 假墙钟。**必须给**：`pill.ts` 里倒计时读的是 `Date.now()`，而 vm 上下文自带的是真
+   * `Date`，测试没法推进它——于是"后台冻结两分钟"这种时序在夹具里根本演不出来，
+   * 而那正是 2026-10-07 审出的倒计时漂移的现场形状。
+   */
+  let clockMs = 1_700_000_000_000
   const slotRegisters: Array<{ definition: Record<string, unknown>; component?: () => unknown }> = []
   const doc = new FakeDocument(options.hidden ? 'hidden' : 'visible')
   if (options.staleStyle) {
@@ -311,6 +332,12 @@ function load(options: LoadOptions = {}): Harness {
       log: () => {},
     },
     document: doc,
+    /**
+     * 只换掉 `Date.now`：这一半只用它读"这张码什么时候到期"，而判据要能**推进**时间。
+     * 其余（构造、`parse`、`UTC`…）原样转发到真 Date —— 这一行是给将来用的保险，
+     * 不是这次要测的东西。
+     */
+    Date: { ...RealDate, now: () => clockMs },
     // 真浏览器有 `AbortSignal.timeout`，pill 拿它做每条请求的 3 秒硬超时。
     // 夹具不给它的话，那条路在 vm 里会静悄悄退回"没有 signal"，判据也就测了个空。
     AbortSignal,
@@ -360,7 +387,11 @@ function load(options: LoadOptions = {}): Harness {
           `退出配对必须带 ${PAIR_MARKER_HEADER}: ${PAIR_MARKER_VALUE}，实际 init=${JSON.stringify(init)}`,
         )
         if (options.unpairThrows) throw new Error('退出配对那条断了')
-        return { ok: true, status: 200, json: async () => options.unpairAnswer ?? { state: 'ok', unpaired: 1 } }
+        return {
+          ok: (options.unpairHttp ?? 200) === 200,
+          status: options.unpairHttp ?? 200,
+          json: async () => options.unpairAnswer ?? { state: 'ok', unpaired: 1 },
+        }
       }
       assert.equal(method, 'GET', `${url} 不该收到 ${method}`)
       return { ok: true, status: 200, json: async () => ({}) }
@@ -468,6 +499,9 @@ function load(options: LoadOptions = {}): Harness {
       pillRef()(null)
     },
     fakeDocument: () => doc,
+    advanceClock: (ms: number) => {
+      clockMs += ms
+    },
   }
 }
 
@@ -1084,6 +1118,9 @@ test('码过期后**不再自动补一张**，就地说明白要人自己去按�
   assert.equal(harness.timerCount(), 2, '该有两个节拍')
   const image = root.find('drc-qr')
   assert.ok(image, '前提：图在屏上')
+  // 拨一秒再打那一拍：倒计时读的是墙钟，所以"一秒过去"必须由时钟表达，
+  // 而不是由"节拍响了一次"顺带减掉 1000（2026-10-07 改，见下面那条漂移判据）。
+  harness.advanceClock(1_000)
   await harness.fireAndFlush(1)
   assert.equal(
     harness.requests.filter((url) => url === PAIR_NEW_ROUTE).length,
@@ -1207,6 +1244,7 @@ test('倒计时每秒只改那一行文本：img 与 6 位码原地不动（重�
   assert.ok(image, `前提：图在屏上（${root.allText()}）`)
   assert.equal(root.find('drc-count')!.textContent, '1 分 0 秒后过期')
 
+  harness.advanceClock(1_000) // 真过了一秒，再打那一拍
   await harness.fireAndFlush(1)
   assert.equal(root.find('drc-count')!.textContent, '59 秒后过期', '每秒要动的只有这一行')
   assert.equal(
@@ -1248,6 +1286,115 @@ test('/status 非 200（路由没挂上就是 404）：要留一行 warn，pill 
     '读不到状态就不许发码：已配对的主机不该因为我们读不到状态就白吃一张新码',
   )
   assert.match(waitingRoot.find('drc-note')!.textContent, /读不到主机状态/, 'loading 要落地成一句人话，不能永远转圈')
+})
+
+// ── 2026-10-07 审计：倒计时是"期限"的投影，不是节拍器的读数 ──────────
+// 现场（2026-10-05 用户报的"要等下次刷新的二维码才能用"）：用户点开发码面板之后必然要
+// **切走**去手机上扫码，而后台页的 setInterval 会被节流（Chrome intensive throttling 一分钟
+// 一醒）、Electron 会冻不可见窗口、合盖直接停摆。原来那一行是 `expiresInMs -= 1000`，
+// 于是屏上的数字只数"节拍响过几次"，切回来时那张码早就死了而面板还写着"还剩 2 分"。
+
+test('倒计时按墙钟算：后台冻结的那段时间不许被当成"没过去"', async () => {
+  // 这条判的是**节拍本身**，所以刻意不打任何节拍：只把墙钟往前拨，
+  // 模拟"两分钟里一次回调都没有"。旧实现（`expiresInMs -= 1000`）这时会显示 59 秒。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 },
+  })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.equal(root.find('drc-count')!.textContent, '1 分 0 秒后过期', '前提：刚拿到码时算得出 1 分钟')
+
+  harness.advanceClock(90_000) // 一分半过去，一拍都没响
+  await harness.fireAndFlush(1)
+
+  assert.equal(
+    root.find('drc-count')?.textContent,
+    undefined,
+    `一张 60 秒的码过了 90 秒必须已经收起来，实际屏上是：${root.find('drc-count')?.textContent ?? '(没有这一行)'}`,
+  )
+  assert.match(
+    root.find('drc-note')!.textContent,
+    /已过期/,
+    '必须就地改口说"已过期"：用户扫的是一张死码，面板却显示它还活着',
+  )
+  assert.equal(harness.liveTimerCount(), 1, '走完就该自清，只留状态轮询那一拍')
+})
+
+test('切回前台那一拍就把倒计时对齐（后台节流期间表早就停了，回来要立刻看到真相）', async () => {
+  // 墙钟锚定保证"下一拍回来时数字是对的"，可后台被冻结时下一拍可能几分钟后才来，
+  // 而用户是**切回来立刻看屏**的 —— 这一拍就是为那一眼准备的。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 },
+  })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.ok(root.find('drc-count'), '前提：倒计时在跑')
+
+  // 部分过期：还剩 25 秒。不是"走光"，所以这一拍该做的是把数字改对。
+  harness.advanceClock(35_000)
+  harness.fakeDocument().emit('visibilitychange', {})
+  assert.equal(
+    root.find('drc-count')!.textContent,
+    '25 秒后过期',
+    '切回来第一眼必须是真实剩余，不是"35 秒没响就还是 60"',
+  )
+
+  // 再切回来一次：这次是真的过期了，必须落到"已过期"而不是继续显示 25 秒。
+  harness.advanceClock(30_000)
+  harness.fakeDocument().emit('visibilitychange', {})
+  assert.equal(root.find('drc-count'), undefined, '过期之后不许还挂着一行倒计时')
+  assert.match(root.find('drc-note')!.textContent, /已过期/)
+  assert.equal(harness.liveTimerCount(), 1, '过期即停表，只留状态轮询')
+})
+
+test('关面板与卸载之后 visibilitychange 不许再动屏（孤儿监听 = 一条留在页面上的引用）', async () => {
+  // 面板关掉之后那张码早就不在屏上了；监听还活着的话，一次切回前台就会去重画一个
+  // 已经收掉的面板——用户看到的是"我明明关掉了，它自己又动了一下"。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    newAnswer: { state: 'ready', epoch: 'e1', token: '482913', expiresInMs: 60_000 },
+  })
+  const root = harness.mountPill()
+  await openPairing(root)
+  assert.equal(harness.fakeDocument().listenerCount('visibilitychange'), 1, '前提：监听挂上了')
+
+  harness.unmountPill()
+  assert.equal(
+    harness.fakeDocument().listenerCount('visibilitychange'),
+    0,
+    '卸载必须把监听摘掉：pill.ts 头注写着"卸载要清定时器"，监听同一条纪律',
+  )
+})
+
+test('/unpair 的回答不许丢掉：403 带着守卫名回来是宿主故意留的唯一现场', async () => {
+  // `routes.ts` 的 403 回答里**专门**带 `guard`，注释写着"屏幕上那句话就是唯一的现场"，
+  // 而发码那条路由的客户端分支（`panelViewFor`）确实把它印出来了。
+  // 退出配对这条路原来把整个回答丢掉：403 不会让 fetch 抛错，于是那句现场一句都留不下，
+  // 而面板已经乐观地把 `paired` 清零 —— 用户看着一张自己没点过的码出现又消失。
+  const harness = load({
+    react: FAKE_REACT,
+    slots: true,
+    status: { ...DEFAULT_STATUS, paired: 1, pairings: 1 },
+    unpairAnswer: { error: 'request-not-trusted', guard: 'missing-marker-header' },
+    unpairHttp: 403,
+  })
+  const root = harness.mountPill()
+  await flush()
+  root.find('drc-pill')!.emit('click')
+  await flush()
+  assert.equal(root.find('drc-btn')!.textContent, '退出配对', '前提：按钮身份是退出配对')
+  root.find('drc-btn')!.emit('click')
+  await flush()
+
+  assert.ok(
+    harness.warnings.some((line) => line.includes('403') && line.includes('request-not-trusted')),
+    `退出配对被守卫拒了必须留一行 warn（状态码与宿主给的那句 error），实际：${harness.warnings.join(' | ')}`,
+  )
 })
 
 test('二维码那一屏换成"发不出码 / 失败"时倒计时要停：否则是个每秒还在重画的孤儿定时器', async () => {

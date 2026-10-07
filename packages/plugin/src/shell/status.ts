@@ -18,13 +18,16 @@ import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Clock, StatusSink } from '../ports/index.js'
 
+/** 状态快照的刷新周期（毫秒）。抽成常量：关掉快照时 `index.ts` 要用同一个节拍。 */
+export const STATUS_REFRESH_MS = 3000
+
 export class StatusFile implements StatusSink {
   private timer: unknown
 
   constructor(
     private readonly file: string,
     private readonly clock: Clock,
-    private readonly refreshMs = 3000,
+    private readonly refreshMs = STATUS_REFRESH_MS,
   ) {}
 
   write(snapshot: Record<string, unknown>): void {

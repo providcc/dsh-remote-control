@@ -1015,3 +1015,73 @@ test('握手超时那条路只许排出一次重连：双 timer 会把退避翻�
   h.client.stop()
   assert.equal(h.clock.pending, 0, 'stop() 之后不许留下重连定时器：插件走了还去建 socket')
 })
+
+/* ── 2026-10-07 审计：作废的"出口"与出站的"体积闸" ────────────────────── */
+
+test('作废帧没发出去就不许记账：否则「手机唯一的出口」在中继重连期间被永久堵死', () => {
+  // 现场：`voidConversation` 原来先 `voided.add()` 再 `raw()`，而 `raw()` 对非 OPEN 的
+  // socket 是静默 false（中继抖一下，退避最长 30 秒以上）。于是这一帧没发出去，通道却
+  // 已经被标成"声明过了"，此后**任何**重试都被那道闸挡掉——包括设计上明确依赖的
+  // `onEncrypted` → 「本端已无钥匙」→ 再作废一次那条路。
+  //
+  // 症状：中继那边路由还在，手机继续对着一个听不见的对端发帧，既无回执也撞不上
+  // `unknown_session`，而 index.ts 明明承诺过"手机端会显示请重新配对"。
+  const h = harness()
+  h.socket.readyState = 3 // CLOSED：正好是"作废那一刻中继正在退避"
+
+  h.client.voidConversation('c_aabbccddeeff')
+  assert.equal(h.outOf('session-leave').length, 0, '前提：socket 不在 OPEN，这一帧确实没发出去')
+
+  // 重连成功。手机还在旧 convId 上说话 —— 主机必须**再声明一次**。
+  h.socket.readyState = 1 // OPEN
+  h.feed({ t: 'enc', sessionId: 'c_aabbccddeeff', seq: 1, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' })
+
+  const leave = h.outOf('session-leave')
+  assert.equal(leave.length, 1, '作废帧没发出去就等于"还没说过"：手机那条路必须还能重试，否则主机重启后手机永远转圈')
+  assert.equal((leave[0] as { sessionId: string }).sessionId, 'c_aabbccddeeff')
+  assert.ok(
+    h.logs.some((line) => line.includes('session-leave not sent')),
+    '没发出去要留痕：否则"声明过了"与"声明成功了"在排障时长得一模一样',
+  )
+})
+
+test('出站帧超上限时当成没发出去：超限的密文会被中继整帧拒掉，而主机原来只记日志', () => {
+  // `encToClient` 是协议层唯一执行 `MAX_CIPHERTEXT_BYTES` 的地方，注释写着"超过上限
+  // 对侧静默丢帧"。主机原来手拼 `{t:'enc',…}`，这条路上一个体积闸都没有。
+  // 而超限的后果不是"这帧没了"：中继回一条 `error{bad_frame}`，插件对 `error` 只记日志，
+  // 手机于是走完 15 秒超时留下一句"读不到"——本仓库最典型的「什么也没发生」。
+  const h = harness()
+  const slot = h.slots.create(120_000)
+  h.feed({ t: 'peer-joined', sessionId: 'c_aabbccddeeff', clientId: 'k_mp', pairingToken: slot.token })
+  h.socket.sent.length = 0
+
+  const huge: EvPayload = {
+    t: 'ev.message_delta',
+    sessionId: 'c_aabbccddeeff',
+    messageId: 'm1',
+    // base64 再 base64，密文长度 ≈ 正文的 16/9：900KB 正文必然越过 1040384 的上限。
+    delta: 'x'.repeat(900_000),
+  } as EvPayload
+  const sent = h.client.send('c_aabbccddeeff', huge)
+
+  assert.equal(sent, false, '过不了体积闸就必须说"没发出去"：返回 true 会让 runtime 把它记成已送达')
+  assert.equal(
+    h.socket.sent.filter((line) => line.includes('"t":"enc"')).length,
+    0,
+    '超限的 enc 帧不许交给 socket：中继的 ws.maxPayload 会因此把**整条连接**掐掉（1009）',
+  )
+  assert.ok(
+    h.logs.some((line) => line.includes('wire size cap')),
+    `体积闸要留痕（现场排障全靠这一行），实际：${h.logs.join(' | ')}`,
+  )
+
+  // 反证：正常大小的帧仍然照发——闸不能变成"什么都发不出去"。
+  const small: EvPayload = {
+    t: 'ev.message_delta',
+    sessionId: 'c_aabbccddeeff',
+    messageId: 'm2',
+    delta: '正常长度的一小段正文',
+  } as EvPayload
+  assert.equal(h.client.send('c_aabbccddeeff', small), true, '闸只拦超限的帧：正常的流式输出必须照发')
+  assert.equal(h.socket.sent.filter((line) => line.includes('"t":"enc"')).length, 1)
+})

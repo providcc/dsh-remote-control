@@ -594,7 +594,9 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    * 真机上"新建没反应"的病根可能在任意一层，而报错信息里带上"这一层有什么成员"，
    * 排查就不用再重启一次 Harness 去取证。
    */
-  async function newSession(args?: { workspace?: string }): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
+  async function newSession(args?: {
+    workspace?: string
+  }): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
     const controller = services.sessionController
     if (!controller) return { ok: false, message: '主机这一代没有 sessionController 服务' }
     const commands = controller.commands

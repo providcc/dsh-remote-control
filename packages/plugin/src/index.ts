@@ -165,11 +165,7 @@ export function apply(ctx: LooseContext, injected: Partial<PluginConfig> = {}, c
   }
 }
 
-function applyInner(
-  ctx: LooseContext,
-  injected: Partial<PluginConfig>,
-  clock: Clock,
-): RuntimeHandle | undefined {
+function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: Clock): RuntimeHandle | undefined {
   const config = readConfig(injected)
   // 载具探测的复查（8s/25s/60s）与载具宽限都是"宿主还活着就顺手看一眼"的一次性动作。
   // 它们必须 unref 且在停机时撤掉，否则 60s 那一发会把事件循环钉住——`node e2e/run.mjs`

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { existsSync, readdirSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { appendFileNote, safeSegment, saveFileAttachments } from '../src/shell/uploads.js'
@@ -102,4 +103,50 @@ test('整批附件总量也要卡：单文件 512KB × 4 会撞穿中继的 1MB 
   // 与 mp 同口径：单文件 200KB、总量 400KB 的一批必须放行（mp 侧就是按原始字节算的）。
   const ok = saveFileAttachments({ files: [one, one], dir, sessionId: 'ses/2' })
   assert.equal(ok.ok, true, `2×200KB 被误拒：与 mp 的 MAX_ATTACH_TOTAL_BYTES 口径不一致（${JSON.stringify(ok)}）`)
+})
+
+test('写到一半失败：已经落盘的那几个必须收回来，不许留一批没人认领的孤儿文件', () => {
+  // 文件头第 2 条纪律是"被拒的批次一个字节都不留在磁盘上"，而原来那句话只管**校验**：
+  // `writeFileSync` 自己会在循环中途抛（ENOSPC / EACCES / EMFILE），第 2 个文件已经
+  // 落盘、第 3 个抛了，`catch` 返回失败、手机如实显示"整条 prompt 失败、什么都没发"。
+  // 于是用户重试一次文件名就变成 report-2.pdf、report-3.pdf……一直涨。
+  //
+  // 生产里的触发条件（磁盘满 / 目录只读 / 文件数超限）没法在 CI 里复现，
+  // 所以这里直接换掉 `fs.writeFileSync`：让**第 2 次**调用抛 —— 正是那个形状。
+  // （`uploads.ts` 走的是 `fs.writeFileSync(...)` 的属性访问，所以替换默认导出上的成员有效。）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drc-uploads-io-'))
+  const realWrite = fs.writeFileSync
+  let calls = 0
+  try {
+    fs.writeFileSync = ((...args: Parameters<typeof fs.writeFileSync>) => {
+      calls += 1
+      if (calls === 2) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+      return (realWrite as (...a: Parameters<typeof fs.writeFileSync>) => void)(...args)
+    }) as typeof fs.writeFileSync
+
+    const result = saveFileAttachments({
+      files: [
+        { name: 'first.txt', data: Buffer.alloc(16, 0x41).toString('base64') },
+        { name: 'second.txt', data: Buffer.alloc(16, 0x42).toString('base64') },
+        { name: 'third.txt', data: Buffer.alloc(16, 0x43).toString('base64') },
+      ],
+      dir,
+      sessionId: 'ses_io',
+    })
+
+    assert.equal(result.ok, false, '前提：这一批应当整体失败（磁盘写不下去）')
+    assert.match(String((result as { message?: string }).message ?? ''), /ENOSPC|落盘失败/, '失败理由要原样带回去')
+
+    const sessionDir = path.join(dir, 'ses_io')
+    const leftovers = existsSync(sessionDir) ? readdirSync(sessionDir) : []
+    assert.deepEqual(
+      leftovers,
+      [],
+      `这一批被拒了，磁盘上却留下了 ${JSON.stringify(leftovers)}：用户看到的是"发送失败"，` +
+        '重试一次文件名就变成 first-2.txt、first-3.txt……一直涨，而那些副本没有任何人认领',
+    )
+  } finally {
+    fs.writeFileSync = realWrite
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

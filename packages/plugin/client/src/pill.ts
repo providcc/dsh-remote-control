@@ -489,7 +489,15 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
   let statusTimer: ReturnType<typeof setInterval> | undefined
   let countTimer: ReturnType<typeof setInterval> | undefined
   let view: PanelView = { kind: 'info' }
+  /**
+   * 屏上那个"还剩多少"（秒数文本与"已过期"提示都读它）。
+   *
+   * 它是**算出来的**，不是数出来的 —— 真相是下面的 `expiresAt`（墙钟到期时刻）。
+   * 见 `syncCountdown` 的注释：这一行曾经是"每个节拍减 1000"。
+   */
   let expiresInMs = 0
+  /** 这张码的**墙钟**到期时刻（`Date.now()` 口径）。倒计时的一切都从它重算。 */
+  let expiresAt = 0
   let lastStatus: StatusAnswer | undefined
   /** 面板开着等首次 `/status`：这段时间**一颗码都不发**（见 `openPanel` 那条注释）。 */
   let awaitingStatus = false
@@ -549,6 +557,49 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       countTimer = undefined
     }
     expiresInMs = 0
+    expiresAt = 0
+  }
+
+  /**
+   * 把"还剩多少"按**墙钟**重算一遍，返回这张码此刻还有没有效。
+   *
+   * ## 为什么不能是"每个节拍减 1000"（2026-10-07 审计）
+   *
+   * 原来那一行是 `expiresInMs -= 1000`：屏上的数字只准到"浏览器有没有按秒交出那一拍"。
+   * 而**用户点开发码面板之后必然要去切走**——掏出手机打开微信扫��，这个窗口正是
+   * 计时器最不可靠的时候：Chrome 对隐藏页做 intensive throttling（一分钟才醒一次），
+   * Electron 还会把不可见的窗口冻起来，合上盖子则直接停摆。
+   *
+   * 于是最常见的用法恰好是最坏的情况：面板开着、切走两分钟、回来一看还写着
+   * "2 分 5 秒后过期"，而那张码两分钟前就死了 —— 用户扫的是一个显示上"还活着"的死码，
+   * 手机回一句配对失败，而面板从头到尾没说过一句"已过期"。**这正是 2026-10-05
+   * 现场报的那件事**，倒计时本来就是为了治它，结果用同一个错误把它放回来了。
+   *
+   * 倒计时是一个**期限**的投影，不是节拍器的读数：只认墙钟，节拍只负责"什么时候重画"。
+   * 单拍走飞（后台冻结）也自愈 —— 下一拍按墙钟重算，一次就补回全部欠账。
+   */
+  const syncCountdown = (): boolean => {
+    expiresInMs = Math.max(0, expiresAt - Date.now())
+    return expiresInMs > 0
+  }
+
+  /**
+   * 倒计时走完的收场：停表 + 整块重画（note 要改口"已过期"）。
+   *
+   * 单独抽出来是因为**两条路**都要走到它：节拍自己走到 0，以及切回前台时
+   * `resyncCountdown` 发现那张码在后台期间就已经过期（那一路才是现场那次的真实时序：
+   * 面板开着切走，回来时表早就停了，`expiresInMs` 却还停在切走前那一拍）。
+   */
+  const expireCountdown = (): void => {
+    if (countTimer !== undefined) {
+      clearInterval(countTimer)
+      countTimer = undefined
+    }
+    expiresAt = 0
+    expiresInMs = 0
+    // 走完最后 1 秒才整块重画这一屏（note 要改口"已过期"）。这一拍 `<img>` 仍按
+    // src 复用，所以不会多向 `/pairing.png` 要一张——每秒重画的问题见 `paintCountdown`。
+    paint()
   }
 
   const write = (): void => {
@@ -850,17 +901,14 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
       return
     }
     expiresInMs = view.expiresInMs
+    expiresAt = Date.now() + view.expiresInMs
     if (countTimer === undefined) {
       countTimer = setInterval(() => {
-        expiresInMs -= 1000
-        // 到点**换一张的能力没有了**（2026-10-03 拍板）：不自动补、也没有「换一张」按钮。
-        // 停表并就地把它说成"已过期"，重发与否由人再按一次那颗按钮决定。
-        if (expiresInMs <= 0) {
-          clearInterval(countTimer)
-          countTimer = undefined
-          // 走完最后 1 秒才整块重画这一屏（note 要改口"已过期"）。这一拍 `<img>` 仍按
-          // src 复用，所以不会多向 `/pairing.png` 要一张——每秒重画的问题见 `paintCountdown`。
-          paint()
+        // 只判"还剩多少"，不负责推进 —— 推进是墙钟的事（见 `syncCountdown`）。
+        if (!syncCountdown()) {
+          // 到点**换一张的能力没有了**（2026-10-03 拍板）：不自动补、也没有「换一张」按钮。
+          // 停表并就地把它说成"已过期"，重发与否由人再按一次那颗按钮决定。
+          expireCountdown()
           return
         }
         paintCountdown()
@@ -880,11 +928,29 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     if (disposed || !panel) return
     try {
       // 与发码同一条守卫：这是写路由，桌面宿主会删 `origin`，所以判据是那个自定义头。
-      await fetchWithTimeout(UNPAIR_ROUTE, {
+      const response = (await fetchWithTimeout(UNPAIR_ROUTE, {
         method: 'POST',
         headers: { 'x-drc-pair': '1' },
         credentials: 'same-origin',
-      })
+      })) as { status?: number; json?(): Promise<unknown> } | undefined
+      /**
+       * **回答不许丢掉**（2026-10-07 审计）。原来这里是裸 `await`：
+       * 而 403 **不会**让 fetch 抛错，于是"守卫拒了"这件事一句都留不下——
+       * 可 `routes.ts` 的 403 回答里**专门**带 `guard`，注释写着
+       * "屏幕上那句话就是唯一的现场"。发码那条路经 `panelViewFor` 把它印了出来，
+       * 唯独这里把它扔了：守卫拒 → 面板照样乐观翻面、照样跳去二维码页，
+       * 用户看着一张自己没点过的码出现又消失，而控制台一声不响。
+       *
+       * 乐观翻面本身仍然保留（它治的是"按下没反应"的错觉），只是**不再冒充成功**：
+       * 真失败会留一行 warn，下一次轮询照样把真相带回来。
+       */
+      const httpStatus = typeof response?.status === 'number' ? response.status : 0
+      if (httpStatus !== 200) {
+        const body = (await response?.json?.()) as { error?: unknown; guard?: unknown } | undefined
+        const why = typeof body?.error === 'string' ? body.error : 'no response'
+        const guard = typeof body?.guard === 'string' ? ` guard=${body.guard}` : ''
+        degrade(`退出配对被主机拒了（HTTP ${httpStatus} ${why}${guard}；面板会靠下一次轮询对账）`)
+      }
     } catch (error) {
       degrade('退出配对请求失败（面板会靠下一次轮询对账）', error)
     }
@@ -1068,8 +1134,28 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     if (panel) closePanel()
     else openPanel()
   })
+
+  /**
+   * 切回前台那一拍把倒计时对齐一次。
+   *
+   * **为什么墙钟锚定还不够、非要挂这一个监听**：后台被节流/冻结时那一拍可能几分钟后才来，
+   * 用户却是**切回来立刻看屏**的。墙钟锚定保证"下一拍回来时数字是对的"，可那已经是几分钟后；
+   * 这一拍把欠账当场补上，用户看到的第一眼就是真相。
+   *
+   * 只在倒计时活着时才做事：二维码那一屏之外的场合（info / failed / loading）
+   * 屏上根本没有"还剩多少"，碰它只会凭空多一次重画。
+   */
+  const resyncCountdown = (): void => {
+    if (disposed || countTimer === undefined) return
+    if (!syncCountdown()) {
+      expireCountdown()
+      return
+    }
+    paintCountdown()
+  }
   doc.addEventListener('pointerdown', onPointerDown, true)
   doc.addEventListener('keydown', onKeyDown)
+  doc.addEventListener('visibilitychange', resyncCountdown)
   write()
   void pollStatus()
   statusTimer = setInterval(() => void pollStatus(), POLL_MS)
@@ -1081,6 +1167,7 @@ export function buildPill(root: Element, deps: PillDeps): () => void {
     closePanel()
     doc.removeEventListener('pointerdown', onPointerDown, true)
     doc.removeEventListener('keydown', onKeyDown)
+    doc.removeEventListener('visibilitychange', resyncCountdown)
     button.remove()
   }
 }

@@ -2522,3 +2522,57 @@ test('待办双端一致：新一轮开始时，手机上**上一轮**的待办�
     '这个会话压根没用过待办，却收到了一帧空清单：每轮白发一帧只是白花渲染',
   )
 })
+
+// ── cmd.new_session 的 workspace（2026-10-07 接线）─────────────────────
+//
+// 这一段曾经**刻意不写**，理由是"插件钉的那份 wire 还没有这个字段，而 parseCmdPayload
+// 会把不认识的键 strip 掉" —— 写出来的是一段永远读到 undefined 的代码。
+// 那个前提在 2.0.14 已经不成立（字段在 schema 里、钉也已经跟上），而**不接线的后果**
+// 不会被任何人发现：手机指定了分组，主机在自己推断的目录里建，回执照样 ok:true。
+// "用户选了 A，它落在 B" —— 没有错误、没有日志、手机上完全看不出发生了什么。
+
+test('cmd.new_session：手机指定的 workspace 必须原样交给内核端口', async () => {
+  const { runtime, transport, kernel, clock } = fixture()
+  const seen: Array<{ workspace?: string } | undefined> = []
+  kernel.newSession = (args?: { workspace?: string }) => {
+    seen.push(args)
+    return Promise.resolve({ ok: true, sessionId: 'ses_made' })
+  }
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+  await clock.advance(1_000)
+
+  await runtime.handleCommand(
+    cmd(PAYLOAD_TYPES.cmdNewSession, { workspace: '/Users/linbin/some-project' }),
+    'c_000000000001',
+  )
+  await settle()
+
+  assert.equal(seen.length, 1, '夹具自检：newSession 被调了一次')
+  assert.equal(
+    seen[0]?.workspace,
+    '/Users/linbin/some-project',
+    '手机指定的落点被丢掉了：会话会建在主机自己推断的目录里，而回执照样 ok:true（无错、无日志、手机上看不出来）',
+  )
+})
+
+test('cmd.new_session：老手机不带 workspace 时端口收到 undefined（向后兼容那一档）', async () => {
+  // 反证：接线不能变成"没有 workspace 也造一个空串塞进去"——那会让载体以为
+  // 手机指定了一个空目录，而 `cmd.workspace ? … : undefined` 正是为此留的。
+  const { runtime, transport, kernel, clock } = fixture()
+  const seen: Array<{ workspace?: string } | undefined> = []
+  kernel.newSession = (args?: { workspace?: string }) => {
+    seen.push(args)
+    return Promise.resolve({ ok: true, sessionId: 'ses_made' })
+  }
+  runtime.start()
+  await settle()
+  transport.pair('c_000000000001')
+  await clock.advance(1_000)
+
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdNewSession, {}), 'c_000000000001')
+  await settle()
+
+  assert.equal(seen[0], undefined, '没带就等于没带：载体会退回它那三级推断，行为与接线之前完全一致')
+})

@@ -380,3 +380,47 @@ test('carrierGraceMs 是死键：已从配置面上删掉（全 src 零读取）
   const config = readConfig({ carrierGraceMs: 50 } as unknown as Partial<PluginConfig>, {})
   assert.equal(config.serverUrl, DEFAULT_CONFIG.serverUrl, '带着一个死键也要能正常合成配置')
 })
+
+// ── 2026-10-07 审计：两个"写了不报错、不告警、不生效"的配置 ───────────────
+
+test('statusFile 是相对路径：必须告警，并说清它会落在宿主的 CWD 上', () => {
+  // 原来只有 `!config.statusFile` 一道真值检查。而 `StatusFile` 是
+  // `mkdirSync(path.dirname(file))` + `writeFileSync`，相对路径按**宿主进程的 CWD**
+  // 解析——GUI 宿主的 CWD 是 `/`，写不进去，失败被 write() 那个空 catch 吞掉。
+  // 症状：插件正常加载、status.json 从不出现、没有 problems、没有日志、没有任何探针。
+  const problems = validateConfig(base({ statusFile: 'status.json' }))
+  assert.ok(
+    problems.some((problem) => problem.field === 'statusFile' && problem.level === 'warn'),
+    `相对路径必须告警：它按宿主 CWD 解析，GUI 宿主上是 /（写不进去且静默）。实际 problems=${JSON.stringify(problems)}`,
+  )
+  assert.equal(
+    problems.some((problem) => problem.level === 'error'),
+    false,
+    '不该拦启动：这是 warn 级——但必须留下能查到的那一行',
+  )
+})
+
+test('maxFileBytes 调过整批预算：夹回并说清"调它不会生效"', () => {
+  // `runtime` 传下去的 `maxTotalBytes` 是硬的（与中继 1MB 帧上限同源），所以把
+  // `maxFileBytes` 设成 2MB 的结果是：一个 600KB 的文件被**整批闸**拒掉，
+  // 回给手机的话是"这一批附件合计 512KB…请少带几个"——而用户只带了**一个**文件。
+  const config = base({ maxFileBytes: 2 * 1024 * 1024 })
+  const problems = validateConfig(config)
+  assert.ok(
+    problems.some((problem) => problem.field === 'maxFileBytes' && problem.level === 'warn'),
+    `调大到整批预算之上必须告警：它不会生效，而用户看到的报错还会让他"少带几个"。实际 problems=${JSON.stringify(problems)}`,
+  )
+  assert.equal(config.maxFileBytes, 524288, '要夹回 512KB，而不是让一个不会生效的值留在那儿')
+})
+
+test('maxFileBytes 在预算之内：不该被夹，也不该告警', () => {
+  // 反证：上面那条不能靠"一律夹回默认"来满足——那会把一个合法的 256KB 配成 512KB 预算的口径。
+  const config = base({ maxFileBytes: 256 * 1024 })
+  const problems = validateConfig(config)
+  assert.equal(config.maxFileBytes, 256 * 1024, '合法值不许被改')
+  assert.equal(
+    problems.some((problem) => problem.field === 'maxFileBytes'),
+    false,
+    `预算之内的合法值不该告警：实际 problems=${JSON.stringify(problems)}`,
+  )
+})
