@@ -5,6 +5,34 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.16] - 2026-10-07
+
+依赖与版本对齐，**没有功能改动**。
+
+### 变更
+
+- 依赖 `dsh-remote-wire` 从 `2.0.14` 钉到 **`2.0.16`**（精确钉，不用 caret ——
+  caret 会解析到更高的 1.9.0，那就不是这一代协议了），lockfile 重新解析。
+- 版本号 2.0.15 → 2.0.16（2.0.15 已被占用，见 `scripts/next-version.mjs`）。
+
+### 这一版为什么值得单独记一笔
+
+wire 2.0.16 带的是**协议层的握手面改造**（`hello.capabilities`、`MIN_SUPPORTED_PROTOCOL`
+等九个新模块）。它当时的状态是「已发 npm、没人评审、零个消费方在用」，
+所以发这一版之前补了两件事：
+
+- **握手面加性的论证**（伞仓 `e2e/wire-handshake-compat.test.mjs`，7 条）：
+  最要紧的一条是「**老 schema（2.0.14）收新 hello**」—— 用 zod 默认 `.object()`
+  逐字段复刻旧版形状实测通过（未知键被 strip），并用一条反向判据把
+  「我们**依赖** zod 的 strip 语义」变成显式契约：将来谁把 schema 收紧成
+  `.strict()`，新字段就会拒掉老对端，而**发出去的包收不回来**（npm 版本号不可重用）。
+- **中继侧真的用上了那份判定**（本轮新增，`tests/handshake.test.mjs` 6 条）：
+  改造之前 `hello.protocol` **从未被任何一端校验过** —— 实测发一份
+  `hello{protocol: 999}` 会照常收到 `hello-ok`。于是协议不兼容的现场表现是
+  「连上了、界面正常、什么都不发生」，没有一层会报错。
+
+判据 490 条**逐条不变**（换钉前后一致），加的判据在中继与伞仓两仓。
+
 ## [2.0.15] - 2026-10-07
 
 串行深审一轮（四个分片并行逐行读完约 1.2 万行源码 + 判据）的产出。**八处修复全部先红后绿，
@@ -732,6 +760,7 @@ bundle，不直接 import 那个纯函数）**、**`waiting` 缺席（老版宿�
   之前 tarball 里的 `dist/src`、`dist/tests`（约 90 个文件、449 KB）全是消费方拿不到的东西。
 
 [未发布]: https://github.com/providcc/dsh-remote-control/compare/v2.0.15...HEAD
+[2.0.16]: https://github.com/providcc/dsh-remote-control/compare/v2.0.15...v2.0.16
 [2.0.15]: https://github.com/providcc/dsh-remote-control/compare/v2.0.14...v2.0.15
 [2.0.14]: https://github.com/providcc/dsh-remote-control/compare/v2.0.13...v2.0.14
 [2.0.10]: https://github.com/providcc/dsh-remote-control/compare/v2.0.9...v2.0.10
