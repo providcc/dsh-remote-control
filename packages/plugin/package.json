@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-control",
-  "version": "2.0.15",
+  "version": "2.0.16",
   "description": "DSH Remote Control host plugin: pairs a running DeepSeek Harness with the DRC relay so a WeChat Mini Program can send prompts, watch streamed output, and answer approvals. Payload-level E2E encryption; the relay never sees plaintext. Pairing is one click on the status-bar pill (three same-origin routes + a browser half).",
   "type": "module",
   "license": "MIT",
@@ -61,7 +61,7 @@
     "format:check": "prettier --check . --ignore-path ../../.prettierignore"
   },
   "dependencies": {
-    "dsh-remote-wire": "2.0.14",
+    "dsh-remote-wire": "2.0.16",
     "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0",
