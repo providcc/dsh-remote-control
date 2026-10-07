@@ -2940,3 +2940,70 @@ test('反向判据：这一代主机没有归档能力时**明确拒绝**，不�
   assert.match(String(res.message), /不支持归档/, '要说清是"主机这一代没有"，而不是"失败了"')
   assert.match(String(res.message), /archiveSession/, '要点名缺的那个能力，排错时不必去猜')
 })
+
+/**
+ * `settledReplies` 必须与台账**同生共死**（2026-10-07 修）。
+ *
+ * ## 缺陷形状
+ *
+ * 台账（协议层 `IdempotencyLedger`）按**窗口 + 容量**两路淘汰，而
+ * `settledReplies` 是 core 里另一张独立的 Map。原来的"让它同生共死"实现是
+ * `forgetWhenOutOfWindow(cmdId, now)`：登记完那一条之后**顺手问一次台账还在不在**。
+ *
+ * 而 `ledger.has(cmdId, now)` 里的 `prune(now)` **只对台账自己的 entries 生效**——
+ * 它删的是台账的键，`settledReplies` 里其余的键从此再没有任何代码碰过。
+ * 于是台账稳在 256 条，而回执表等于"进程活多久就长多大"。
+ *
+ * 症状不是"内存涨一点"：`cmd.list_sessions` 的回执带 `data.sessions`（最多 100 条
+ * 会话摘要），每一条都常驻；而 mp 每次重连/刷新列表都会发一次那条命令。
+ * 长跑进程（GUI 宿主本来就长驻）持续涨内存，且**没有任何一行日志**说这件事。
+ *
+ * ## 为什么不能用"再问一次"来补
+ *
+ * 把 `forgetWhenOutOfWindow` 改成遍历全表是 O(n) 每条命令，而 n 正是要解决的问题。
+ * 正确形状是**在台账淘汰之后，把台账已经没有的键从回执表里删掉**——
+ * 而这件事的时机只能是"台账刚发生过一次结构性淘汰"时。
+ */
+test('settledReplies 不许无界增长：它必须与台账一起收缩', async () => {
+  const { runtime, transport } = fixture({ listingRefreshMs: 3_600_000 })
+  transport.pair('c_000000000001')
+  // 连发 900 条（> IDEMPOTENCY_CAPACITY = 256），每条都带回执。
+  // 用 list_sessions 是因为它的回执带 data，最能体现"每条都常驻"的代价。
+  for (let i = 0; i < 900; i++) {
+    runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdListSessions, {}), 'c_000000000001')
+    if (i % 50 === 0) await settle()
+  }
+  await settle()
+  const size = (runtime as unknown as { settledReplies: Map<string, unknown> }).settledReplies.size
+  assert.ok(
+    size <= 256,
+    `settledReplies 长到 ${size} 条：台账容量是 256，这张表与它"同生共死"的承诺没有成立。` +
+      '每条 cmd.list_sessions 的回执还带最多 100 条会话摘要',
+  )
+})
+
+test('反向判据：容量淘汰掉的那条，重发时必须回"回执已不在"而不是静默', async () => {
+  // 上一条钉住"表会收缩"；这一条钉住"收缩之后那条路径仍然有话可说"。
+  // 两者是一对：只写前一条的话，把 delete 换成"什么都不做"也能全绿。
+  const { runtime, transport } = fixture({ listingRefreshMs: 3_600_000 })
+  transport.pair('c_000000000001')
+  const stale = cmd(PAYLOAD_TYPES.cmdListSessions, {})
+  runtime.handleCommand(stale, 'c_000000000001')
+  await settle()
+  // 把它挤出容量：再发 300 条不同的
+  for (let i = 0; i < 300; i++) {
+    runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdListSessions, {}), 'c_000000000001')
+    if (i % 50 === 0) await settle()
+  }
+  await settle()
+  const replies = transport.resultReplies()
+  const last = replies[replies.length - 1]
+  // 无论它是"重放了旧回执"还是"回执已不在"，都必须是**一条 ok 的明说**，
+  // 而不能是"手机继续转到超时"。
+  assert.ok(last, '夹具自检：至少要收到一条回执')
+  assert.equal(last.t, PAYLOAD_TYPES.evResult)
+  assert.ok(
+    last.ok === true,
+    `重发一条已被容量淘汰的命令时必须回一条 ok 的明说（"已执行过但回执不在"），实得 ${JSON.stringify(last)}`,
+  )
+})

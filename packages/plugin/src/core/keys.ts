@@ -81,6 +81,19 @@ export class ConversationBook {
   private readonly byId = new Map<string, Conversation>()
 
   /**
+   * 一条落盘记录被丢弃时叫这个（2026-10-07 补）。
+   *
+   * 为什么要有出口而不能只静默丢弃：`restore` 的注释承诺"一条形状不合的记录
+   * 整条丢弃"，而**静默丢弃**在用户眼里就是"我明明配对过，手机却要重扫"——
+   * 没有任何一句话告诉他为什么。宿主侧把它记进日志，并在 `status.json` 的
+   * `pairStore` 里留一个计数。
+   *
+   * 可选：单测直接 new 出来的 book 不接它，而那正是它可选项的原因
+   * （不接时行为完全一致：丢弃，只是不留痕）。
+   */
+  onRestoreRejected?: (conversationId: string, reason: string) => void
+
+  /**
    * 为一条新配对建立密钥。
    *
    * @param psk 必须来自 `PairingSlots.resolveFor(token)`——**不允许**"取最新的一个"。
@@ -117,12 +130,37 @@ export class ConversationBook {
   restore(records: readonly StoredConversation[], now: number): string[] {
     const restored: string[] = []
     for (const record of records) {
-      const conversation = this.open({ id: record.id, psk: record.psk, now })
-      conversation.seqHost = record.seqHost
-      conversation.createdAt = record.createdAt
-      conversation.lastActivityAt = record.lastActivityAt
-      conversation.restored = true
-      restored.push(record.id)
+      /**
+       * **一条形状不合的记录整条丢弃**（2026-10-07 补上兑现）。
+       *
+       * 上面那段注释早就承诺了这件事，而实现是直接 `open()` —— 于是
+       * `derivePskKey` 对一条**截断过的 psk** 抛
+       * 「配对密钥（PSK）解码后必须是 16 字节，收到 9 字节」。
+       *
+       * 为什么这一抛是灾难级的而不仅是"少一条通道"：`restore` 的调用点
+       * （`index.ts` 的 `restoreConversations`）**不在任何 try 内**，而它在
+       * `applyInner` 里 —— 一次抛出就让 `handle` 变成 undefined，
+       * 于是**没有 status.json、没有 pill、整条配对链路无**，
+       * 只留一行 stderr。GUI 宿主里 stdout 没人看，于是用户看到的是
+       * "插件好像没起来"，而根因是磁盘上一个被截断的 base64 串。
+       *
+       * 落盘那一层的 zod 挡不住这个：`psk: z.string().min(1)` 只要求非空，
+       * 16 字节的约束在 wire 层的 `derivePskKey` 里，而它只在**派生时**才发现。
+       * 所以这道校验必须在这里 —— 它是唯一同时握着"记录"与"派生"两边的地方。
+       *
+       * 代价：一条坏记录 = 那一台手机要重扫一次。而另一个选择是整个插件起不来。
+       */
+      try {
+        const conversation = this.open({ id: record.id, psk: record.psk, now })
+        conversation.seqHost = record.seqHost
+        conversation.createdAt = record.createdAt
+        conversation.lastActivityAt = record.lastActivityAt
+        conversation.restored = true
+        restored.push(record.id)
+      } catch (error) {
+        // 逐条记，不中断整批：坏的是**一条**，不是全部。
+        this.onRestoreRejected?.(record.id, String((error as Error)?.message ?? error))
+      }
     }
     return restored
   }

@@ -313,11 +313,22 @@ export class HostRuntime {
    * `data`）。**这正是协议层那张表刻意不存载荷的原因**：载荷级的记忆必须由使用方
    * 自己按同样的边界管。
    *
-   * 做法：登记时顺手看一眼台账还在不在（`has()` 只问不记），不在就删掉这条回执。
-   * 淘汰因此**跟着台账走**，而台账的窗口与容量都由协议层定义（单一来源）。
+   * ## 2026-10-07 修：原来这里**根本没在淘汰其余的条目**
+   *
+   * 原实现是 `if (!this.ledger.has(cmdId, now)) this.settledReplies.delete(cmdId)`
+   * —— 登记完**那一条**之后顺手问一次台账还在不在。而 `ledger.has()` 里的
+   * `prune()` 只对台账自己的 entries 生效：它删的是**台账**的键，
+   * `settledReplies` 里其余的键从此再没有任何代码碰过。
+   *
+   * 实测：900 条命令后台账 256 条、回执表 900 条。而每条 `cmd.list_sessions`
+   * 的回执带 `data.sessions`（最多 100 条会话摘要）——长跑进程（GUI 宿主本来就长驻）
+   * 持续涨内存，且**没有任何一行日志**说这件事。
+   *
+   * 现在改成向台账要"我淘汰了谁"（`takeEvicted`）：那是**唯一**知道淘汰了谁的
+   * 地方，而遍历全表对齐是 O(n) 每条命令 —— n 正是要解决的问题。
    */
-  private forgetWhenOutOfWindow(cmdId: string, now: number): void {
-    if (!this.ledger.has(cmdId, now)) this.settledReplies.delete(cmdId)
+  private forgetEvicted(): void {
+    for (const cmdId of this.ledger.takeEvicted()) this.settledReplies.delete(cmdId)
   }
 
   /** 手机发来的命令。`conversationId` 是配对通道 id，与载荷里的 sessionId 不是一回事（F3）。 */
@@ -351,7 +362,9 @@ export class HostRuntime {
     const reply = (ok: boolean, extras: { message?: string; data?: Record<string, unknown> } = {}): void => {
       const frame = resultOf(cmd.cmdId, ok, extras)
       this.settledReplies.set(cmd.cmdId, frame)
-      this.forgetWhenOutOfWindow(cmd.cmdId, now)
+      // 顺序要紧：先登记这条，再问台账淘汰了谁 —— 反过来的话，
+      // 这一次 admit 造成的容量淘汰（把**别人**挤出去）会漏掉。
+      this.forgetEvicted()
       this.replyTo(conversationId, frame)
     }
     try {

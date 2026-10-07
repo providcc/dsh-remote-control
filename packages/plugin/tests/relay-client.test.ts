@@ -92,6 +92,8 @@ interface Harness {
   /** 会话簿**结构性**变化（新配对 / 作废）的次数：落盘由它驱动。 */
   readonly structural: number[]
   readonly logs: string[]
+  /** `pair-fail` 回调收到的 (reason, pairingToken) —— 见下面那组判据。 */
+  readonly pairFails: Array<{ reason: string; pairingToken: string | undefined }>
 }
 
 function harness(): Harness {
@@ -106,6 +108,7 @@ function harness(): Harness {
   const states: Harness['states'] = []
   const structural: number[] = []
   const logs: string[] = []
+  const pairFails: Harness['pairFails'] = []
   const client = new RelayClient({
     url: 'ws://127.0.0.1:1',
     hostId: 'h_test',
@@ -131,6 +134,7 @@ function harness(): Harness {
     },
     onState: (info) => states.push(info),
     onStructuralChange: () => structural.push(structural.length),
+    onPairFail: (reason, pairingToken) => pairFails.push({ reason, pairingToken }),
   })
   attachSocket(client, socket)
   const out = (): Array<Record<string, unknown>> =>
@@ -152,6 +156,7 @@ function harness(): Harness {
     states,
     structural,
     logs,
+    pairFails,
   }
 }
 
@@ -1133,4 +1138,41 @@ test('出站帧超上限时当成没发出去：超限的密文会被中继整�
   } as EvPayload
   assert.equal(h.client.send('c_aabbccddeeff', small), true, '闸只拦超限的帧：正常的流式输出必须照发')
   assert.equal(h.socket.sent.filter((line) => line.includes('"t":"enc"')).length, 1)
+})
+
+/**
+ * `pair-fail` 必须把**是哪一张码**失败的交给接线方（2026-10-07 补）。
+ *
+ * ## 缺陷形状
+ *
+ * 这一帧原先只有 `reason`，而 `index.ts` 的处理是"作废**当前展示的那张**"——
+ * 于是它只能拿 `active.pairing` 顶罪。多码并存时那会**作废错的那张**：
+ * 屏幕上是码 B（完全有效），用户扫了一张早就过期的码 A → 中继回
+ * `invalid_or_expired` → B 被记进 `spentTokens` 并 forget。
+ *
+ * 症状不是"多扫一次码"：B 的 PSK 被丢弃意味着那条配对通道作废，
+ * 而这正是本文件头引用的那起「取错 PSK 全线解不开」的前置条件。
+ *
+ * 这一层只验**透传**：接线方拿它做什么是 index.ts 的责任，两条判据分开写。
+ */
+test('pair-fail 的 pairingToken 原样交给接线方', () => {
+  const h = harness()
+  h.feed({ t: 'pair-fail', reason: 'invalid_or_expired', pairingToken: '999999' })
+  assert.equal(h.pairFails.length, 1, '必须回调（不回调 = 屏幕上那张死码一直挂着）')
+  assert.equal(h.pairFails[0]?.reason, 'invalid_or_expired')
+  assert.equal(
+    h.pairFails[0]?.pairingToken,
+    '999999',
+    '必须点名是哪一张：接线方靠它避免把"当前展示的那张"误当成废码',
+  )
+})
+
+test('反向判据：中继没带 token 时给 undefined（而不是空串或猜一个）', () => {
+  // 更老的中继仍在跑（升级要重启容器，插件升级只要重开 Harness）。
+  // 那一侧必须让接线方**知道**"没有这个信息"，好退回旧行为；
+  // 给空串会让 `forget('')` 变成一次无意义的查表，而接线方也分不出两种情况。
+  const h = harness()
+  h.feed({ t: 'pair-fail', reason: 'already_used' })
+  assert.equal(h.pairFails.length, 1)
+  assert.equal(h.pairFails[0]?.pairingToken, undefined, '缺省必须是 undefined，语义是"中继没告诉我们"')
 })

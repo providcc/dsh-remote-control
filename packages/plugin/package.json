@@ -61,7 +61,7 @@
     "format:check": "prettier --check . --ignore-path ../../.prettierignore"
   },
   "dependencies": {
-    "dsh-remote-wire": "2.0.18",
+    "dsh-remote-wire": "2.0.20",
     "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0",

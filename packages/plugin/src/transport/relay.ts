@@ -144,7 +144,24 @@ export interface RelayClientOptions {
    * 只能等 TTL 走完（`pairOnStartSec` 默认 0，没有任何东西会自动补发）。
    * 接线方要做的是"清展示位 + 作废这张 + 按需补一张"；被限速时不建议立刻再申请。
    */
-  onPairFail?: (reason: string) => void
+  /**
+   * @param pairingToken **是哪一张码失败的**；中继没给（更老的一版）时为 undefined，
+   *        此时接线方**必须**退回"当前展示的那张"—— 见下面那条误伤的说明。
+   *
+   * ## 为什么这个参数是必需的（2026-10-07 补）
+   *
+   * 这个帧原先只有 `reason`，而接线方的处理是"作废**当前展示的那张**"——
+   * 于是它只能拿 `active.pairing` 顶罪。多码并存时那会**作废错的那张**：
+   * 屏幕上是码 B（完全有效），用户扫了一张早就过期的码 A → 中继回
+   * `invalid_or_expired` → 主机把 B 记进 `spentTokens` 并 forget，再补一张 C。
+   *
+   * 症状不是"多扫一次码"：B 的 PSK 被丢弃意味着那条配对通道作废，
+   * 而这正是本文件头引用的那起「取错 PSK 全线解不开」事故的前置条件。
+   *
+   * 缺省是 undefined 而不是必填：发它的是中继，而"新主机 + 老中继"是真实组合
+   * （中继升级要重启容器、插件升级只要重开 Harness，两者节奏不同）。
+   */
+  onPairFail?: (reason: string, pairingToken: string | undefined) => void
   /**
    * 中继的错误帧（2026-10-07 接上）。
    *
@@ -267,12 +284,36 @@ export class RelayClient {
    * —— 否则主机重启后手机能连上、主机却不订阅任何事件，表现与配对丢失一模一样。
    */
   restoreConversations(records: Parameters<ConversationBook['restore']>[0]): string[] {
+    /**
+     * 被丢弃的记录要走日志，而这条出口是**每次调用都重挂**的：
+     * 它挂在一个长寿命对象（`conversations`）上，而 `restoreConversations`
+     * 在一次进程里只被调一次——但"只调一次"不是这行代码的保证，
+     * 而"上一个调用方留下的钩子还挂着"是一个比"没有钩子"更难查的状态。
+     */
+    this.conversations.onRestoreRejected = (conversationId, reason) => {
+      this.options.log('stored conversation rejected', { conversationId, reason })
+    }
     const restored = this.conversations.restore(records, this.options.clock.now())
+    this.conversations.onRestoreRejected = undefined
     if (restored.length > 0) {
       this.options.log('conversations restored from disk', {
         count: restored.length,
         // 记一下有没有手机已经登记进来了：恢复阶段应当恒为 0。
         clients: this.conversations.clientCount(),
+      })
+    }
+    if (restored.length < records.length) {
+      /**
+       * **丢了要说得比"恢复了几条"更响**（2026-10-07）。
+       *
+       * `count: 2` 那一行只说"恢复了几条"，而用户看到的是"我明明配对过、
+       * 手机却要重扫"——那一句没有任何提示。两条数放在一起才构成一个完整事实：
+       * 盘上有 3 条、恢复了 2 条，于是"那第 3 条为什么没回来"有了解释。
+       */
+      this.options.log('some stored conversations were dropped', {
+        onDisk: records.length,
+        restored: restored.length,
+        dropped: records.length - restored.length,
       })
     }
     return restored
@@ -607,7 +648,7 @@ export class RelayClient {
         // 主机一侧完全无痕，status.json 也看不出配对为什么没成。
         // 清槽是安全的：这张码的 PSK 已经不可能再被用上了。
         this.options.log('pair failed', { reason: frame.reason })
-        this.options.onPairFail?.(frame.reason)
+        this.options.onPairFail?.(frame.reason, frame.pairingToken)
         return
       case 'error':
         // 中继只会把错误码发给"该对它负责"的那一端；本端把它记进状态，

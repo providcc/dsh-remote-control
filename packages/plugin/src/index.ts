@@ -22,6 +22,8 @@ import { KeepAwake } from './core/sleep-policy.js'
 import { PairingSlots } from './core/keys.js'
 import { PairingWindow, tokenHandle } from './core/pairing-window.js'
 import { buildLogRecord } from './shell/log-line.js'
+import { isoOrUndefined } from './shell/iso.js'
+import { decidePairFail } from './shell/pairing-fail.js'
 import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
@@ -345,7 +347,25 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
         lastRelayGeneration = info.generation
         // 新连接 = 新配额：限流退避不该跨连接生效（旧窗口早就过去了，
         // 而留着它会让"重连之后配对码一直不自动补"看起来像另一个 bug）。
-        if (info.relay === 'online') pairRateLimitedUntil = 0
+        if (info.relay !== 'online') return
+        pairRateLimitedUntil = 0
+        /**
+         * **刚上线就 tick 一次**（2026-10-07 补）。
+         *
+         * 启动那处的 `pairingWindow.tick()` 注释写着「先 tick 一次，让
+         * `pairOnStartSec>0` 的实例一起来就能看到 status.json 里有码」——
+         * 而它是**恒为空操作**的：它紧跟在 `relay.connect()` 后面，那一刻
+         * `emitState('connecting')` 刚把状态置成 connecting，于是 `tick()` 的
+         * 第二行 `if (!this.deps.relayOnline()) return false` 必然早退。
+         * 真正兜住的是 3 秒后的 housekeeping，所以症状是"配置了自动发码却要等
+         * 3 秒才看到码"，而不是"没有码"。
+         *
+         * 为什么修在这里而不是删掉那句注释：`online` 只在 `hello-ok` 到达时出现，
+         * 而那正是"发码闸门第一次打开"的时刻——那一刻不 tick，就要再等一个
+         * 完整周期。（顺带：中继重启后主机重连也是同一个 `online`，
+         * 那种情况下 pending-pair 表已空，同一次 tick 正好补上。）
+         */
+        pairingWindow.tick()
       },
       /**
        * 中继宣告"这张配对码没配上"。
@@ -364,13 +384,35 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
        *（被拒 → 补一张 → 再被拒 → 再补），而配对限流的全局配额是 20/s。
        * 于是"刚被限速"最可能的表现是主机自己把配额烧光，手机随后连普通帧都发不出去。
        */
-      onPairFail: (reason) => {
-        const shown = active.pairing
-        if (shown) {
-          spendPairingToken(shown.token)
-          active.pairing = null
-          pairingWindow.forget(shown.token)
+      onPairFail: (reason, failedToken) => {
+        /**
+         * **只作废真正失败的那张**（2026-10-07）。
+         *
+         * 原来这里是"作废当前展示的那张"——而 `pair-fail` 帧原先不带 token，
+         * 所以它只能拿 `active.pairing` 顶罪。多码并存时那会**作废错的那张**：
+         * 屏幕上是码 B（完全有效），用户扫了一张早就过期的码 A → 中继回
+         * `invalid_or_expired` → B 被记进 `spentTokens` 并 forget。
+         *
+         * 症状不是"多扫一次码"：B 的 PSK 被丢弃意味着那条配对通道作废，
+         * 而这正是 `relay.ts` 文件头引用的那起「取错 PSK 全线解不开」的前置条件。
+         *
+         * 三种情形：
+         * ① 中继给了 token 且它就是展示中的那张 → 作废它（与从前同一条路）；
+         * ② 中继给了 token 但**不是**展示中的那张 → 那张是别人扫的旧码，
+         *    **只把它记成已花**（免得窗口再补一张一样的），展示位**不动**；
+         * ③ 中继没给（更老的一版）→ 退回"作废展示中的那张"，与从前一致。
+         */
+        //
+        // 判定本身在 `shell/pairing-fail.ts`（纯函数、三种情形各有判据）：
+        // 原来它内联在这儿，而这一层**测不到**——`RelayClient` 没有 socket
+        // 注入点，所以"喂一帧 pair-fail 进 apply()"在当前装置下做不到，
+        // 结果是这段"会不会误伤一张有效码"的逻辑一行判据都没有。
+        const decision = decidePairFail(active.pairing?.token, failedToken)
+        if (decision.victim) {
+          spendPairingToken(decision.victim)
+          pairingWindow.forget(decision.victim)
         }
+        if (decision.clearShown) active.pairing = null
         log('relay rejected the pairing code', { reason })
         const waitMs = pairRateLimitedUntil - clock.now()
         if (waitMs > 0) {
@@ -446,8 +488,14 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
     relay.connect()
     // 自动发码走 pairingWindow，而不是启动时发一张就完事：
     // 一张码是一次性的，用完/中继重启/过半程都得换一张（判据见 core/pairing-window.ts）。
-    // tick 挂在 status 的 3 秒节拍上（旧实现就是挂在这里），并且**先 tick 一次**，
-    // 让 `pairOnStartSec>0` 的实例一起来就能看到 status.json 里有码。
+    // tick 挂在 status 的 3 秒节拍上（旧实现就是挂在这里）。
+    //
+    // ⚠️ 这里的 `tick()` 在启动这一轮里**必然空转**，而它原来那句注释说
+    // 「先 tick 一次，让 pairOnStartSec>0 的实例一起来就能看到 status.json 里有码」——
+    // 那是**一句假话**：上一行 `relay.connect()` 刚 `emitState('connecting')`，
+    // 于是 `tick()` 第二行 `if (!this.deps.relayOnline()) return false` 早退。
+    // 真正让"一起来就有码"成立的是 `onState` 里 `online` 分支上的那一次 tick
+    // （闸门第一次打开的时刻）。这一行保留是为了让首轮状态一致，**不承担**发码。
     pairingWindow.tick()
 
     /**
@@ -572,7 +620,7 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
         file: pairStoreFile || undefined,
         restored: restoredAtBoot.length,
         lastSavedAt:
-          pairStoreFile && pairStore.lastSavedAt > 0 ? new Date(pairStore.lastSavedAt).toISOString() : undefined,
+          pairStoreFile && pairStore.lastSavedAt > 0 ? isoOrUndefined(pairStore.lastSavedAt) : undefined,
       },
       pairing: describeActivePairing(),
       keepAwake: snapshot,
@@ -641,7 +689,9 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
     return {
       token: slot.token,
       psk: slot.psk,
-      expiresAt: new Date(slot.expiresAt).toISOString(),
+      // 越界时给 undefined 而不是抛：`slot.expiresAt` 来自中继给的 ttlMs，
+      // 而这一行在**构造 status 快照**的路径上（见 shell/iso.ts 的文件头）。
+      expiresAt: isoOrUndefined(slot.expiresAt),
       qr: shown.qr,
       ageSec: Math.max(0, Math.round((clock.now() - slot.createdAt) / 1000)),
     }

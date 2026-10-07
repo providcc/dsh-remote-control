@@ -437,3 +437,70 @@ test('没给 restoredIdleTtlMs 时退回 idleTtlMs：调用方不该因为少一
     '夹具自检的前提：默认策略下 2 天的恢复会话会被剪掉（idleTtlMs 兜底生效）。若这条红了说明兜底语义变了，需要重新评估',
   )
 })
+
+/**
+ * 一条形状不合的落盘记录必须**整条丢弃**，而不是把整个插件带崩（2026-10-07 修）。
+ *
+ * ## 缺陷形状
+ *
+ * `restore` 的注释早就承诺「一条形状不合的记录整条丢弃（宁可少一条通道，
+ * 也不要一条解不开的）」，而实现是直接 `open()` —— 于是 `derivePskKey`
+ * 对一条截断过的 psk 抛「配对密钥（PSK）解码后必须是 16 字节，收到 9 字节」。
+ *
+ * 为什么这一抛是灾难级的：`restoreConversations` 的调用点在 `index.ts` 的
+ * `applyInner` 里、**不在任何 try 内** ⇒ 一次抛出就让 `handle` 变成 undefined ⇒
+ * **没有 status.json、没有 pill、整条配对链路无**，只留一行 stderr。
+ * 而 GUI 宿主里 stdout 没人看，用户看到的是"插件好像没起来"，
+ * 根因却是磁盘上一个被截断的 base64 串。
+ *
+ * 落盘那层的 zod 挡不住：`psk: z.string().min(1)` 只要求非空，
+ * 16 字节的约束在 wire 的 `derivePskKey` 里，只在**派生时**才发现。
+ */
+test('一条坏记录只丢它自己：整批里其余的照常恢复，插件不崩', () => {
+  const good = 'AAAAAAAAAAAAAAAAAAAAAA==' // 16 字节
+  const truncated = 'AAAA' // base64 合法但解出来只有 3 字节
+  const rejected: Array<{ id: string; reason: string }> = []
+  const book = new ConversationBook()
+  book.onRestoreRejected = (id, reason) => rejected.push({ id, reason })
+
+  const restored = book.restore(
+    [
+      { id: 'c_ok1', psk: good, seqHost: 0, createdAt: 1, lastActivityAt: 1 },
+      { id: 'c_bad', psk: truncated, seqHost: 0, createdAt: 1, lastActivityAt: 1 },
+      { id: 'c_ok2', psk: good, seqHost: 0, createdAt: 1, lastActivityAt: 1 },
+    ],
+    100,
+  )
+
+  assert.deepEqual(restored, ['c_ok1', 'c_ok2'], '坏的那条不许连累其余的（它是"一条"，不是"全部"）')
+  assert.equal(book.has('c_ok1'), true)
+  assert.equal(book.has('c_ok2'), true)
+  assert.equal(book.has('c_bad'), false, '坏记录必须整条丢弃：留着它 = 一条解不开的通道')
+  // 且必须**说出来**：静默丢弃在用户眼里就是"我明明配对过，手机却要重扫"
+  assert.equal(rejected.length, 1, '丢弃必须留痕')
+  assert.equal(rejected[0]?.id, 'c_bad')
+  assert.match(rejected[0]?.reason ?? '', /16 字节|PSK/, '原因要带得出来，否则日志里只有一个 convId')
+})
+
+test('反向判据：全部记录都坏时，一条都不许留下，且不许抛', () => {
+  const book = new ConversationBook()
+  book.onRestoreRejected = () => {}
+  const restored = book.restore(
+    [
+      { id: 'c_a', psk: 'AAAA', seqHost: 0, createdAt: 1, lastActivityAt: 1 },
+      { id: 'c_b', psk: '', seqHost: 0, createdAt: 1, lastActivityAt: 1 },
+    ],
+    100,
+  )
+  assert.deepEqual(restored, [], '一条都恢复不出来是合法结局（用户全部重扫），不是崩溃')
+  assert.equal(book.size, 0)
+})
+
+test('反向判据：不挂 onRestoreRejected 也照常工作（它是可选出口，不是隐式依赖）', () => {
+  // 单测直接 new 出来的 book 不接它，而那正是它可选项的原因。
+  // 不接时行为完全一致：丢弃，只是不留痕。
+  const book = new ConversationBook()
+  const restored = book.restore([{ id: 'c_bad', psk: 'AAAA', seqHost: 0, createdAt: 1, lastActivityAt: 1 }], 100)
+  assert.deepEqual(restored, [])
+  assert.equal(book.size, 0)
+})
