@@ -41,6 +41,14 @@ interface Calls {
   prompt: Array<Record<string, unknown>>
   /** 带图提示交 `attachments.admitPromptContent` 的入参。 */
   admit: unknown[][]
+  /**
+   * `archiveSession` / `unarchiveSession` 的**完整实参列表**（不是只记 id）。
+   *
+   * 为什么记数组而不记 id：这一族判据的核心是"**不许传第二个参数**"
+   * —— 只记 id 就看不见多出来的那个 `{stopActivity:true}`，而那正是会
+   * 停掉主机上正在跑工作的那个参数。记 `args` 才测得出"只有一个参数"。
+   */
+  archive: Array<{ method: 'archiveSession' | 'unarchiveSession'; args: unknown[] }>
 }
 
 interface Fixture {
@@ -77,7 +85,16 @@ function fixture(
     pendingKindForSession?: (sessionId: string) => 'approval' | 'question' | undefined
   } = {},
 ): Fixture {
-  const calls: Calls = { resume: [], unarchive: [], followup: [], steer: [], cancel: [], prompt: [], admit: [] }
+  const calls: Calls = {
+    resume: [],
+    unarchive: [],
+    followup: [],
+    steer: [],
+    cancel: [],
+    prompt: [],
+    admit: [],
+    archive: [],
+  }
   const clock = new FakeClock()
   const liveAgent: Record<string, unknown> = {
     followup: (message: unknown) => calls.followup.push(message),
@@ -101,6 +118,13 @@ function fixture(
         archivedSessionIds: ['ses_arch'],
         unarchiveSession: (id: string) => {
           calls.unarchive.push(id)
+          return Promise.resolve()
+        },
+        // ⚠️ 这个桩**照抄内核的签名形状**（第二个参数是 options），而不是照抄
+        // 我们"应该"怎么调。它存在的意义就是：哪天有人为了"让用户少跑一趟"
+        // 而补上 `{ stopActivity: true }`，`args.length` 会立刻从 1 变成 2。
+        archiveSession: (...args: unknown[]) => {
+          calls.archive.push({ method: 'archiveSession', args })
           return Promise.resolve()
         },
       },
@@ -2244,4 +2268,104 @@ test('待办双端一致：会话没在跑时，历史里那份旧快照**不许
     true,
     '会话正在跑却没有把待办快照补给手机：收窄过头了，2026-10-06 那条症状会回来',
   )
+})
+
+// ── 归档 / 取消归档（cmd.archive_session 的落点，2026-10-07）────────────
+//
+// 这一段钉住三条**只有载体这一层能钉**的纪律：
+// 1. **绝不传 `stopActivity`**（规范 A1/A4）——它会停掉主机上正在跑的工作；
+// 2. **运行中的会话明确拒绝**，且拒绝前一次内核调用都不发；
+// 3. **方向不能反**：归档走 archiveSession、取消归档走 unarchiveSession。
+
+test('归档：调 workspaceRegistry.archiveSession，且**只传一个参数**（规范 A1/A4）', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle())
+  const res = await kernel.archiveSession?.('ses_a', true)
+  assert.equal(res?.ok, true, `实得 ${JSON.stringify(res)}`)
+  assert.equal(f.calls.archive.length, 1, '必须调内核的 archiveSession')
+  const call = f.calls.archive[0]!
+  assert.equal(call.method, 'archiveSession')
+  assert.equal(call.args[0], 'ses_a')
+  // ⚠️ 这是本文件里最重要的一条断言。内核的签名是
+  // `archiveSession(sessionId, { stopActivity })`，而 `stopActivity: true`
+  // 会**停掉主机上正在跑的工作**——用户在手机上误点一下的不可逆代价。
+  // 只记 id 的桩看不见多出来的第二个参数，所以上面记的是**完整实参列表**。
+  assert.equal(
+    call.args.length,
+    1,
+    `实得 ${call.args.length} 个参数：第二个就是 stopActivity，它会停掉主机上正在跑的工作（规范 A1）`,
+  )
+})
+
+test('取消归档：走 unarchiveSession 而不是 archiveSession（方向不能反）', async () => {
+  const f = fixture()
+  const kernel = f.kernel(f.bundle())
+  const res = await kernel.archiveSession?.('ses_arch', false)
+  assert.equal(res?.ok, true)
+  assert.equal(f.calls.unarchive.length, 1, '取消归档必须走 unarchiveSession')
+  assert.equal(f.calls.archive.length, 0, '反向判据：把取消归档也调 archiveSession = 用户永远拿不回那条会话')
+})
+
+test('运行中的会话：明确拒绝，且**一次内核调用都不发**', async () => {
+  const f = fixture()
+  const bundle = f.bundle({ live: true })
+  // `agentStatus` 读的是 agent 上的 `status` 字段，而共用夹具里的 `liveAgent`
+  // **没有**这个字段（它只被 `ensureRunnable` 那几条用例用到，那里不关心状态）。
+  // 所以这里就地补上，而不是去改共用夹具 —— 改它会让依赖"无 status ⇒ idle"的
+  // 那些用例跟着变，而那正是「判据依赖的全局状态必须归一」的另一面。
+  bundle.agents = {
+    ...bundle.agents,
+    get: () => ({ status: 'running', followup: () => {}, steer: () => {}, cancel: () => {} }),
+  } as unknown as ServicesBundle['agents']
+  const kernel = f.kernel(bundle)
+  const res = await kernel.archiveSession?.('ses_live', true)
+  assert.equal(res?.ok, false, '运行中的会话绝不能被归档：内核会抛，而兜底传 stopActivity 就是停掉它')
+  assert.match(res?.message ?? '', /正在运行/, '拒绝原因必须是人话：WorkspaceActiveSessionError 这个类名对用户毫无意义')
+  assert.equal(f.calls.archive.length, 0, '拒绝之前就把归档发出去 = "说了不做"，而内核那边可能已经停了它')
+  // 反向判据：非归档方向（取消归档）不受这条限制
+  f.calls.archive.length = 0
+  const back = await kernel.archiveSession?.('ses_live', false)
+  assert.equal(back?.ok, true, '取消归档不受"运行中"限制：它不是破坏性动作')
+})
+
+test('这一代内核没有归档能力：明确拒绝并点名缺的那个方法（规范 A2）', async () => {
+  const f = fixture()
+  const bundle = f.bundle()
+  // 真实的"更老的内核"形状：workspaceRegistry 在，但只有 unarchiveSession
+  delete (bundle.workspaceRegistry as { archiveSession?: unknown }).archiveSession
+  const kernel = f.kernel(bundle)
+  const res = await kernel.archiveSession?.('ses_a', true)
+  assert.equal(res?.ok, false, '静默成功会让用户以为归档了，而列表里那条还在')
+  assert.match(res?.message ?? '', /archiveSession/, '要点名缺的那个成员：排错时不必去猜')
+})
+
+test('内核抛 WorkspaceActiveSessionError 时翻成一句人话（不是把类名甩给用户）', async () => {
+  const f = fixture()
+  const bundle = f.bundle()
+  bundle.workspaceRegistry = {
+    ...bundle.workspaceRegistry,
+    archiveSession: () => Promise.reject(new Error('WorkspaceActiveSessionError: ses_a is active')),
+  } as ServicesBundle['workspaceRegistry']
+  const kernel = f.kernel(bundle)
+  const res = await kernel.archiveSession?.('ses_a', true)
+  assert.equal(res?.ok, false)
+  assert.match(res?.message ?? '', /正在运行/, '必须翻成人话')
+  assert.ok(
+    !/WorkspaceActiveSessionError/.test(res?.message ?? ''),
+    '类名会原样弹到用户手机上（core 把 message 直接 toast 出去）',
+  )
+})
+
+test('内核抛别的错时也如实上报，不吞掉（不假装成功）', async () => {
+  const f = fixture()
+  const bundle = f.bundle()
+  bundle.workspaceRegistry = {
+    ...bundle.workspaceRegistry,
+    archiveSession: () => Promise.reject(new Error('EACCES: permission denied')),
+  } as ServicesBundle['workspaceRegistry']
+  const kernel = f.kernel(bundle)
+  const res = await kernel.archiveSession?.('ses_a', true)
+  assert.equal(res?.ok, false)
+  assert.match(res?.message ?? '', /归档会话失败/, '失败要说明是"归档"这一步失败的')
+  assert.match(res?.message ?? '', /EACCES/, '底层原因要带出来：日志与用户那头都能查')
 })

@@ -284,6 +284,26 @@ export interface KernelPort {
 
   /** 冷会话续跑（归档/未加载的会话发指令前需要）。 */
   ensureRunnable?(sessionId: string): Promise<{ ok: boolean; message?: string }>
+  /**
+   * 归档 / 取消归档一条会话（`cmd.archive_session` 的落点，2026-10-07 加）。
+   *
+   * ## 为什么是可选方法
+   *
+   * 这一代宿主**有**这个能力（`workspaceRegistry.archiveSession` /
+   * `unarchiveSession`，真机上 55 条已归档会话就是它做的），但**下一代有没有**
+   * 不由我们决定。缺这个方法时 `core` 回一条明说原因的 `ev.result{ok:false}`，
+   * 而不是静默成功——静默成功会让用户以为归档了，而列表里那条还在。
+   *
+   * ## ⚠️ 实现方 MUST NOT 传 `stopActivity`
+   *
+   * 内核的 `archiveSession(sessionId, options)` 在会话还在跑时**抛**
+   * `WorkspaceActiveSessionError`，除非传 `stopActivity: true`——而那会**停掉主机上
+   * 正在跑的工作**。插件的纪律是"不改变宿主自己的行为"（用户在手机上误点一下，
+   * 主机上正在跑的任务就断了，那是不可逆的损失）。
+   *
+   * 所以正确行为是**明确报错**："会话正在运行，不能归档"。让用户回工作台停。
+   */
+  archiveSession?(sessionId: string, archived: boolean): Promise<{ ok: boolean; message?: string }>
   /** 当前模型选择，仅用于展示与"没模型就拒绝"的前置判断。 */
   modelSelection?(): { provider: string; model: string } | undefined
   /**

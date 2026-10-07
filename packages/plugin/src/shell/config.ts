@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { defaultPairStoreFile } from './pair-store.js'
+import { MAX_ATTACHMENT_BYTES } from 'dsh-remote-wire/limits'
 import { MAX_ATTACH_TOTAL_BYTES } from './uploads.js'
 
 export interface PluginConfig {
@@ -138,7 +139,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   pairStoreFile: '',
   // 图片附件落盘：默认 status.json 同目录的 uploads/（见 `resolveUploadDir`）。
   uploadDir: '',
-  maxFileBytes: 512 * 1024,
+  maxFileBytes: MAX_ATTACHMENT_BYTES,
   newSessionCwd: '',
   // 配对的唯一入口。关掉它 = 这台主机**没有**配对入口（`/drc pair` 与文本二维码都在
   // 2026-10-03 删掉了），所以 index.ts 会把它记成一条 warn 而不是安静地什么都不做。
@@ -355,9 +356,9 @@ export function validateConfig(config: PluginConfig): ConfigProblem[] {
     problems.push({
       level: 'warn',
       field: 'maxFileBytes',
-      message: '必须是正的有限字节数，已夹回 524288（512KB）',
+      message: `必须是正的有限字节数，已夹回 ${MAX_ATTACHMENT_BYTES}（512KB）`,
     })
-    config.maxFileBytes = 512 * 1024
+    config.maxFileBytes = MAX_ATTACHMENT_BYTES
   } else if (config.maxFileBytes > MAX_ATTACH_TOTAL_BYTES) {
     /**
      * **调大它不会生效**，而原来一句提示都没有（2026-10-07 审计）。

@@ -224,6 +224,26 @@ export class MockKernel implements KernelPort {
     return { ok: true }
   }
 
+  /**
+   * 归档 / 取消归档（与 `carrier-services` 的同名方法同语义）。
+   *
+   * mock 也要**如实复现内核那条"运行中拒收"**，否则这一条路径只会在真机上第一次
+   * 被走到——而那正是最不该第一次就走到的地方（用户在手机上点归档，
+   * 主机上正在跑的任务被停掉）。
+   *
+   * 与真载体一样：**没有 `stopActivity` 参数**。见 `ports/index.ts` 的注释。
+   */
+  async archiveSession(sessionId: string, archived: boolean): Promise<{ ok: boolean; message?: string }> {
+    const found = this.sessions.find((session) => session.id === sessionId)
+    if (!found) return { ok: false, message: `会话不存在：${sessionId}` }
+    if (archived && this.running.has(sessionId)) {
+      return { ok: false, message: '会话正在运行，不能归档。请先在电脑上让它跑完' }
+    }
+    found.state = archived ? 'archived' : 'idle'
+    this.emit({ kind: 'sessions-changed', reason: archived ? 'archived' : 'unarchived' })
+    return { ok: true }
+  }
+
   modelSelection(): { provider: string; model: string } | undefined {
     return { provider: 'mock', model: 'mock-model' }
   }

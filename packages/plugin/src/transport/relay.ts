@@ -36,17 +36,59 @@
 import { WebSocket } from 'ws'
 import { randomBytes } from 'node:crypto'
 import {
+  type CapabilityId,
   type CmdPayload,
+  type EndpointFrame,
   type EvPayload,
   base64Text,
   encToClient,
+  helloForHost,
+  isRetryableError,
   open,
+  pairBegin,
   parseCmdPayload,
   parseRelayFrameText,
+  ping as pingFrame,
+  resync as resyncFrame,
   seal,
+  sessionLeave,
 } from 'dsh-remote-wire'
 import { ConversationBook, DEFAULT_PRUNE_POLICY, type PairSlot, type PrunePolicy } from '../core/keys.js'
 import type { Clock } from '../ports/index.js'
+
+/**
+ * 本插件在 `hello` 里声明的能力（规范 §5.3 C1/C3）。
+ *
+ * **只列真正接上了的**，逐条对应一处实现：
+ * - `attachments`：`shell/uploads.ts` + `core/runtime.ts` 的整批先验后写；
+ * - `history`：`cmd.session_history` 走游标分页（`runtime.ts` 的 historyFace）；
+ * - `new-session.workspace`：`cmd.new_session.workspace` 已接线（`carrier-services.ts` 的
+ *   `badWorkspace()` 拿到的就是手机传来的路径，不是自己推断的）；
+ * - `get-pending`：`cmd.get_pending` 有实现；
+ * - `keep-awake`：`cmd.keep_awake` + `ev.keep_awake_state` 有实现（mp 侧没界面，见 HANDOFF §5-14）；
+ * - `model`：`ev.model` 有实现；
+ * - `retry-compaction`：`ev.retry` / `ev.compaction` 都有（真机各 18 次）；
+ * - `idempotency`：`IdempotencyLedger` 按 cmdId 去重（规范 §10.2）；
+ * - `resync`：鉴权后发 `resync`。
+ *
+ * **刻意不列**：`drc.host.info`（`ev.host_info` 还没做，HANDOFF §3.6）、
+ * `drc.crypto.v2`（棘轮是规划中的破坏性变更）、`drc.pairing.token`（6 位码单独输入那条路已删）。
+ * 列一个没实现的能力 = 手机按"支持"表现，而实际会干等 12 秒——比不列更糟。
+ */
+const HOST_CAPABILITIES: readonly CapabilityId[] = [
+  'drc.v1',
+  'drc.pairing.qr',
+  'drc.payload.attachments',
+  'drc.payload.history',
+  'drc.payload.new-session.workspace',
+  'drc.payload.get-pending',
+  'drc.payload.keep-awake',
+  'drc.payload.model',
+  'drc.payload.retry-compaction',
+  'drc.cmd.idempotency',
+  'drc.data.enc-batch',
+  'drc.host.resync',
+]
 
 export interface RelayClientOptions {
   url: string
@@ -262,14 +304,20 @@ export class RelayClient {
       this.options.clock.clearTimeout(timeout)
       this.attempts = 0
       // D5：主机与客户端共用一条注册帧。PSK 从不上网（D1），这里只有 host token。
-      this.raw({
-        t: 'hello',
-        role: 'host',
-        protocol: 1,
-        token: this.options.token,
-        hostId: this.options.hostId,
-        label: this.options.label,
-      })
+      //
+      // ⚠️ `capabilities` 是**本插件真实支持的那几张**（规范 §5.3 C1/C3），不是全集。
+      // 它的用处是让对端能区分"这一代主机没有这个能力"与"它有但没开"——
+      // 而后者在 mp 侧是从**看能力面**推断出来的（`dsh-remote-mp` 不做别的协商），
+      // 所以少报一个 id 的代价是"明明支持却按不支持表现"，多报一个的代价是
+      // "发过去手机上干等 12 秒"。取交集要保守：这里报的都是**有实现且有判据钉着**的。
+      this.raw(
+        helloForHost({
+          token: this.options.token,
+          hostId: this.options.hostId,
+          label: this.options.label,
+          capabilities: HOST_CAPABILITIES,
+        }),
+      )
     })
     socket.on('message', (raw) => this.onFrame(String(raw)))
     // 存活探针：半开连接在本地是隐形的（对端走了、close 永不来），只能靠问。
@@ -305,7 +353,7 @@ export class RelayClient {
    * 而手机扫它必然失败（取证 docs/legacy-spec/host-plugin-runtime.md §6.2）。
    */
   publishPairing(slot: PairSlot): boolean {
-    return this.raw({ t: 'pair-begin', pairingToken: slot.token })
+    return this.raw(pairBegin(slot.token))
   }
 
   /**
@@ -424,7 +472,7 @@ export class RelayClient {
     this.conversations.close(conversationId)
     // 作废是一条通道的消失，属于结构性变化：立刻落盘，别等下一次 tick。
     this.options.onStructuralChange?.()
-    const told = this.raw({ t: 'session-leave', sessionId: conversationId })
+    const told = this.raw(sessionLeave(conversationId))
     // **只有真的发出去了才记账**：没发出去就必须留着"还没说过"这个状态，
     // 好让下一次调用（peer-joined 之外就是那条 onEncrypted 重试路）能再试一遍。
     if (told) {
@@ -439,7 +487,17 @@ export class RelayClient {
     this.options.onConversationGone(conversationId)
   }
 
-  private raw(frame: Record<string, unknown>): boolean {
+  /**
+   * 发一帧。
+   *
+   * 参数类型是 `EndpointFrame | Record<string, unknown>`：出站控制帧现在一律由
+   * 协议层的构造器产出（`helloForHost` / `pairBegin` / `sessionLeave` / `resync` /
+   * `ping` / `encToClient`），**参数表以外的字段在类型上写不出来**。
+   * 留 `Record<string, unknown>` 是因为 `send()` 那条路塞的是 `encToClient` 的返回值，
+   * 而它的类型来自协议层的 `RelayOutbound`（`[key: string]: unknown`）——
+   * 收窄成 `EndpointFrame` 会因为 `seq` 可选这类细节而不必要地卡住调用方。
+   */
+  private raw(frame: EndpointFrame | Record<string, unknown>): boolean {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false
     try {
       this.socket.send(JSON.stringify(frame))
@@ -471,7 +529,7 @@ export class RelayClient {
         // `resync` 声明的是"本端**仍持有密钥**的会话"。恢复出来的会话必须列进去，
         // 否则中继的 resync 会把它们当成主机已经放弃的通道删掉，
         // 手机下次发帧就撞 `unknown_session`（= 免扫码重连失败的典型症状）。
-        this.raw({ t: 'resync', sessionIds: this.conversations.ids() })
+        this.raw(resyncFrame(this.conversations.ids()))
         this.options.log('relay online', {
           generation: this.generation,
           conversations: this.conversations.size,
@@ -512,7 +570,7 @@ export class RelayClient {
         if (frame.clientId) this.conversations.get(frame.sessionId)?.clientIds.add(frame.clientId)
         // 这条通道现在又有密钥了：清掉"已声明作废"的记号，否则下次真要作废时发不出去。
         this.voided.delete(frame.sessionId)
-        this.raw({ t: 'resync', sessionIds: this.conversations.ids() })
+        this.raw(resyncFrame(this.conversations.ids()))
         this.emitState('online')
         this.options.onPeerJoined(frame.sessionId, frame.pairingToken)
         return
@@ -554,8 +612,20 @@ export class RelayClient {
       case 'error':
         // 中继只会把错误码发给"该对它负责"的那一端；本端把它记进状态，
         // 会话清理交给 enc 路径（那里才知道具体是哪条通道）。
+        //
+        // **按码分支**（2026-10-07 接线）：此前这一帧只被记进日志，主机从不按 `code`
+        // 判断，于是协议层那张"哪些码值得原样重试"的表在本端完全没被用上。
+        // 判据是 `isRetryableError`（协议层 §12.2）——它把"重发有没有可能在下一次成功"
+        // 变成一个事实，而这张表**不在本文件里**是有理由的：哪些码可重试是协议知识，
+        // 本地退避的具体秒数才是本端的策略。
+        //
+        // ⚠️ 刻意**不**在这里自动重发：`bad_frame` / `unknown_frame` 标的是**对端的 bug**，
+        // 把它们当可重试会让主机在一条永远不会自愈的连接上无限重试，而重试是有限额度的
+        // ——它会把额度耗在"重发同一条坏帧"上。真正需要动作的只有一个码：
+        // `rate_limited`，而它的处置（暂缓发码）已经由 `onRelayError` 交给策略层。
         this.options.log('relay error frame', {
           code: frame.code,
+          retryable: isRetryableError(frame.code),
           ...(frame.message === undefined ? {} : { message: frame.message }),
         })
         // 交给策略层（2026-10-07）：此前这一帧只被记进日志，主机从不按 code 分支。
@@ -721,7 +791,7 @@ export class RelayClient {
       // 这里只保证不再对旧 socket 发问）。
       if (this.stopped || this.socket !== socket) return
       if (socket.readyState === WebSocket.OPEN) {
-        this.raw({ t: 'ping', ts: this.options.clock.now() })
+        this.raw(pingFrame(this.options.clock.now()))
         this.clearPongDeadline()
         this.pongDeadline = this.options.clock.setTimeout(() => {
           // terminate 而不是 close：半开连接上 close() 要等 TCP 挥手，

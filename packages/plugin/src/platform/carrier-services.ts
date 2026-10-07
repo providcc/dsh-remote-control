@@ -1088,6 +1088,56 @@ export function createServicesKernel(services: ServicesBundle, options: Services
   }
 
   /**
+   * 归档 / 取消归档一条会话（`cmd.archive_session` 的落点）。
+   *
+   * ## ⚠️ 刻意**不传** `stopActivity`（这是本函数最重要的一行注释）
+   *
+   * 内核的 `archiveSession(sessionId, options)` 在会话还在跑时**抛**
+   * `WorkspaceActiveSessionError`，除非传 `stopActivity: true`——而那会**停掉主机上
+   * 正在跑的工作**。用户在手机上误点一下，主机上正在跑的任务就断了：那是不可逆的
+   * 损失，而且违反"插件不改变宿主自己的行为"这条纪律。
+   *
+   * 所以这里 `archive.call(registry, sessionId)` **不带第二个参数**。内核抛错时
+   * 把它翻成一句用户看得懂的话（"会话正在运行，不能归档"），
+   * 而不是一个 `WorkspaceActiveSessionError: ...` 的类名。
+   *
+   * 反向判据：哪天有人为了"让用户少跑一趟"而在这里补上 `stopActivity`，
+   * 下面那条"抛错时翻成人话"的判据不会红——所以另有一条判据钉住"不带第二参"。
+   */
+  async function archiveSession(sessionId: string, archived: boolean): Promise<{ ok: boolean; message?: string }> {
+    const registry = services.workspaceRegistry as LooseObject | undefined
+    // 取消归档走 `unarchiveSession`、归档走 `archiveSession`：内核把它们做成了两个
+    // 方法而不是一个带布尔参数的（实测 app.asar 里两个都在，且 `ensureRunnable`
+    // 已经在用 unarchiveSession 那一个）。这里跟着内核的形状，不自己发明第三种。
+    const name = archived ? 'archiveSession' : 'unarchiveSession'
+    const method = fn(registry, name)
+    if (!method) {
+      return {
+        ok: false,
+        message: `这一代宿主不能${archived ? '归档' : '取消归档'}会话（workspaceRegistry 没有 ${name}）`,
+      }
+    }
+    // 会话还在跑时先自己判一次，给出比内核类名更好懂的话。
+    // ⚠️ 这是**预判**不是替代：内核仍可能抛（两个判断之间有竞态），下面照样 catch。
+    if (archived && agentStatus(sessionId) === 'running') {
+      return { ok: false, message: '会话正在运行，不能归档。请先在电脑上让它跑完' }
+    }
+    try {
+      await method.call(registry, sessionId)
+      return { ok: true }
+    } catch (error) {
+      // 内核的 WorkspaceActiveSessionError 在这里被翻成一句话。
+      // 判据用**类名**而不是 message 内容：message 是给人看的、会随版本变文案，
+      // 而"这一类错误需要被翻译"这件事本身必须被钉住。
+      const text = messageOf(error)
+      if (/WorkspaceActiveSessionError|active session/i.test(text)) {
+        return { ok: false, message: '会话正在运行，不能归档。请先在电脑上让它跑完' }
+      }
+      return { ok: false, message: `${archived ? '归档' : '取消归档'}会话失败：${text}` }
+    }
+  }
+
+  /**
    * 读一条会话已有的历史（手机打开会话时用）。
    *
    * 走 `sessionQuery.readSession(id)`：它返回**整份**会话日志（不是窗口），
@@ -1614,6 +1664,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     subscribe,
     attachInteractionSink,
     ensureRunnable,
+    archiveSession,
     // 与发指令/续跑走同一条读取路径：这里原来还有一份实现，而且是 `current()` 裸调用
     // （不带 receiver；真要用 this 的服务方法会当场抛），两份迟早分叉。
     modelSelection: currentSelection,

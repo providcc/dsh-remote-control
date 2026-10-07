@@ -31,6 +31,7 @@ import type {
   SessionSummary,
 } from 'dsh-remote-wire'
 import { appendFileNote, MAX_ATTACH_TOTAL_BYTES, saveFileAttachments } from '../shell/uploads.js'
+import { MAX_ATTACHMENT_BYTES } from 'dsh-remote-wire/limits'
 import { IdempotencyLedger } from 'dsh-remote-wire/idempotency'
 import {
   keepAwakeState,
@@ -135,7 +136,7 @@ const DEFAULTS: RuntimeOptions = {
    * 去判断线上行为，也别把 `index.ts` 那个解析去掉（去掉就真的会静默拒收一切附件）。
    */
   uploadDir: '',
-  maxFileBytes: 512 * 1024,
+  maxFileBytes: MAX_ATTACHMENT_BYTES,
 }
 
 /** 一次列表最多给手机多少条会话（与中继侧的会话上限同源，取证 §5.3）。 */
@@ -536,6 +537,40 @@ export class HostRuntime {
             replayed += 1
           }
           reply(true, { data: { replayed } })
+          return
+        }
+        case 'cmd.archive_session': {
+          /**
+           * 归档 / 取消归档一条会话。
+           *
+           * 能力缺失时**明确拒绝**，理由与 `cmd.session_history` 那条一样：
+           * 回 ok:true 会让用户以为归档了，而列表里那条还在。
+           *
+           * 成功后**必须补推一次列表**：本端不监听 `workspace/changes`（它在
+           * `unmappedEventTypes` 里——那是一帧 `{turn:N}`，不含"改了哪些文件"，
+           * 手机也无法从中推断出归档了哪一条，见伞仓 HANDOFF §8 P0-2），
+           * 所以唯一能让界面跟上的是"改完自己推一次"。
+           */
+          const archive = this.kernel.archiveSession
+          if (!archive) {
+            reply(false, { message: '主机这一代不支持归档会话（内核端口没有 archiveSession 能力）' })
+            return
+          }
+          const archived = cmd.archived !== false
+          const outcome = await archive.call(this.kernel, cmd.sessionId, archived)
+          if (!outcome.ok) {
+            reply(false, { message: outcome.message ?? `${archived ? '归档' : '取消归档'}失败` })
+            return
+          }
+          reply(true, { data: { archived } })
+          // 补推列表放在回执**之后**：回执是给"点下按钮那一下"的答复，
+          // 列表是给下一次渲染的输入，两者的顺序不影响正确性，但回执先走
+          // 能让手机立刻关掉那个转圈——而列表这一帧会顺带把按钮恢复原状。
+          //
+          // 复用 `pushSessions` 而不是自己 `listSessions` + `sessionChanged`：
+          // 那条路上还有"读失败时保留上一次快照"与"整段包 try"两件事，
+          // 自己重写一遍就是第三份口径（而分叉的那一版正是这个项目最常见的缺陷形状）。
+          await this.pushSessions('archived')
           return
         }
       }

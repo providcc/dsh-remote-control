@@ -109,6 +109,8 @@ interface FakeKernel extends KernelPort {
     }>
     interrupt: string[]
     ensureRunnable: string[]
+    /** 每一次 `archiveSession(sessionId, archived)` 的实参。 */
+    archive: Array<{ sessionId: string; archived: boolean }>
     unsubscribes: number
   }
   failList: boolean
@@ -128,6 +130,11 @@ interface FakeKernel extends KernelPort {
   /** 非空时替代 SESSIONS 作为列表内容：用来证明"尾随推送带的是最新快照"。 */
   listing: SessionSummary[] | undefined
   ensureRunnableImpl: ((sessionId: string) => Promise<{ ok: boolean; message?: string }>) | undefined
+  /**
+   * 非空时替代默认的 archiveSession 实现：用来演"内核拒收"与"抛错"两种结局。
+   * 默认（undefined）= 一律 ok:true，与真载体一致。
+   */
+  archiveSessionImpl: ((sessionId: string, archived: boolean) => Promise<{ ok: boolean; message?: string }>) | undefined
   feed(event: KernelEvent): void
 }
 
@@ -137,7 +144,7 @@ function makeKernel(): FakeKernel {
     carrier: 'fake',
     events,
     sink: undefined,
-    calls: { listSessions: [], sendPrompt: [], interrupt: [], ensureRunnable: [], unsubscribes: 0 },
+    calls: { listSessions: [], sendPrompt: [], interrupt: [], ensureRunnable: [], archive: [], unsubscribes: 0 },
     failList: false,
     throwOnSend: false,
     rejectSendFor: undefined,
@@ -147,6 +154,7 @@ function makeKernel(): FakeKernel {
     failRunState: false,
     listing: undefined,
     ensureRunnableImpl: undefined,
+    archiveSessionImpl: undefined,
     async listSessions(limit: number) {
       kernel.calls.listSessions.push(limit)
       if (kernel.failList) throw new Error('内核读列表失败')
@@ -190,6 +198,17 @@ function makeKernel(): FakeKernel {
     async ensureRunnable(sessionId: string) {
       kernel.calls.ensureRunnable.push(sessionId)
       if (kernel.ensureRunnableImpl) return kernel.ensureRunnableImpl(sessionId)
+      return { ok: true }
+    },
+    /**
+     * ⚠️ 这个桩**不实现"运行中拒收"**：那是载体（carrier-services / mock-kernel）
+     * 的责任，不在 core。core 这一层只断言"端口被调用了、失败会如实回执"，
+     * 而"载体拒收"在 `carrier-services.test.ts` / `mock-kernel` 那侧单独钉。
+     * 理由：把两条语义塞进一个桩里，测出来的就只是"桩自己对自己"。
+     */
+    async archiveSession(sessionId: string, archived: boolean) {
+      kernel.calls.archive.push({ sessionId, archived })
+      if (kernel.archiveSessionImpl) return kernel.archiveSessionImpl(sessionId, archived)
       return { ok: true }
     },
     describe() {
@@ -2757,7 +2776,13 @@ test('主机认不出的指令：按 cmdId 回 ev.result{ok:false}，并说清�
   transport.pair('c_000000000001')
 
   // ① 主机这一代**根本没有**这个命令（将来手机先升级、主机没跟上的形状）。
-  runtime.handleInvalidCommand('c_000000000001', 'cmd_future', 'cmd.archive_session')
+  //
+  // ⚠️ 这里原来拿 `cmd.archive_session` 当例子，而它 2026-10-07 已经发版了 ——
+  // 于是判据红在一个**与本次改动毫无字面关系**的地方（症状与改动点不同文件同仓）。
+  // 判据的意图是"一个协议里不存在的命令名"，所以必须用一个**真的不存在**的名字，
+  // 而且它得是"看起来像一条合法命令"的形状（`cmd.` 前缀 + 小写下划线）——
+  // 随便写个 `garbage` 会让 `isKnownPayloadType` 分支变得太容易过。
+  runtime.handleInvalidCommand('c_000000000001', 'cmd_future', 'cmd.archive_session_v2')
   // ② 命令名认识、**字段**过不去（最典型：mediaType 超过 schema 的 64 上界）。
   runtime.handleInvalidCommand('c_000000000001', 'cmd_shape', PAYLOAD_TYPES.cmdSendPrompt)
 
@@ -2823,4 +2848,95 @@ test('被拒的指令**不许**进台账：没做过的事不许记成"已执行
     /已执行过/,
     '拒收与执行是两条路：把"没做过的事"记进"已执行"的台账是撒谎',
   )
+})
+
+/**
+ * `cmd.archive_session`（2026-10-07 加）。
+ *
+ * 这一族的三条纪律，各由下面各自的判据钉住：
+ * 1. **core 只转发，语义在载体**：core 断言"端口被调用、失败如实回执"，
+ *    而"运行中拒收 / stopActivity 绝不传"由 `carrier-services.test.ts` 单独钉
+ *    ——把它们塞进同一个桩里，测出来的就只是"桩自己对自己"。
+ * 2. **不许静默成功**（规范 A2）：端口缺能力时必须回 ok:false。
+ * 3. **成功后必须补推列表**（规范 A3）：本端不消费 `workspace/changes`
+ *    （那是一帧 `{turn:N}`，推不出归档了哪一条）。
+ */
+test('cmd.archive_session：转发到端口、成功回执，并补推一次列表（规范 A3）', async () => {
+  const { runtime, transport, kernel } = fixture()
+  transport.pair('c_000000000001')
+  const before = transport.ofType(PAYLOAD_TYPES.evSessionChanged).length
+
+  runtime.handleCommand(cmd('cmd.archive_session' as CmdPayload['t'], { sessionId: 's1' }), 'c_000000000001')
+  await settle()
+
+  assert.deepEqual(
+    kernel.calls.archive,
+    [{ sessionId: 's1', archived: true }],
+    '缺省就是归档：core 必须把"缺省"翻译成显式的 archived=true 交给端口（端口不认 undefined）',
+  )
+  const [res] = transport.resultReplies()
+  assert.ok(res, '必须有回执')
+  assert.equal(res.ok, true, '成功要回 ok:true —— 手机靠它关掉那个转圈')
+  assert.equal(
+    transport.ofType(PAYLOAD_TYPES.evSessionChanged).length,
+    before + 1,
+    '成功后必须补推一次列表：用户点完就该看到列表变了，等下一次 15 秒刷新等于"点了没反应"',
+  )
+})
+
+test('cmd.archive_session：archived:false 是取消归档，方向不能反', async () => {
+  const { runtime, transport, kernel } = fixture()
+  transport.pair('c_000000000001')
+  runtime.handleCommand(
+    cmd('cmd.archive_session' as CmdPayload['t'], { sessionId: 's1', archived: false }),
+    'c_000000000001',
+  )
+  await settle()
+  assert.deepEqual(
+    kernel.calls.archive,
+    [{ sessionId: 's1', archived: false }],
+    '反向判据：把 false 当成 true 就是"取消归档变成了再归档一次"，用户永远拿不回那条会话',
+  )
+})
+
+test('cmd.archive_session：端口拒收时如实回 ok:false 并带出原因（规范 A2）', async () => {
+  const { runtime, transport, kernel } = fixture()
+  transport.pair('c_000000000001')
+  // 真载体在会话还在跑时回的就是这句（`stopActivity` 我们刻意不传）
+  kernel.archiveSessionImpl = async () => ({ ok: false, message: '会话正在运行，不能归档。请先在电脑上让它跑完' })
+  const before = transport.ofType(PAYLOAD_TYPES.evSessionChanged).length
+
+  runtime.handleCommand(cmd('cmd.archive_session' as CmdPayload['t'], { sessionId: 's1' }), 'c_000000000001')
+  await settle()
+
+  const [res] = transport.resultReplies()
+  assert.ok(res)
+  assert.equal(res.ok, false, '失败必须说失败：假装成功会让用户以为归档了，而列表里那条还在')
+  assert.match(String(res.message), /正在运行/, '原因要原样透出，mp 那边直接 toast 它')
+  assert.equal(
+    transport.ofType(PAYLOAD_TYPES.evSessionChanged).length,
+    before,
+    '失败时不许推列表：推了就是"列表没变"与"操作成功"两个互相矛盾的信号',
+  )
+})
+
+test('反向判据：这一代主机没有归档能力时**明确拒绝**，不许静默成功', async () => {
+  // 缺口的语义：`archiveSession?` 是可选方法，缺它 = 这一代内核没有这个能力。
+  // core 这一层必须把它变成一条明说原因的 ok:false，而不是"跳过这一条 case"
+  // （那会让手机干等 12 秒的 COMMAND_TIMEOUT_MS 再报一句"主机没有回应"）。
+  const { runtime, transport, kernel } = fixture()
+  transport.pair('c_000000000001')
+  // 刻意制造"没有这个方法"的载体（真实场景：更老的内核）。
+  // 不用 @ts-expect-error：`delete` 一个可选成员在 TS 里本来就合法。
+  delete (kernel as { archiveSession?: unknown }).archiveSession
+  const cmdId = 'cmd_no_archive'
+  runtime.handleCommand({ t: 'cmd.archive_session', cmdId, sessionId: 's1' } as CmdPayload, 'c_000000000001')
+  await settle()
+
+  const [res] = transport.resultReplies()
+  assert.ok(res, '必须回执：静默丢弃 = 手机端只剩 12 秒超时')
+  assert.equal(res.cmdId, cmdId, '按 cmdId 结算，cmdId 必须原样带回')
+  assert.equal(res.ok, false)
+  assert.match(String(res.message), /不支持归档/, '要说清是"主机这一代没有"，而不是"失败了"')
+  assert.match(String(res.message), /archiveSession/, '要点名缺的那个能力，排错时不必去猜')
 })

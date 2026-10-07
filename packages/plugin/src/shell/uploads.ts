@@ -15,6 +15,14 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_TOTAL_BYTES,
+  MAX_FILE_ATTACHMENTS,
+} from 'dsh-remote-wire/limits'
+
+/** 本仓沿用的旧名 = 协议层的 `MAX_ATTACHMENT_TOTAL_BYTES`（见下面那段注释）。 */
+const MAX_ATTACH_TOTAL_BYTES = MAX_ATTACHMENT_TOTAL_BYTES
 
 /** 一条落盘成功的文件（2026-10-05 加）。 */
 export interface SavedFile {
@@ -51,8 +59,18 @@ export type SaveFilesResult = SaveFilesOk | SaveFilesFail
  * 整帧被掐、socket 1009 断开，用户看到的是"发个附件就掉线"。mp 侧有这道闸，
  * 但它是**客户端**；一条旧版/被改过的小程序照样能把超限批次送上来，所以主机侧按
  * 同一把尺子再量一遍（口径差一点都会出现"手机说发出去了、主机回失败"的分叉）。
+ *
+ * **转出协议层的 `MAX_ATTACHMENT_TOTAL_BYTES`**（2026-10-07）：这个数此前在本仓被抄了
+ * 四遍（这里、`config.ts` 两处、`runtime.ts` 一处），改一处不会让另外三处变红，
+ * 而症状是"手机按 512KB 算、主机按 256KB 算"这类只有真机才看得见的分叉。
+ * 现在唯一定义点在 wire 的 `limits.ts`；本仓的导出保留是为了不破坏既有 import。
+ *
+ * ⚠️ 别写成 `export { MAX_ATTACHMENT_TOTAL_BYTES as MAX_ATTACH_TOTAL_BYTES } from '...'`
+ * 那一行**不会**在本地产生一个叫 `MAX_ATTACH_TOTAL_BYTES` 的绑定（`from` 形式只在
+ * 导出侧改名），于是下面 `saveFileAttachments` 里的同名引用会是"未定义"。
+ * 正确形状是上面 import 一次 + 一句本地 `const` 别名 + 这里纯转出。
  */
-export const MAX_ATTACH_TOTAL_BYTES = 512 * 1024
+export { MAX_ATTACH_TOTAL_BYTES }
 
 /**
  * 文件名/目录名收敛：只留 [A-Za-z0-9._-]，其余折成 _；空串与超长都有兜底。
@@ -110,8 +128,8 @@ export function saveFileAttachments(options: {
   /** 整批的原始字节上限；默认与 mp 侧同值（见 {@link MAX_ATTACH_TOTAL_BYTES}）。 */
   maxTotalBytes?: number
 }): SaveFilesResult {
-  const maxCount = options.maxCount ?? 4
-  const maxBytes = options.maxBytesPerFile ?? 512 * 1024
+  const maxCount = options.maxCount ?? MAX_FILE_ATTACHMENTS
+  const maxBytes = options.maxBytesPerFile ?? MAX_ATTACHMENT_BYTES
   const maxTotalBytes = options.maxTotalBytes ?? MAX_ATTACH_TOTAL_BYTES
   const files = options.files || []
   if (files.length === 0) return { ok: true, saved: [], dir: options.dir }
