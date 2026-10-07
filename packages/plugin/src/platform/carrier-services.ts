@@ -594,7 +594,7 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    * 真机上"新建没反应"的病根可能在任意一层，而报错信息里带上"这一层有什么成员"，
    * 排查就不用再重启一次 Harness 去取证。
    */
-  async function newSession(): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
+  async function newSession(args?: { workspace?: string }): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
     const controller = services.sessionController
     if (!controller) return { ok: false, message: '主机这一代没有 sessionController 服务' }
     const commands = controller.commands
@@ -609,10 +609,16 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       // （手机侧照能用，只是主机那一面"新建了却不在列表里"）。
       //
       // 三级取值（2026-10-06 用户报"落在未分组"，根因是旧实现只看第一条）：
+      //   ⓪ 手机指明的工作区（`cmd.new_session.workspace`）——**优先级最高**；
       //   ① 配置点名的 `DRC_NEW_SESSION_CWD`（运维在配置文件里写下的一句钉）；
       //   ② **最后操作过的那条会话**的目录（主机自己从事件流观察到的，不猜）；
       //   ③ 往前扫若干条，找第一条带 cwd 的（"最近建过但没挂目录"的那类会话）；
       //   ④ 还是不给（宿主自己安排，日志留痕）。
+      //
+      // ⓪ 为什么排在配置那一句钉**之上**：那一句钉是"手机没说话时的默认"，
+      // 而手机这一次是**明确说了**要让会话落在哪。用户选了分组却落在别处，
+      // 就是我们要修的那个症状本身——把运维的默认值当成硬拒绝，症状一模一样。
+      // 手机传来的值仍然过 `badWorkspace()`：它是不可信输入，判定的是**形状**。
       //
       // ②③ 都必须存在：旧实现只有一个退化版本（`listSessions(1)[0]`，而那份列表按 createdAt 排），
       // "最新建的那条"完全可能没有 cwd（它自己可能就是手机在旧版本里不带 cwd 建出来的那条），
@@ -620,10 +626,21 @@ export function createServicesKernel(services: ServicesBundle, options: Services
       //
       // ⚠️ 仍然永远不给 sessionId（那会让内核复用旧会话而不是新建），
       // 也永远不与 workspaceId 同时给（两者并存会被内核当场拒 gateway/bad-request）。
+      const requested = String(args?.workspace ?? '').trim()
+      let requestedWhy = ''
+      if (requested) requestedWhy = badWorkspace(requested)
+      if (requested && requestedWhy) {
+        // 形状不合法 = 用户选了个主机根本不能用的目录。明确说清楚，不静默改道：
+        // 静默改道的表现是"我选了 A，它落在 B"，而那比失败更难查。
+        return { ok: false, message: `手机指定的工作区不可用（${requestedWhy}）` }
+      }
       const pinned = String(options.newSessionCwd ?? '').trim()
       let cwd = ''
       let cwdFrom = ''
-      if (pinned) {
+      if (requested) {
+        cwd = requested
+        cwdFrom = 'client'
+      } else if (pinned) {
         cwd = pinned
         cwdFrom = 'config'
       }

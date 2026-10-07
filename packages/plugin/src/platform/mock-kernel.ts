@@ -167,11 +167,22 @@ export class MockKernel implements KernelPort {
    * 假的新建会话：造一个 id、塞进内存列表，行为与真实载体一致（列表里立刻能看见）。
    * 这样"新建 → 列表出现 → 点进去"这条链在本地闭环里能真跑一遍。
    * `newSessionError` 用来演"宿主没有这个能力"那一支。
+   *
+   * `workspace` **要记进摘要**（2026-10-07）：真载体会把新建那条的 cwd 记进
+   * `freshSessions`，下一条列表推送立刻带上它。不记的话，"手机指定的分组真的生效了"
+   * 这条判据只能去翻内部状态——而那条链历史上骗过判据（判据只断言"有回执"，
+   * 不断言"落在哪"，于是接线漏了也全绿）。
    */
-  async newSession(): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
+  async newSession(args?: { workspace?: string }): Promise<{ ok: boolean; sessionId?: string; message?: string }> {
     if (this.options.newSessionError) return { ok: false, message: this.options.newSessionError }
     const sessionId = `ses_mock_new_${++this.sequence}`
-    this.sessions.unshift({ id: sessionId, state: 'idle', running: false })
+    const workspace = String(args?.workspace ?? '').trim()
+    this.sessions.unshift({
+      id: sessionId,
+      state: 'idle',
+      running: false,
+      ...(workspace ? { workspace } : {}),
+    })
     return { ok: true, sessionId }
   }
 

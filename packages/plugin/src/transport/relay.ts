@@ -39,6 +39,7 @@ import {
   type CmdPayload,
   type EvPayload,
   base64Text,
+  encToClient,
   open,
   parseCmdPayload,
   parseRelayFrameText,
@@ -81,6 +82,19 @@ export interface RelayClientOptions {
    * 接线方要做的是"清展示位 + 作废这张 + 按需补一张"；被限速时不建议立刻再申请。
    */
   onPairFail?: (reason: string) => void
+  /**
+   * 中继的错误帧（2026-10-07 接上）。
+   *
+   * 此前这一帧只被记进日志：主机**从不**按 `code` 分支，于是协议层那条
+   * "发出去的是机器可判的码"（规范 §12）在本端完全没被用上。接上之后至少有一件事
+   * 变得可能：**限流**有了确切的信号来源——配对限流在中继那条路径上被折成了
+   * `invalid_or_expired`（中继只把 `rate_limited` 写进自己的日志），主机只能从
+   * 这里的 `rate_limited` 知道"刚才是被限速了，现在再申请一张只会继续被拒"。
+   *
+   * `retryAfterMs` 是中继给的等待建议（毫秒，可选）。编不出来的那种错误不带它，
+   * 所以缺省时调用方要自己选一个退避。
+   */
+  onRelayError?: (code: string, retryAfterMs: number | undefined) => void
   /** 连接状态变化，直接进 status.json。 */
   onState: (state: RelayStateInfo) => void
   /** 重连后的第一批帧之前要不要等一会（手机端可能还在旧 convId 上发）。 */
@@ -296,9 +310,35 @@ export class RelayClient {
     // 但往一条空会话发帧只有两个后果：中继计一次丢帧，和本地白做一次加密。
     if (conversation.clientIds.size === 0) return false
     const record = seal(conversation.kH2C, payload)
+    /**
+     * **出站体积闸**（2026-10-07 审计补上）。`encToClient` 是协议层里唯一一处执行
+     * `MAX_CIPHERTEXT_BYTES` 的地方，注释写着"超过上限对侧静默丢帧"——而主机原来
+     * 直接手拼 `{t:'enc',…}`，**这条路上一个体积闸都没有**。
+     *
+     * 后果不是"这一帧丢了"：超限时中继的 `parseEndpointFrame` 会回一条 `error{bad_frame}`，
+     * 而插件对 `error` 帧**只记日志**（见 `onFrame` 的 `case 'error'`），手机上于是走完
+     * 15 秒 `HISTORY_TIMEOUT_MS` 留下一句"读不到"——正是本仓库最典型的
+     * 「功能看着正常、其实什么也没发生」。
+     *
+     * 闸门留在协议层（不在这儿重抄一遍上限）：同源同口径，将来上限变了不会只改一半。
+     * 过不了就**当成没发出去**返回 false，让 `countOutbound` 如实记一次 `_no_peer`，
+     * 而不是把一条注定被丢的帧当成已送达。
+     */
+    let frame: Record<string, unknown>
+    try {
+      frame = encToClient(conversationId, ++conversation.seqHost, record.ciphertext)
+    } catch (error) {
+      this.options.log('outbound frame rejected by the wire size cap', {
+        sessionId: conversationId,
+        message: messageOf(error),
+      })
+      return false
+    }
+    // 活动时刻**在闸门之后**才记：一条注定发不出去的帧不该把这条通道"用活"，
+    // 否则剪枝的空闲判据永远等不到它（那正是"PSK 簿永远不剪"的成因之一）。
     conversation.lastActivityAt = this.options.clock.now()
     this.options.onBookActivity?.()
-    return this.raw({ t: 'enc', sessionId: conversationId, seq: ++conversation.seqHost, ciphertext: record.ciphertext })
+    return this.raw(frame)
   }
 
   broadcast(payload: EvPayload): number {
@@ -341,19 +381,40 @@ export class RelayClient {
    *
    * 幂等：同一条通道只声明一次（`voided` 有上界，避免长会话里堆内存）。
    * 重新配对（`peer-joined`）会清掉这条记录，所以下次作废仍能声明。
+   *
+   * ## 先发再记账（2026-10-07 审计）
+   *
+   * 原来 `voided.add()` 在 `raw()` **之前**，而 `raw()` 对非 OPEN 的 socket 是静默
+   * `return false`（中继抖一下或重启时，退避最长 30 秒以上）。于是这一帧没发出去，
+   * 通道却已经被标成"声明过了"，**此后任何重试都被第 346 行挡掉**——包括设计上
+   * 明确依赖的那条出路（`onEncrypted` 收到这条会话的密文 → 本端已无钥匙 →
+   * 再调一次 `voidConversation`，见 `onFrame`）。
+   *
+   * 症状：中继那边的路由还在，手机继续对着一个听不见的对端发帧，既收不到回执也撞不上
+   * `unknown_session`，而 `index.ts` 明明向用户承诺过"中继会收到 `session-leave`、
+   * 手机端会显示「主机已断开，请重新配对」"。
+   *
+   * （下一次 `resync` 会把中继没列出的会话删掉，所以最坏是拖到下一次重连——
+   * 但那是在拿一条已经许诺过的保证去换一个碰巧会到来的兜底。）
    */
   voidConversation(conversationId: string): void {
     if (this.voided.has(conversationId)) return
-    if (this.voided.size >= VOIDED_MAX) {
-      const oldest = this.voided.values().next().value
-      if (oldest !== undefined) this.voided.delete(oldest)
-    }
-    this.voided.add(conversationId)
     this.undecryptable.delete(conversationId)
     this.conversations.close(conversationId)
     // 作废是一条通道的消失，属于结构性变化：立刻落盘，别等下一次 tick。
     this.options.onStructuralChange?.()
-    this.raw({ t: 'session-leave', sessionId: conversationId })
+    const told = this.raw({ t: 'session-leave', sessionId: conversationId })
+    // **只有真的发出去了才记账**：没发出去就必须留着"还没说过"这个状态，
+    // 好让下一次调用（peer-joined 之外就是那条 onEncrypted 重试路）能再试一遍。
+    if (told) {
+      if (this.voided.size >= VOIDED_MAX) {
+        const oldest = this.voided.values().next().value
+        if (oldest !== undefined) this.voided.delete(oldest)
+      }
+      this.voided.add(conversationId)
+    } else {
+      this.options.log('session-leave not sent (socket not open); it will be retried', { conversationId })
+    }
     this.options.onConversationGone(conversationId)
   }
 
@@ -476,6 +537,12 @@ export class RelayClient {
           code: frame.code,
           ...(frame.message === undefined ? {} : { message: frame.message }),
         })
+        // 交给策略层（2026-10-07）：此前这一帧只被记进日志，主机从不按 code 分支。
+        // `retryAfterMs` 用 `in` 收窄而不是直接取：主机钉的那一版 wire 里可能还没有
+        // 这个字段（加性的、可选的），中继也可能是更老的一版。这里要的是
+        // "有就用、没有就退回自己的下限"，所以对字段存在与否做一次显式判定。
+        const hinted = 'retryAfterMs' in frame ? frame.retryAfterMs : undefined
+        this.options.onRelayError?.(frame.code, typeof hinted === 'number' ? hinted : undefined)
         return
       case 'pong':
         // 探针的答复到了：这一轮的问题作废（没有待答问题时可视为心跳噪声）。

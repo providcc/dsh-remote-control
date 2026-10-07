@@ -26,7 +26,7 @@ import { RelayClient } from './transport/relay.js'
 import { SystemSleepBackend } from './platform/sleep-posix.js'
 import { createServicesKernel } from './platform/carrier-services.js'
 import { createOneShotTimers, DEFAULT_SYSTEM_CLOCK } from './core/clock.js'
-import { StatusFile } from './shell/status.js'
+import { StatusFile, STATUS_REFRESH_MS } from './shell/status.js'
 import { resolveHostId } from './shell/host-id.js'
 import { PairStore } from './shell/pair-store.js'
 import {
@@ -96,16 +96,26 @@ const SERVICE_NAMES = [
  */
 const MAX_CONVERSATIONS = 64
 
+/**
+ * 被中继限速之后的**默认**退避时长。
+ *
+ * 中继可以在错误帧里给 `retryAfterMs`（协议 §12.2 E2），给了就用它的；
+ * 没给时用这个值。量级对着中继那条 `DRC_PAIR_GLOBAL_PER_SEC = 20` 的固定 1 秒窗口：
+ * 退避必须跨过至少一个完整窗口，否则它只是把拒绝往后推一点点，
+ * 而在"被拒 → 自动补码 → 再被拒"的循环里，推一点点等于没退。
+ */
+const PAIR_RATE_LIMIT_BACKOFF_MS = 2_000
+
 /** 取证：同一个进程里宿主调用了几次 `apply`（bundle 被重复挂载时能看到）。 */
 const APPLY_COUNT = { n: 0 }
 
 /** 默认时钟：真实定时器。测试注入假时钟（见 core/clock.ts）。 */
 export const systemClock: Clock = DEFAULT_SYSTEM_CLOCK
 
-export function apply(ctx: LooseContext, injected: Partial<PluginConfig> = {}): void {
+export function apply(ctx: LooseContext, injected: Partial<PluginConfig> = {}, clock: Clock = systemClock): void {
   let handle: RuntimeHandle | undefined
   try {
-    handle = applyInner(ctx, injected)
+    handle = applyInner(ctx, injected, clock)
   } catch (error) {
     // 兜底：任何一步抛出都不许穿出去。
     try {
@@ -155,9 +165,12 @@ export function apply(ctx: LooseContext, injected: Partial<PluginConfig> = {}): 
   }
 }
 
-function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): RuntimeHandle | undefined {
+function applyInner(
+  ctx: LooseContext,
+  injected: Partial<PluginConfig>,
+  clock: Clock,
+): RuntimeHandle | undefined {
   const config = readConfig(injected)
-  const clock = systemClock
   // 载具探测的复查（8s/25s/60s）与载具宽限都是"宿主还活着就顺手看一眼"的一次性动作。
   // 它们必须 unref 且在停机时撤掉，否则 60s 那一发会把事件循环钉住——`node e2e/run.mjs`
   // 1.2s 跑完却 60s 才退出、任何 headless/CLI 跑法白等一分钟，都出自这里（见 core/clock.ts）。
@@ -227,10 +240,26 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
    * ——这正是原来"拆成两个包"所提供的隔离，现在由 `startPill` 的软探测提供。
    */
   let pillRoutes: PillHandle | undefined
+  /**
+   * `start()` 内部登记的停机动作（现在只有"没有 status.json 时那只 housekeeping 节拍"）。
+   *
+   * 为什么不让 `start()` 自己管：它是个闭包，拿不到 `stop()`；而停机时漏清一个
+   * 定时器 = 插件走了之后还在往一个已经不存在的会话簿上写盘。
+   */
+  const stopHooks: Array<() => void> = []
   // RelayClient 是唯一知道连接此刻怎么样的一方；状态快照读这两个值。
   let lastRelayState: 'online' | 'connecting' | 'offline' = 'connecting'
   let lastRelayProblem: string | undefined
   let lastRelayGeneration = 0
+  /**
+   * 限流退避到什么时候（与 `clock.now()` 同一时钟域）。
+   *
+   * 为什么要有它：见下面 `onPairFail` —— 自动补码撞上限速是一条会自我加速的循环，
+   * 而"刚被限速"唯一的证据是 `error{code:'rate_limited'}` 那一帧
+   * （配对路径上的 `reason` 已被中继折成 `invalid_or_expired`，认不出来）。
+   * 连接重建时清零：配额按连接计，新 socket 是一份新配额。
+   */
+  let pairRateLimitedUntil = 0
 
   const transport: RuntimeTransport = {
     reply(conversationId: string, payload: EvPayload): boolean {
@@ -261,7 +290,14 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       lookupPairingSlot: (token) => slots.resolveFor(token),
       onPairReady: (token, ttlMs) => {
         // 服务端权威 TTL：不改写就会提前清掉 PSK，造成"配对成功但全解不开"。
-        if (!slots.applyServerTtl(token, ttlMs)) log('pair-ready for an unknown token', { token })
+        //
+        // ⚠️ 这里**只能记 tokenHandle(token)**（码文本的 sha256 前 8 位）。原来记的是
+        // `{ token }` —— 把 6 位配对码**原样**写进了 stdout，而同一个 stdout 上
+        // `pill/routes.ts` 刻意只记 `tokenLength` + `epoch`、中继侧 D2 也为此把完整码
+        // 降到 debug。§0.10.7 那条纪律在这一个调用点上没跟上：stdout 是会被翻出来贴进
+        // issue 的那种地方，而这条路径**可达**——`slots.prune()` 在 3 秒节拍上会剔掉过期
+        // 的槽，之后中继才把 pair-ready 送回来的那一张就正好"不认识"了。
+        if (!slots.applyServerTtl(token, ttlMs)) log('pair-ready for an unknown token', { code: tokenHandle(token) })
         pairingWindow.applyServerTtl(token, ttlMs)
       },
       onPeerJoined: (conversationId, pairingToken) => {
@@ -307,18 +343,26 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
         lastRelayState = info.relay
         lastRelayProblem = info.problem
         lastRelayGeneration = info.generation
+        // 新连接 = 新配额：限流退避不该跨连接生效（旧窗口早就过去了，
+        // 而留着它会让"重连之后配对码一直不自动补"看起来像另一个 bug）。
+        if (info.relay === 'online') pairRateLimitedUntil = 0
       },
       /**
-       * 中继宣告"这张配对码没配上"（`expired` / `already_used` / `rate_limited` /
-       * `invalid_or_expired`）。
+       * 中继宣告"这张配对码没配上"。
        *
-       * 这个口原来是**声明了却没人接**（`relay.ts:461` 调、index.ts 从不传）：中继说码废了，
-       * 主机这边毫无反应，屏幕上那张死码继续挂着 —— 用户对着 `already_used` 反复扫，
-       * 只能等 TTL 走完（`pairOnStartSec` 默认 0，没有任何东西会去换它）。
+       * `reason` 只有四个取值（`invalid_or_expired` / `already_used` / `host_offline` /
+       * `bad_token`），取自小程序那张中文映射表。处理：**清展示位 + 作废这张码 +
+       * 立刻补一张**（同一时刻屏幕上必须有一张能用的）。
        *
-       * 处理：**清展示位 + 作废这张码 + 立刻补一张**（同一时刻屏幕上必须有一张能用的）。
-       * `rate_limited` 例外：中继明确在限速，立刻再申请只会继续被拒，把换码留给
-       * 用户点"刷新"或下一次窗口判断（那时中继的限速窗口多半已经过去）。
+       * ⚠️ 限速**不在 `reason` 里**：中继的配对限流是连接级配额，落到线上时被折成
+       * `invalid_or_expired`（它自己的日志里仍记 `rate_limited`）。原来这里写的
+       * `if (reason !== 'rate_limited')` 因此是一个**永远为真**的分支 —— 死代码，
+       * 而它读起来像是"限速时我们会克制一下"。真正的信号来自 `onRelayError`：
+       * 见到 `rate_limited` 就进入退避窗口，窗口内不自动补码。
+       *
+       * 为什么这件事要紧：自动补码撞上限速是一条会**自我加速**的循环
+       *（被拒 → 补一张 → 再被拒 → 再补），而配对限流的全局配额是 20/s。
+       * 于是"刚被限速"最可能的表现是主机自己把配额烧光，手机随后连普通帧都发不出去。
        */
       onPairFail: (reason) => {
         const shown = active.pairing
@@ -328,7 +372,23 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
           pairingWindow.forget(shown.token)
         }
         log('relay rejected the pairing code', { reason })
-        if (reason !== 'rate_limited') wrappedPublish()
+        const waitMs = pairRateLimitedUntil - clock.now()
+        if (waitMs > 0) {
+          // 不补码，但**把原因记下来**：用户点「刷新」仍然随时可以（那是人的决定）。
+          log('pairing republish deferred while rate limited', { waitMs })
+          return
+        }
+        wrappedPublish()
+      },
+      /**
+       * 中继的错误帧：主机第一次真的按 `code` 分支。
+       * 目前只对限速有反应 —— 那是唯一一条"立刻重试只会更糟"的码。
+       */
+      onRelayError: (code, retryAfterMs) => {
+        if (code !== 'rate_limited') return
+        const wait = retryAfterMs ?? PAIR_RATE_LIMIT_BACKOFF_MS
+        pairRateLimitedUntil = Math.max(pairRateLimitedUntil, clock.now() + wait)
+        log('relay rate limited us', { waitMs: wait })
       },
       // 配对通道长存（D3）之后必须自己剪枝：中继那边的空闲 TTL 是 7 天，
       // 不剪就是无界的 PSK 簿 + 每次广播对废弃通道逐个密封。
@@ -389,12 +449,30 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
     // tick 挂在 status 的 3 秒节拍上（旧实现就是挂在这里），并且**先 tick 一次**，
     // 让 `pairOnStartSec>0` 的实例一起来就能看到 status.json 里有码。
     pairingWindow.tick()
-    status.start(() => {
+
+    /**
+     * 周期性 housekeeping：**剪枝 + 补码 + 批量落盘**。
+     *
+     * 抽出来是因为它**不属于**状态快照（2026-10-07 审计）。
+     * 原来这三件事全都写在 `status.start()` 那个回调里，而 `StatusFile.start`
+     * 在 `statusFile` 为空时直接 return —— 那个空值是一个**有文档的**开关
+     * （HOST-SIDE §4「置空关闭状态快照」），于是关掉快照的用户同时关掉了：
+     *
+     * - **通道剪枝**（`pruneConversations` 是全仓唯一的 `pruneStale()` 调用方）
+     *   → 密钥簿重新变回无界，`MAX_CONVERSATIONS` 与两条 TTL 全部失效：
+     *   每天重新配对一次的用户两周就攒 200+ 把 PSK，每次广播逐条密封；
+     * - **配对码自动换代**（`pairingWindow.tick`）→ `pairOnStartSec>0` 的实例
+     *   永远只发启动那一张，用户扫完就再没有第二张（那句"要等下次刷新的二维码"）；
+     * - **PSK 簿的批量落盘** → 只剩结构性变化与停机那两条写盘路。
+     *
+     * 一句话：**一个排错开关顺手关掉了三件与排错无关的事**，而它们全都没有任何提示。
+     */
+    const housekeeping = (): void => {
       pairingWindow.tick()
       relay?.pruneConversations()
       // `seqHost` 与 `lastActivityAt` 每次广播都变，挂在 `onStructuralChange` 上等于
       // 每 15 秒写一次盘；所以那些变动只标脏，这里按 3 秒节拍批量落一次。
-      // 判据是 `hasPendingChanges`：**没脏就不写**，否则 status.json 的 3 秒节拍
+      // 判据是 `hasPendingChanges`：**没脏就不写**，否则这条节拍
       // 会变成一个无条件写盘的心跳（而这个插件在 GUI 宿主里可能连开好几天）。
       if (pairStoreFile && pairStore.hasPendingChanges && relay) {
         pairStore.save(relay.conversations.snapshot(), clock.now())
@@ -405,7 +483,34 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // 判断「中继那边攒了多少待配对条目」的唯一依据 —— 涨着就说明不了任何事。
       // `prune()` 早就写好了，只是**一直没有调用方**（`grep -rn 'prune()'` 只命中定义）。
       slots.prune()
+    }
+    status.start(() => {
+      housekeeping()
       return state()
+    })
+    /**
+     * **快照关掉时自己起一节拍**（同上那条纪律的另一半）。
+     *
+     * 刻意不塞进 `StatusFile`：那一类只管"把状态写到盘上"，让它顺带驱动剪枝与补码，
+     * 就等于让"写不写排错文件"决定了"密钥簿剪不剪"。这里另起一只，
+     * `stop()` 里与 `status.stop()` 一起收。
+     */
+    let housekeepingTimer: unknown
+    if (!config.statusFile) {
+      const tickHousekeeping = (): void => {
+        // 先续期再干活：housekeeping 里任何一处抛出都不该让这条节拍断掉
+        // （断了就等于回到"再也不会剪枝"的那个状态，而且没有任何日志）。
+        housekeepingTimer = clock.setTimeout(tickHousekeeping, STATUS_REFRESH_MS)
+        try {
+          housekeeping()
+        } catch (error) {
+          log('housekeeping tick failed', { message: String((error as Error)?.message ?? error).slice(0, 160) })
+        }
+      }
+      housekeepingTimer = clock.setTimeout(tickHousekeeping, STATUS_REFRESH_MS)
+    }
+    stopHooks.push(() => {
+      if (housekeepingTimer !== undefined) clock.clearTimeout(housekeepingTimer)
     })
   }
 
@@ -1202,6 +1307,13 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>): Runtime
       // pill 那四条路由也要一起收：它是不在主链路上的旁路，所以单独一句。
       pillRoutes?.stop()
       status.stop()
+      for (const hook of stopHooks) {
+        try {
+          hook()
+        } catch {
+          /* 停机动作不许拖住停机 */
+        }
+      }
       // **停机时补一次落盘**：正常关机是唯一能保证"3 秒 tick 之前那几秒的改动也写下去"的时机。
       // 只在有脏数据时写（`save` 内部也会因空文件路径直接返回）。
       if (pairStoreFile && relay && pairStore.hasPendingChanges) {

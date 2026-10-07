@@ -257,8 +257,13 @@ export interface KernelPort {
    *
    * 成功时返回**主机分配**的 id。刻意不接受标题：命名是主机那一侧的事
    * （创建时不传 sessionId 由内核分配，不传 cwd 就用默认项目目录）。
+   *
+   * `args.workspace` 是手机指明的工作区目录（**目录绝对路径**，与
+   * `SessionSummary.workspace` 同一个字符串、逐字透传）。缺省 = 由实现自己推断
+   * （配置 → 最近活动的会话 → 宿主默认）。它来自手机，是**不可信输入**，
+   * 所以形状校验（绝对路径 / 长度 / 非 Windows 形状）属于实现，端口不收未校验的值。
    */
-  newSession?(): Promise<{ ok: boolean; sessionId?: string; message?: string }>
+  newSession?(args?: { workspace?: string }): Promise<{ ok: boolean; sessionId?: string; message?: string }>
 
   /** 订阅会话事件；返回退订函数。实现必须拒绝订阅 waterfall（见 guard.ts）。 */
   subscribe(onEvent: (event: KernelEvent) => void): () => void

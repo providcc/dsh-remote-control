@@ -387,13 +387,14 @@ export class HostRuntime {
             reply(false, { message: '主机这一代不支持新建会话（内核端口没有 newSession 能力）' })
             return
           }
-          // ⚠️ 这里**不读** `cmd.workspace`（手机指明分组）：该字段在 `dsh-remote-protocol` 里已加
-          // （可选、向后兼容），但插件按精确版本钉着 npm 上的 `dsh-remote-wire`，那份还没发版，
-          // 而 `parseCmdPayload` 会把不认识的键 strip 掉。所以**在 wire 发版 + 改钉之前，
-          // 这里读到的永远是 undefined**——与其写一段读不到值的代码，不如先由主机自己推断
-          // （见 carrier-services 的 newSession：最后操作过的会话 → 往前扫带 cwd 的会话）。
-          // 发版后的接线顺序见 HANDOFF §0「新建会话落点」。
-          const made = await create.call(this.kernel)
+          // 手机指明的工作区（可选）：`cmd.new_session.workspace`。
+          // 这一段曾经**刻意不写**：那时插件钉的是还没发版的 wire，
+          // 而 `parseCmdPayload` 会把不认识的键 strip 掉 —— 写出来的是一段
+          // 永远读到 `undefined` 的代码。现在钉的是 2.0.14，字段在 schema 里，
+          // 所以 `cmd.workspace` 拿得到值，接线成立（发版与钉的顺序见 HANDOFF §0.10.4）。
+          // 老手机不发这个字段 → 载体自己推断（配置 → 最近活动的会话 → 宿主默认），
+          // 行为与接线之前完全一致。
+          const made = await create.call(this.kernel, cmd.workspace ? { workspace: cmd.workspace } : undefined)
           if (!made.ok || !made.sessionId) {
             reply(false, { message: made.message ?? '新建会话失败' })
             return
