@@ -5,45 +5,81 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
-## [1.0.0-rc.1] - 2026-10-06
+## [2.0.15] - 2026-10-07
 
-> **首个开源候选版。** 四仓统一用这一个版本号；此前的 2.0.x 是私有期编号。
+串行深审一轮（四个分片并行逐行读完约 1.2 万行源码 + 判据）的产出。**八处修复全部先红后绿，
+且逐个做过变异验证**；其中两处第一版判据恒真，被变异当场抓住后重写（详见提交说明）。
 
-### 新增：会话状态接上 `awaiting-permission` / `awaiting-answer`
+### 修复
 
-协议里这两个状态一直有、小程序的「等你处理」区与「待审批/待回答」徽标也只认这两个
-字符串，而这里只产出 `archived | running | idle` —— 真机上那个区**永远不出现**
-（e2e 是自造状态喂进去的，测试绿、真机空）。现在由 runtime 的挂起表经 index.ts 注入
-给 carrier；审批优先于提问（180s vs 300s）。
+- **浏览器面倒计时不再漂移**：原来那一行是 `expiresInMs -= 1000`，而用户点开发码面板
+  之后必然要切走去手机上扫码 —— 那个窗口正是计时器最不可靠的时候（Chrome 对隐藏页
+  intensive throttling 一分钟一醒、Electron 冻不可见窗口、合盖直接停摆）。回来还写着
+  "2 分 5 秒后过期"而那张码两分钟前就死了，用户扫的是一个显示上"还活着"的死码。
+  改为按墙钟重算 + `visibilitychange` 那一拍当场补上欠账。
+  **这正是 2026-10-05 现场报的那件事，倒计时本来就是为了治它。**
+- **`POST /unpair` 的回答不再被整个丢掉**：`routes.ts` 的 403 回答里**专门**带 `guard`，
+  注释写着"屏幕上那句话就是唯一的现场"，而退出配对这条路裸 `await` ——
+  403 不会让 fetch 抛错，于是那句现场一句都留不下，而面板已经乐观地把 `paired` 清零。
+- **配对码不再原样进 stdout**：`log('pair-ready for an unknown token', { token })`
+  是 §0.10.7 那条纪律漏掉的第四个调用点，而这条路径**可达**（`slots.prune()` 剔掉
+  过期槽之后，中继才把 pair-ready 送回来的那张就正好"不认识"了）。
+- **`voidConversation` 改为先发再记账**：原来 `voided.add()` 在 `raw()` 之前，
+  而 `raw()` 对非 OPEN 的 socket 静默 false（中继抖一下，退避最长 30 秒以上）。
+  于是这一帧没发出去、通道却已被标成"声明过了"，此后任何重试都被挡住 ——
+  包括设计上明确依赖的 `onEncrypted` → 再作废一次那条路。
+- **出站帧恢复体积闸**：`encToClient` 是协议层唯一执行 `MAX_CIPHERTEXT_BYTES` 的地方，
+  而主机原来手拼 `{t:'enc',…}`，这条路上一个闸都没有。超限的后果不是"这帧没了"：
+  中继回 `error{bad_frame}`，而插件对 `error` 只记日志 —— 手机走完 15 秒超时留下一句
+  "读不到"。顺带把 `lastActivityAt` 挪到闸门之后（一条注定发不出去的帧不该把通道"用活"）。
+- **关掉状态快照不再顺手关掉三件与排错无关的事**：剪枝 / 配对码自动换代 / PSK 簿批量落盘
+  全都寄生在 `status.start()` 的回调里，而 `StatusFile.start` 在没有文件时直接 return。
+  `statusFile: ''` 是**有文档**的开关，于是那台主机同时失去了通道剪枝
+  （全仓唯一的 `pruneStale()` 调用方 → 密钥簿重新变回无界，`MAX_CONVERSATIONS` 与两条
+  TTL 形同虚设）。**没有任何提示。**
+- **两个"写了不报错、不告警、不生效"的配置**：`statusFile` 相对路径按宿主 CWD 解析
+  （GUI 宿主上是 `/`）→ **唯一排错入口静默消失**；`maxFileBytes` 调过整批预算不会生效，
+  而报错还会让只带了一个文件的用户"少带几个"。
+- **写到一半失败不再留一批孤儿文件**：`writeFileSync` 中途抛（ENOSPC/EACCES）时，
+  已落盘的 1~3 个文件留着，重试一次文件名就变成 `first-2.txt`、`first-3.txt`……一直涨。
 
-### 修复（rc1 前逐行审计的产出，每条都有判据在旧代码上验过会红）
+### 新增
 
-- **真 cordis ctx 上 `typeof ctx.off === 'function'` 会抛错**（get trap），把 sessions
-  那条 inject 回调整段打断——真机 `status.json` 里已经复现，只是被下一个回调侥幸救回。
-- **on/off 绑定移出 accept + 支持 on 晚到补订阅**：原来若宿主在 apply 时就能
-  `ctx.get('sessions')`，内核会在任何 inject 回调之前启动，带恢复会话时 subscribe 读到
-  `services.on === undefined` 就**永久关闭流式**（无重试，而 `describe()` 现读 `hasOn`
-  显示 true 掩盖真相）。
-- **附件总量闸**：主机原来只卡单文件 512KB，schema 允许 4 个 → 最坏约 2.7MB 进一帧，
-  超中继 1MB 就是 socket 1009 断开（不合规客户端能掐断主机自己的中继连接）。
-- **平台已 abort 的审批/提问当场结算**：`addEventListener('abort')` 对**已经 abort** 的
-  signal 永不触发，于是卡照发、锁照挂，整个超时窗口（180/300 秒）手机上是可点的死卡。
-- **`pushSessions` 全程 try/catch + 调用点 catch**：原来 13 处 `void` 调用任一处抛出即
-  未捕获 rejection（Node≥15 默认终止进程），违反"绝不带崩宿主"。
-- 结算校验 `item.kind`（跨类 requestId 原来会串类结算且回 ok:true）；审批决定改白名单
-  （只认 `approve`）——原来是 fail-open，未知词一律**放行**；`stop()` 收卡；挂锁改
-  `finally` 配对；`start()` 两步都成功才置位；模型补发只与列表求交。
-- 落盘与权限：`status.json` 补 `chmod 0600`（那个文件在开启动发码时含有效配对码+PSK）；
-  pair-store 写失败保持脏标记（原来 PSK 会静默不落盘且永不重试）；`pairTtlMs` 折 Infinity；
-  死配置键 `carrierGraceMs` 删除；`pair-fail` 接线（换码退避）。
-- 浏览器面：倒计时不再每秒重建二维码页（每秒重编码一张 QR）；首帧 `/status` 未落地时
-  点开面板**不发码**（原来已配对的主机也会被发一张新码）；`/status` 非 200 留 warn；
-  轮询加超时与 in-flight 守卫；注入样式补 `data-plugin`（会被宿主 HMR 当成别人的删掉）；
-  配对码不再进 stdout 日志；跨站 Origin 白名单化。
-- 文档口径对齐（`uploadDir` 默认值、`maxImageBytes` 其实是 `maxFileBytes`、
-  `status.json` 的 pairing 与 `pairOnStartSec` 无关等）。
+- **`cmd.new_session.workspace` 接线**（HANDOFF §0.10.4 的第 3 步，阻塞条件已解除）：
+  字段在 `dsh-remote-wire@2.0.14` 的 schema 里、钉也已经跟上，而主机一直没读它 ——
+  手机指定了分组，会话建在主机自己推断的目录里，回执照样 `ok:true`，**无错、无日志、
+  手机上完全看不出**。现在：端口接 `args.workspace`；载体多一级取值
+  （`⓪ 手机指明的工作区`，排在运维配置那一句钉之上 —— 那句钉是"手机没说话时的默认"，
+  而用户这一次是明确说了）；仍然过 `badWorkspace()`，形状不合法就**明确失败而不是静默改道**。
+  老手机不带这个字段 → 载体自己推断，行为与接线之前完全一致。
+- **限速退避换掉一个恒真的死分支**：`onPairFail` 里写的是 `if (reason !== 'rate_limited')`，
+  而 `pair-fail.reason` 的四个取值里**没有** `rate_limited`（中继把配对限流折成
+  `invalid_or_expired`）—— 实测 `parseRelayFrameText` 对它返回 `null`。那个分支读起来像
+  "限速时我们会克制一下"，实际上从不克制；而自动补码撞上限流是一条会**自我加速**的循环
+  （被拒 → 补一张 → 再被拒 → 再补）。真正的信号 `error{code:'rate_limited'}` 此前只被记进日志，
+  主机从不按 `code` 分支。现在它开一个退避窗口，窗口内不自动补码（用户点「刷新」仍随时可以）。
 
-判据：410 → **448** 条。
+判据：471 → **490**。
+
+## [2.0.14] - 2026-10-07
+
+> 与 `dsh-remote-wire@2.0.14` 同一发版；依赖钉从 `1.0.0-rc.1` 跟着换成 `2.0.14`。
+
+### 修复
+
+- **待办双端一致**：手机不许把上一轮的清单说成"此刻在做什么"。宿主那一侧的待办是
+  **按轮**清的（上一轮写过、这一轮没写，它就是空的），而内核不会为"这一轮没有待办"
+  专门发一帧 `todo/write`，于是手机上留着上一轮的清单 —— 用户看到一件**没在发生的事**。
+  现在新一轮开始时补一帧空快照（且只在上一轮确实有过清单时才补）。
+- **`updatedAt` 不再是创建时刻**：它一直是 `createdAt`，而手机管它叫"最后消息时间"。
+- **日志值的长度上界**：`message:` 三处一个都没截断，而它们旁边的 `slice(0,120/200)`
+  说明作者知道要截。抽出 `shell/log-line.ts` 纯函数。
+- **新建会话不再落在未分组**（三级取值：配置钉 → 最后操作过的那条会话 → 往前扫）；
+  切帧不劈代理对（emoji 的代理对被硬切成两半 → 两片各带一个孤立代理出站，
+  表情凭空消失且没有任何一层报错）；配对码不进 info 日志。
+- **带图请求不许被悄悄降级成纯文本**：手机说发了 N 张图却一张都送不出数据时整条失败。
+
+判据：448 → 471。
 
 ## [2.0.13] - 2026-10-06
 
@@ -695,7 +731,9 @@ bundle，不直接 import 那个纯函数）**、**`waiting` 缺席（老版宿�
 - 发布产物收窄为 `dist/bundle` + `cordis.patch.yml`。`exports` 只指向自包含单文件，
   之前 tarball 里的 `dist/src`、`dist/tests`（约 90 个文件、449 KB）全是消费方拿不到的东西。
 
-[未发布]: https://github.com/providcc/dsh-remote-control/compare/v2.0.10...HEAD
+[未发布]: https://github.com/providcc/dsh-remote-control/compare/v2.0.15...HEAD
+[2.0.15]: https://github.com/providcc/dsh-remote-control/compare/v2.0.14...v2.0.15
+[2.0.14]: https://github.com/providcc/dsh-remote-control/compare/v2.0.13...v2.0.14
 [2.0.10]: https://github.com/providcc/dsh-remote-control/compare/v2.0.9...v2.0.10
 [2.0.9]: https://github.com/providcc/dsh-remote-control/compare/v2.0.7...v2.0.9
 [2.0.7]: https://github.com/providcc/dsh-remote-control/compare/v2.0.6...v2.0.7
@@ -704,6 +742,49 @@ bundle，不直接 import 那个纯函数）**、**`waiting` 缺席（老版宿�
 [1.2.0]: https://github.com/providcc/dsh-remote-control/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/providcc/dsh-remote-control/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/providcc/dsh-remote-control/releases/tag/v1.0.0
+
+## [1.0.0-rc.1] - 2026-10-06
+
+> **首个开源候选版。** 四仓统一用这一个版本号；此前的 2.0.x 是私有期编号。
+>
+> ⚠️ 它的**版本号小于**上面的 2.0.x（`1.0.0-rc.1 < 2.0.0`），所以按 semver 排在**下面**。
+> 那一轮它被放在文件最上面 —— 读的人会以为 rc1 才是最新一版，而它其实是最旧的一版。
+
+### 新增：会话状态接上 `awaiting-permission` / `awaiting-answer`
+
+协议里这两个状态一直有、小程序的「等你处理」区与「待审批/待回答」徽标也只认这两个
+字符串，而这里只产出 `archived | running | idle` —— 真机上那个区**永远不出现**
+（e2e 是自造状态喂进去的，测试绿、真机空）。现在由 runtime 的挂起表经 index.ts 注入
+给 carrier；审批优先于提问（180s vs 300s）。
+
+### 修复（rc1 前逐行审计的产出，每条都有判据在旧代码上验过会红）
+
+- **真 cordis ctx 上 `typeof ctx.off === 'function'` 会抛错**（get trap），把 sessions
+  那条 inject 回调整段打断——真机 `status.json` 里已经复现，只是被下一个回调侥幸救回。
+- **on/off 绑定移出 accept + 支持 on 晚到补订阅**：原来若宿主在 apply 时就能
+  `ctx.get('sessions')`，内核会在任何 inject 回调之前启动，带恢复会话时 subscribe 读到
+  `services.on === undefined` 就**永久关闭流式**（无重试，而 `describe()` 现读 `hasOn`
+  显示 true 掩盖真相）。
+- **附件总量闸**：主机原来只卡单文件 512KB，schema 允许 4 个 → 最坏约 2.7MB 进一帧，
+  超中继 1MB 就是 socket 1009 断开（不合规客户端能掐断主机自己的中继连接）。
+- **平台已 abort 的审批/提问当场结算**：`addEventListener('abort')` 对**已经 abort** 的
+  signal 永不触发，于是卡照发、锁照挂，整个超时窗口（180/300 秒）手机上是可点的死卡。
+- **`pushSessions` 全程 try/catch + 调用点 catch**：原来 13 处 `void` 调用任一处抛出即
+  未捕获 rejection（Node≥15 默认终止进程），违反"绝不带崩宿主"。
+- 结算校验 `item.kind`（跨类 requestId 原来会串类结算且回 ok:true）；审批决定改白名单
+  （只认 `approve`）——原来是 fail-open，未知词一律**放行**；`stop()` 收卡；挂锁改
+  `finally` 配对；`start()` 两步都成功才置位；模型补发只与列表求交。
+- 落盘与权限：`status.json` 补 `chmod 0600`（那个文件在开启动发码时含有效配对码+PSK）；
+  pair-store 写失败保持脏标记（原来 PSK 会静默不落盘且永不重试）；`pairTtlMs` 折 Infinity；
+  死配置键 `carrierGraceMs` 删除；`pair-fail` 接线（换码退避）。
+- 浏览器面：倒计时不再每秒重建二维码页（每秒重编码一张 QR）；首帧 `/status` 未落地时
+  点开面板**不发码**（原来已配对的主机也会被发一张新码）；`/status` 非 200 留 warn；
+  轮询加超时与 in-flight 守卫；注入样式补 `data-plugin`（会被宿主 HMR 当成别人的删掉）；
+  配对码不再进 stdout 日志；跨站 Origin 白名单化。
+- 文档口径对齐（`uploadDir` 默认值、`maxImageBytes` 其实是 `maxFileBytes`、
+  `status.json` 的 pairing 与 `pairOnStartSec` 无关等）。
+
+判据：410 → **448** 条。
 
 ## [1.0.0] - 2026-10-03
 
