@@ -2102,3 +2102,59 @@ test('runState 也报同一个状态（它与列表必须一致）', async () =>
   const kernel = f.kernel(sessionsWith('ses_a', true))
   assert.equal((await kernel.runState('ses_a')).state, 'awaiting-permission')
 })
+
+test('会话摘要的 updatedAt 是**最后活动时刻**，不是创建时刻（2026-10-06 审计）', async () => {
+  // `ev.session_history` / 手机会话列表一直取的是 `ListedSession.headerTime`，而那个值是
+  // 内核会话头的 **createdAt**。后果有两条，且都用户可见：
+  //   - mp 的 `sessionRank` 注释管它叫"最后消息时间"，于是三天前建、今天刚用过的会话
+  //     排在自己分组的最下面；
+  //   - `formatTime` 显示的也是创建时间，而它对今天的显示 `HH:mm`、对更早的显示日期，
+  //     读起来就是"我刚用过它，却显示成三天前"。
+  //
+  // 主机本来就有这个信号且一直在收：任何一条 `session/event` 都经过 translateSessionEvent。
+  const CREATED = 1_700_000_000_000
+  const f = fixture()
+  const services = f.bundle({ live: true })
+  services.sessionQuery = {
+    listSessions: () =>
+      Promise.resolve([
+        { header: { id: 'ses_old', createdAt: CREATED, cwd: '/w/p' } },
+        { header: { id: 'ses_idle', createdAt: CREATED + 10_000, cwd: '/w/p' } },
+      ]),
+  }
+  const listeners: Record<string, (...args: unknown[]) => void> = {}
+  services.on = (name: string, listener: (...args: unknown[]) => void) => {
+    listeners[name] = listener
+    return () => {}
+  }
+  // 自建时钟而不是用夹具那份：夹具的 FakeClock 从 0 起，记下来的"最后活动时刻"会是 0，
+  // 而 `iso()` 对 0 返回 undefined —— 那正是"不要编造时刻"的既定行为，反而让这条判据测不到。
+  const clock = new FakeClock()
+  await clock.advance(CREATED + 60_000)
+  const kernel = createServicesKernel(services, { clock, log: () => {} })
+  kernel.subscribe(() => {})
+
+  // 只在 ses_idle 上发一条事件：它"最后活动"得更晚，但**创建**得更早。
+  listeners['session/event']?.(
+    { id: 'ses_idle' },
+    { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '跑一下' }], role: 'user', id: 'u-1' } },
+  )
+
+  const rows = await kernel.listSessions(50)
+  const idle = rows.find((r) => r.summary.id === 'ses_idle')
+  assert.ok(idle, '夹具自检：列表里要有 ses_idle')
+  assert.ok(idle.summary.updatedAt, '这条刚有事件，updatedAt 不该是空的')
+  assert.ok(
+    Date.parse(String(idle.summary.updatedAt)) > CREATED + 10_000,
+    `updatedAt 仍是创建时刻（${String(idle.summary.updatedAt)} vs createdAt=${CREATED + 10_000}）：` +
+      '手机会把它排成"最后消息时间"，而实际排的是创建时间',
+  )
+
+  // 没有活动的会话不能被编一个时刻出来——它是 undefined，而不是 createdAt。
+  const old = rows.find((r) => r.summary.id === 'ses_old')
+  assert.equal(
+    old?.summary.updatedAt,
+    undefined,
+    '从没见过活动的会话不该凭空多一个 updatedAt：那是它**创建**的时刻，不是我们知道的事实',
+  )
+})

@@ -276,6 +276,24 @@ export function createServicesKernel(services: ServicesBundle, options: Services
    * 不合并的话，用户新建完回到列表会发现那条会话不在里面。
    */
   const freshSessions = new Map<string, ListedSession>()
+  /**
+   * 每条会话**最后被活动过**的时刻（毫秒）。
+   *
+   * 为什么单开一张表（2026-10-06 审计）：`ev.session_history.updatedAt` 与手机会话列表
+   * 的排序一直取的是 `ListedSession.headerTime`，而那个值是内核会话头的 **createdAt**——
+   * 于是：
+   *   - 手机上那条"最后消息时间"排出来的是**创建时间**，一条三天前建、今天刚用过的会话
+   *     会排在自己分组的最下面（mp 的 `sessionRank` 注释把它称作"最后消息时间"）；
+   *   - 显示出来的时间也是创建时间，而 `formatTime` 对今天的显示 `HH:mm`、对更早的
+   *     显示日期，读起来就是"我刚用过它，却显示成三天前"。
+   *
+   * 主机本来就有这个信号且一直在收：任何一条 `session/event` 都经过
+   * `translateSessionEvent`。把那一刻记下来，`updatedAt` 就成了它字面意思。
+   *
+   * **退化成 createdAt 而不是留空**：进程刚起来、还没收到任何事件时表是空的，
+   * 那时仍按旧口径给 `headerTime`，所以重启前后不会出现"整页时间消失"。
+   */
+  const lastActivityAt = new Map<string, number>()
 
   /**
    * 「最后操作的那个会话」与它的目录（2026-10-06 用户："新建要落在最后操作的分组里"）。
@@ -436,7 +454,11 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     const cached = titleCache.get(record.id)
     const running = agentStatus(record.id) === 'running'
     const state = sessionState(record.id, running, archived)
-    const updatedAt = cached ? iso(record.headerTime) : undefined
+    const activity = lastActivityAt.get(record.id)
+    // 见过活动就用它；没见过就退回旧口径（创建时间），而"连标题都还没看到"的会话仍然
+    // 不给 updatedAt —— 手机对 undefined 与 ISO 串的处理是分开的（`formatTime` 返回空串），
+    // 别把一个我们并不知道的时刻编出来。
+    const updatedAt = activity !== undefined ? iso(activity) : cached ? iso(record.headerTime) : undefined
     return {
       id: record.id,
       state,
@@ -1231,6 +1253,8 @@ export function createServicesKernel(services: ServicesBundle, options: Services
     // "最后操作的会话"：任何一条事件都算（哪怕它随后被 INTENTIONAL_DROPS 丢掉、
     // 或者是一条我们不翻译的类型）——用户确实在那条会话里干了活，这就是我们要的信号。
     lastTouchedSessionId = sessionId
+    // 同理，"最后活动时刻"记的是**用户动过**，不是"这条会话有多新"。
+    lastActivityAt.set(sessionId, options.clock.now())
     const data = (event?.data ?? {}) as LooseObject
     // 审批的审计面对象：`asked` 带 toolName，`decided` 带 outcome。这里只记账不翻译——
     // 卡片本身走 `approval/request` 那条 waterfall，见 attachInteractionSink。
