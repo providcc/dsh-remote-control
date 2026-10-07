@@ -335,6 +335,10 @@ function applyInner(ctx: LooseContext, injected: Partial<PluginConfig>, clock: C
       },
       onConversationGone: (conversationId) => log('conversation gone', { conversationId }),
       onCommand: (conversationId, cmd: CmdPayload) => void runtime?.handleCommand(cmd, conversationId).catch(() => {}),
+      // 形状不对的载荷：**必须有人回一条**，否则手机那头是干等 12 秒的超时
+      // 而真正的根因只在主机日志里（见 `runtime.handleInvalidCommand` 的头注）。
+      onInvalidCommand: (conversationId, cmdId, payloadType) =>
+        runtime?.handleInvalidCommand(conversationId, cmdId, payloadType),
       onState: (info) => {
         lastRelayState = info.relay
         lastRelayProblem = info.problem

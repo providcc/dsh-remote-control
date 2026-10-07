@@ -58,6 +58,27 @@ export interface RelayClientOptions {
   log: (message: string, fields?: Record<string, string | number | boolean | undefined>) => void
   /** 解出一条命令（已经过 MAC 校验）。 */
   onCommand: (conversationId: string, cmd: CmdPayload, clientId?: string) => void
+  /**
+   * 一条**解得开、但形状过不了 schema** 的指令（2026-10-07 补）。
+   *
+   * ## 这为什么必须是一个单独的出口
+   *
+   * 手机发出去的是**加密**的：它在那一端是能过 schema 的（否则 `sendCmd` 自己就拒了）。
+   * 所以"到主机这边过不去"只可能是两端协议版本不一致——最典型的场景是手机把一个
+   * 新字段（例如超长的 `mediaType`）或一个主机这一代还没发版的命令送了过来。
+   *
+   * 从前这一路只写一行日志就 `continue`，后果是：**手机干等满 12 秒**的
+   * `COMMAND_TIMEOUT_MS`，然后拿到一句「主机没有回应这条指令」——而根因一个字都没留下。
+   * 用户与日志里都没有"哪条指令被拒了"这句话，只能靠猜（§5-9）。
+   *
+   * 有了这个出口，主机能按 `cmdId` 回一条 `ev.result{ok:false}`，
+   * 手机那一端立刻拿到可读的原因，而不是等超时。
+   *
+   * 只有**拿到了 `cmdId`** 才可能回执（回执按 cmdId 结算，见 `client.js` 的 `_cmdWaiters`），
+   * 所以 `cmdId` 是 `string | undefined`：没有它时调用方只能记日志，这无可奈何——
+   * 那也是为什么协议要求每条 `cmd.*` 都带 `cmdId`。
+   */
+  onInvalidCommand?: (conversationId: string, cmdId: string | undefined, payloadType: string) => void
   /** 一条新配对建立：调用方要立刻把会话与防休眠状态推过去。 */
   onPeerJoined: (conversationId: string, pairingToken: string | undefined) => void
   /** 一条配对通道被彻底作废（本端解不开、或本端主动声明它没人接了）。 */
@@ -587,16 +608,29 @@ export class RelayClient {
         this.noteUndecryptable(frame.sessionId)
         continue
       }
+      /**
+       * **MAC 过了就算这条会话有活动**，与它后面过不过 schema 无关（2026-10-07 挪到这）。
+       *
+       * 原来 `decryptedAny` 记在 schema 通过之后，于是"解得开但形状不对"的帧不会更新
+       * `lastActivityAt` —— 那条会话会被剪枝判成闲置。而活动的定义是"这端有人在说话"，
+       * 一条真实配对客户端发来的、我们能解的帧当然算；它形状不对是**协议版本**的事，
+       * 不是"没人理这条通道"的事。
+       * 攻击面也没变化：能产出这种帧的人必须先拿到 PSK。
+       */
       // MAC 过了不等于形状对。`onCommand` 下游是 `switch (cmd.t)` + 真实内核调用，
       // 把未校验的对象直接递下去 = 让手机用一条密文决定宿主被怎么调用。
+      decryptedAny = true
       const cmd = parseCmdPayload(decrypted)
       if (!cmd) {
         const name =
           typeof (decrypted as { t?: unknown }).t === 'string' ? String((decrypted as { t?: unknown }).t) : '?'
+        const cmdId = (decrypted as { cmdId?: unknown }).cmdId
         this.options.log('inbound payload failed cmd schema', { sessionId: frame.sessionId, t: name })
+        // 交出去而不是只记日志：没有这一条，手机那边就是干等 12 秒再报
+        // 「主机没有回应」，而根因只活在主机的日志里。
+        this.options.onInvalidCommand?.(frame.sessionId, typeof cmdId === 'string' ? cmdId : undefined, name)
         continue
       }
-      decryptedAny = true
       this.options.onCommand(frame.sessionId, cmd, (frame as { clientId?: string }).clientId)
     }
     // 有实际收发就不算"闲置"：剪枝看的是最后活动时刻，不是创建时刻。

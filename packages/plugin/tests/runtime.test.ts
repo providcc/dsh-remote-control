@@ -2744,3 +2744,83 @@ test('停机不重置台账（重发跨越一次 stop/start 仍不该执行第�
 
   assert.equal(kernel.calls.sendPrompt.length, 1, '跨 stop/start 的重发又执行了一遍')
 })
+
+/**
+ * 形状过不了 schema 的载荷：主机**必须回一条**（2026-10-07 补，§5-9）。
+ *
+ * 手机在它那一端是过得了 schema 的，所以"到主机这边过不去"只可能意味着两端版本不一致。
+ * 从前这一路只写一行日志就 `continue`，于是手机干等满 12 秒的 `COMMAND_TIMEOUT_MS`
+ * 再拿到一句「主机没有回应这条指令」——**根因一个字都没留下**。
+ */
+test('主机认不出的指令：按 cmdId 回 ev.result{ok:false}，并说清该怎么办', async () => {
+  const { runtime, transport } = fixture()
+  transport.pair('c_000000000001')
+
+  // ① 主机这一代**根本没有**这个命令（将来手机先升级、主机没跟上的形状）。
+  runtime.handleInvalidCommand('c_000000000001', 'cmd_future', 'cmd.archive_session')
+  // ② 命令名认识、**字段**过不去（最典型：mediaType 超过 schema 的 64 上界）。
+  runtime.handleInvalidCommand('c_000000000001', 'cmd_shape', PAYLOAD_TYPES.cmdSendPrompt)
+
+  const results = transport.resultReplies()
+  const [unknownCommand, badShape] = results
+  assert.equal(results.length, 2, '两处都必须回执：不回 = 手机端只剩 12 秒超时，根因只活在主机日志里')
+  assert.ok(unknownCommand && badShape, '夹具自检：两条回执都必须取得到')
+
+  assert.equal(unknownCommand.cmdId, 'cmd_future', 'cmdId 必须原样带回去（手机按它结算 waiter）')
+  assert.equal(unknownCommand.ok, false)
+  assert.match(String(unknownCommand.message), /主机这一代不支持/, '没发版的命令要说"插件太旧"，而不是笼统地失败')
+  assert.match(String(unknownCommand.message), /升到最新版/, '必须给出可执行的下一步，而不只是"失败了"')
+
+  assert.equal(badShape.cmdId, 'cmd_shape')
+  assert.equal(badShape.ok, false)
+  assert.match(
+    String(badShape.message),
+    /协议版本不一致/,
+    '同一句失败对"命令不存在"与"字段不认识"必须能分开——那是两种完全不同的排错方向',
+  )
+  assert.match(String(badShape.message), /升到最新版/, '同上：给可执行的下一步')
+  // 这条 message 是**直接 toast 给用户**的（ev.result.ok:false → chat 页弹它），
+  // 所以至少要有一句中文在解释"该做什么"；主机那边抛了什么留在日志里。
+  for (const result of results) {
+    assert.match(String(result.message), /[一-龥]/, `message 必须是能直接给用户看的中文：${String(result.message)}`)
+  }
+})
+
+test('没有 cmdId 时只能留日志：不许造一个假回执去结算手机上别的等待', async () => {
+  const { runtime, transport, logs } = fixture()
+  transport.pair('c_000000000001')
+
+  runtime.handleInvalidCommand('c_000000000001', undefined, 'cmd.future_thing')
+
+  assert.equal(
+    transport.resultReplies().length,
+    0,
+    '没有 cmdId 就无从回执；编一个出来会把手机上某一条**别的**等待误结算',
+  )
+  assert.ok(
+    logs.some((line) => line.includes('unanswerable command rejected')),
+    '这一档必须留痕：否则"手机点了没反应"连日志里都没有答案',
+  )
+})
+
+test('被拒的指令**不许**进台账：没做过的事不许记成"已执行"，真命令来时照常执行', async () => {
+  const { runtime, transport } = fixture()
+  transport.pair('c_000000000001')
+
+  // 同一个 cmdId 先被拒一次（形状不对）。
+  runtime.handleInvalidCommand('c_000000000001', 'cmd_shared', PAYLOAD_TYPES.cmdListSessions)
+  transport.replies.length = 0
+
+  // 同一个 cmdId 再来一条**合法**的命令：它必须真的执行，而不是被当成重发回放。
+  await runtime.handleCommand(cmd(PAYLOAD_TYPES.cmdListSessions, { cmdId: 'cmd_shared' } as never), 'c_000000000001')
+
+  const results = transport.resultReplies()
+  const [executed] = results
+  assert.ok(results.length === 1 && executed, `这条命令本身必须回执（实际 ${results.length} 条）`)
+  assert.equal(executed.ok, true, '被拒的那次把 cmdId 记进了台账 ⇒ 这条真命令被当成"已执行过"直接回放')
+  assert.doesNotMatch(
+    String(executed.message),
+    /已执行过/,
+    '拒收与执行是两条路：把"没做过的事"记进"已执行"的台账是撒谎',
+  )
+})

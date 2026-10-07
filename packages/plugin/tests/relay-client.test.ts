@@ -86,6 +86,8 @@ interface Harness {
   readonly gone: string[]
   readonly left: Array<{ conversationId: string; clientId: string }>
   readonly commands: Array<{ conversationId: string; cmd: CmdPayload; clientId?: string }>
+  /** 解得开但形状过不了 schema 的载荷：主机**必须**按 cmdId 回一条（见 §5-9 的修）。 */
+  readonly invalid: Array<{ conversationId: string; cmdId: string | undefined; payloadType: string }>
   readonly states: Array<{ relay: string; problem?: string; conversations: number; generation: number }>
   /** 会话簿**结构性**变化（新配对 / 作废）的次数：落盘由它驱动。 */
   readonly structural: number[]
@@ -100,6 +102,7 @@ function harness(): Harness {
   const gone: Harness['gone'] = []
   const left: Harness['left'] = []
   const commands: Harness['commands'] = []
+  const invalid: Harness['invalid'] = []
   const states: Harness['states'] = []
   const structural: number[] = []
   const logs: string[] = []
@@ -114,6 +117,9 @@ function harness(): Harness {
     },
     onCommand: (conversationId, cmd, clientId) => {
       commands.push({ conversationId, cmd, ...(clientId === undefined ? {} : { clientId }) })
+    },
+    onInvalidCommand: (conversationId, cmdId, payloadType) => {
+      invalid.push({ conversationId, cmdId, payloadType })
     },
     onPeerJoined: (conversationId, pairingToken) => joined.push({ conversationId, token: pairingToken }),
     onConversationGone: (conversationId) => gone.push(conversationId),
@@ -142,6 +148,7 @@ function harness(): Harness {
     gone,
     left,
     commands,
+    invalid,
     states,
     structural,
     logs,
@@ -277,7 +284,7 @@ test('上行命令用同一张码的 c2h 密钥解密并交给 runtime（两把�
 })
 
 test('MAC 校验通过但载荷不是任何一条已定义命令：不进 runtime，也不许攒成"解不开两次就作废"', () => {
-  const { client, slots, feed, commands, logs } = harness()
+  const { client, slots, feed, commands, logs, invalid, clock } = harness()
   const slot = slots.create(120_000)
   feed({ t: 'peer-joined', sessionId: 'c_dtd111222333', clientId: 'k_mp', pairingToken: slot.token })
   const phone = phoneKeys(slot.psk, 'c_dtd111222333')
@@ -298,6 +305,48 @@ test('MAC 校验通过但载荷不是任何一条已定义命令：不进 runtim
     '拒收必须留痕：否则"手机点了没反应"没有答案',
   )
   assert.equal(client.hasClient('c_dtd111222333'), true, '形状错不是密钥错，不该计入"连续两次解不开就作废"')
+
+  /**
+   * **必须交出去回一条**（2026-10-07 补，§5-9）。
+   *
+   * 手机在它那一端是过得了 schema 的（过不了 `sendCmd` 自己就拒了），所以"到主机这边
+   * 过不去"只可能是两端版本不一致。从前这里只写一行日志就 `continue` —— 于是手机干等满
+   * 12 秒的 `COMMAND_TIMEOUT_MS`，拿到一句「主机没有回应这条指令」，而根因一个字都没留下。
+   */
+  assert.deepEqual(
+    invalid,
+    [{ conversationId: 'c_dtd111222333', cmdId: 'x_1', payloadType: 'cmd.drop_everything' }],
+    '形状不对的载荷没有被交出去：手机那一头只剩 12 秒超时，根因只活在主机日志里',
+  )
+  assert.ok(
+    invalid[0]?.cmdId,
+    'cmdId 必须随载荷一起交出去 —— 没有它主机回不了执（回执是按 cmdId 结算的）',
+  )
+
+  /**
+   * 解得开就算这条会话**有活动**，与过不过 schema 无关（同一次修）。
+   *
+   * 原来 `lastActivityAt` 记在 schema 通过之后，于是"解得开但形状不对"的帧不会更新它，
+   * 那条通道会被剪枝判成闲置。而活动的定义是"这端有人在说话"——一条真实配对客户端
+   * 发来的、我们能解的帧当然算；形状不对是**协议版本**的事，不是"没人理这条通道"的事。
+   *
+   * ⚠️ 断言**先把时刻拨回过去**：夹具用的是假时钟（同一 tick 内不前进），直接比
+   * `after >= before` 恒真，那正是本仓库反复踩到的"判据自己骗自己"。
+   */
+  const conversation = client.conversations.get('c_dtd111222333')
+  assert.ok(conversation, '夹具自检：会话必须在场')
+  const stale = clock.now() - 60_000
+  conversation.lastActivityAt = stale
+  feed({
+    t: 'enc',
+    sessionId: 'c_dtd111222333',
+    ciphertext: seal(phone.kC2H, { t: 'cmd.drop_everything', cmdId: 'x_2' } as never).ciphertext,
+  })
+  const after = client.conversations.get('c_dtd111222333')?.lastActivityAt ?? 0
+  assert.ok(
+    after > stale,
+    `形状不对的帧没被算成活动（停在 ${stale}），通道会被剪枝当闲置剪掉`,
+  )
 
   // 同一条通道上的合法命令仍然进得来（这次拒收没有把通道打死）。
   feed({

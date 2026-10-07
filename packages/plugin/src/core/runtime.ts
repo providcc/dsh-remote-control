@@ -19,6 +19,7 @@
  *   由 `outbound.ts` 的构造器产出，参数表里就没有 sessionId。
  */
 import { randomUUID } from 'node:crypto'
+import { isKnownPayloadType } from 'dsh-remote-wire'
 import type {
   AnswerItem,
   CmdPayload,
@@ -543,6 +544,45 @@ export class HostRuntime {
       // cmdId 一定回原值，因为对答靠它匹配。
       reply(false, { message: messageOf(error) })
     }
+  }
+
+  /**
+   * 手机发来一条**解得开、但主机认不出**的指令（2026-10-07 补，
+   * 入口是 `transport/relay.ts` 的 `onInvalidCommand`）。
+   *
+   * ## 为什么要回一条 `ev.result`
+   *
+   * 手机那一端是过得了 schema 的——它有自己那份协议。所以"到主机这边过不去"几乎只意味着
+   * 两端协议版本不一致：最典型的场景是手机把主机这一代还没发版的命令送了过来
+   * （例如将来加的 `cmd.archive_session`），或某个字段超出了 schema 的上界
+   * （实测最容易撞的是 `fileAttachment.mediaType > 64`）。
+   *
+   * 不回执就是这个项目里最贵的那一类故障的形状：手机干等满 12 秒的
+   * `COMMAND_TIMEOUT_MS`，然后拿到一句「主机没有回应这条指令」——**根因一个字都没留下**，
+   * 而真正的那句话（`inbound payload failed cmd schema`）只活在主机的日志里，
+   * 用户那头看得见的只是"点了没反应"。
+   *
+   * ## 为什么刻意不做的两件事
+   *
+   * 1. **不进 `ledger` / `settledReplies`**：这条命令**没有被执行**，把"没做过的事"
+   *    记进"已执行"的台账是撒谎——重发时会回放一个从来没有发生过的结果。它也没被任何
+   *    环节消费过，所以每次收到都照实再回一次是安全的（这与 `handleCommand` 开头那段
+   *    幂等逻辑是**两条路**，别合并）。
+   * 2. **不把英文技术细节原样发给手机**：`message` 是直接 toast 给用户的，
+   *    说的是"你该怎么办"；主机那边具体抛了什么留在日志里（两边都有，不用二选一）。
+   *
+   * 没有 `cmdId` 时**只能记日志**：回执是按 `cmdId` 结算的（`client.js` 的 `_cmdWaiters`），
+   * 造一个假的会把手机上某一条**别的**等待误结算——那比不回执更糟。
+   */
+  handleInvalidCommand(conversationId: string, cmdId: string | undefined, payloadType: string): void {
+    if (!cmdId) {
+      this.log('unanswerable command rejected', { conversationId, t: payloadType })
+      return
+    }
+    const message = isKnownPayloadType(payloadType)
+      ? `主机认不出「${payloadType}」的字段（两端协议版本不一致），请把小程序与主机插件都升到最新版`
+      : `主机这一代不支持「${payloadType}」，请把主机插件升到最新版`
+    this.replyTo(conversationId, resultOf(cmdId, false, { message }))
   }
 
   /**
